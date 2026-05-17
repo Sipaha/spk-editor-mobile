@@ -12,9 +12,11 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
+import kotlinx.serialization.json.put
 import javax.net.ssl.SSLContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -95,6 +97,38 @@ class RemoteClient(
                 cont.resumeWithException(IllegalStateException("websocket refused frame"))
             }
         }
+    }
+
+    /**
+     * Convenience helper around `remote.solution_agent.get_session_entry`.
+     *
+     * Used by R-5f's diff-streaming flow: on
+     * `agent_session_message_appended` we only re-fetch the single new (or
+     * mutated) entry rather than the whole transcript. The returned
+     * [EntrySummary] always carries `markdown` populated; `images` is
+     * populated only when [includeImages] is true and the entry has
+     * inline images.
+     *
+     * Throws [IllegalStateException] if the server returns a JSON-RPC
+     * error (typically `entry_index_out_of_range`).
+     */
+    suspend fun getSessionEntry(
+        sessionId: String,
+        index: Int,
+        includeImages: Boolean = true,
+    ): GetSessionEntryResult {
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("index", index)
+            put("include_images", includeImages)
+        }
+        val response = call("remote.solution_agent.get_session_entry", params)
+        val err = response.error
+        if (err != null) {
+            error("get_session_entry failed: ${err.message}")
+        }
+        val result = response.result ?: error("get_session_entry returned no result")
+        return JsonRpc.json.decodeFromJsonElement(GetSessionEntryResult.serializer(), result)
     }
 
     fun close() {

@@ -1,10 +1,12 @@
 package ru.sipaha.spkremote.app.ui.solutions
 
+import android.util.Base64
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +18,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -58,15 +62,30 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.markdownColor
+import com.mikepenz.markdown.m3.markdownTypography
+import com.mikepenz.markdown.model.ImageData
+import com.mikepenz.markdown.model.ImageTransformer
 import kotlinx.coroutines.launch
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.app.vm.UiData
 import ru.sipaha.spkremote.core.DisplayState
+import ru.sipaha.spkremote.core.EntryImage
 import ru.sipaha.spkremote.core.EntryRole
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.GetSessionResult
+import ru.sipaha.spkremote.core.PlanSummary
+import ru.sipaha.spkremote.core.ToolCallSummary
 import ru.sipaha.spkremote.core.parseDisplayState
 import ru.sipaha.spkremote.core.parseEntryRole
 
@@ -253,22 +272,36 @@ private fun ChatList(
 private fun ChatBubble(entry: EntrySummary) {
     val role = parseEntryRole(entry.role)
     when (role) {
-        EntryRole.User -> UserBubble(text = entry.preview)
-        EntryRole.Assistant -> AssistantBubble(text = entry.preview)
-        EntryRole.ToolCall -> CenteredAnnotatedBubble(
-            text = entry.preview,
-            icon = Icons.Filled.Build,
-            bg = MaterialTheme.colorScheme.tertiaryContainer,
-            fg = MaterialTheme.colorScheme.onTertiaryContainer,
-            label = "tool",
-        )
-        EntryRole.Plan -> CenteredAnnotatedBubble(
-            text = entry.preview,
-            icon = Icons.AutoMirrored.Filled.List,
-            bg = MaterialTheme.colorScheme.secondaryContainer,
-            fg = MaterialTheme.colorScheme.onSecondaryContainer,
-            label = "plan",
-        )
+        EntryRole.User -> UserBubble(entry = entry)
+        EntryRole.Assistant -> AssistantBubble(entry = entry)
+        EntryRole.ToolCall -> {
+            val tc = entry.toolCall
+            if (tc != null) {
+                ToolCallBubble(call = tc)
+            } else {
+                CenteredAnnotatedBubble(
+                    text = entry.preview,
+                    icon = Icons.Filled.Build,
+                    bg = MaterialTheme.colorScheme.tertiaryContainer,
+                    fg = MaterialTheme.colorScheme.onTertiaryContainer,
+                    label = "tool",
+                )
+            }
+        }
+        EntryRole.Plan -> {
+            val plan = entry.plan
+            if (plan != null) {
+                PlanBubble(plan = plan)
+            } else {
+                CenteredAnnotatedBubble(
+                    text = entry.preview,
+                    icon = Icons.AutoMirrored.Filled.List,
+                    bg = MaterialTheme.colorScheme.secondaryContainer,
+                    fg = MaterialTheme.colorScheme.onSecondaryContainer,
+                    label = "plan",
+                )
+            }
+        }
         EntryRole.Unknown -> CenteredAnnotatedBubble(
             text = entry.preview,
             icon = Icons.Filled.Build,
@@ -280,7 +313,7 @@ private fun ChatBubble(entry: EntrySummary) {
 }
 
 @Composable
-private fun UserBubble(text: String) {
+private fun UserBubble(entry: EntrySummary) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.End,
@@ -291,8 +324,13 @@ private fun UserBubble(text: String) {
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 4.dp),
             modifier = Modifier.widthIn(max = 320.dp),
         ) {
+            // Users overwhelmingly send plain text — but accept markdown when
+            // the server returns it (e.g. a paste from a markdown source).
+            // The pinned light-on-primary palette would clobber inline-code
+            // colours, so for user bubbles we never run the markdown
+            // renderer (stays as legible plain Text).
             Text(
-                text = text,
+                text = entry.markdown ?: entry.preview,
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
             )
@@ -301,7 +339,7 @@ private fun UserBubble(text: String) {
 }
 
 @Composable
-private fun AssistantBubble(text: String) {
+private fun AssistantBubble(entry: EntrySummary) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Start,
@@ -312,11 +350,267 @@ private fun AssistantBubble(text: String) {
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
             modifier = Modifier.widthIn(max = 320.dp),
         ) {
-            Text(
-                text = text,
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            )
+            Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                val md = entry.markdown
+                if (md != null) {
+                    AssistantMarkdownBody(markdown = md, images = entry.images.orEmpty())
+                } else {
+                    // No full markdown yet (placeholder during streaming, or
+                    // pre-R-5e server). Falls back to preview to keep the
+                    // bubble informative until the per-entry RPC settles.
+                    Text(
+                        text = entry.preview,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Render an assistant entry's full markdown body, plumbing in a custom
+ * `ImageTransformer` so `spk-image://N` URLs in the markdown resolve to the
+ * matching base64 blob from `entry.images`. The `multiplatform-markdown-
+ * renderer-m3` library handles paragraph / code / list / link layout and
+ * lets us override only the image fetch step.
+ *
+ * Tapping an inline image opens a full-screen `Dialog` with the original
+ * pixel dimensions; long markdown bodies wrap naturally inside the bubble.
+ */
+@Composable
+private fun AssistantMarkdownBody(markdown: String, images: List<EntryImage>) {
+    var fullscreen by remember { mutableStateOf<EntryImage?>(null) }
+    // Decode all images up-front. Sessions with many images may want a
+    // lazier strategy, but in practice an assistant message rarely embeds
+    // more than 2-3 — and decoding here means the Markdown renderer's
+    // per-image transform() call is non-blocking + does no work on layout.
+    val decoded: Map<Int, Painter> = remember(images) {
+        images.associate { it.index to bitmapPainterFromBase64(it.dataBase64) }
+    }
+    val transformer = remember(images) { SpkImageTransformer(decoded, images) { fullscreen = it } }
+
+    Markdown(
+        content = markdown,
+        colors = markdownColor(
+            text = MaterialTheme.colorScheme.onSurfaceVariant,
+            codeText = MaterialTheme.colorScheme.onSurface,
+            codeBackground = MaterialTheme.colorScheme.surface,
+        ),
+        typography = markdownTypography(
+            text = MaterialTheme.typography.bodyMedium,
+            paragraph = MaterialTheme.typography.bodyMedium,
+            code = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            inlineCode = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+        ),
+        imageTransformer = transformer,
+    )
+
+    val tappedImage = fullscreen
+    if (tappedImage != null) {
+        Dialog(onDismissRequest = { fullscreen = null }) {
+            Surface(
+                color = Color.Black,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 600.dp)
+                    .clickable { fullscreen = null },
+            ) {
+                val painter = decoded[tappedImage.index]
+                if (painter != null) {
+                    androidx.compose.foundation.Image(
+                        painter = painter,
+                        contentDescription = "Full-screen image",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Custom [ImageTransformer] that maps `spk-image://N` URLs to a decoded
+ * base64 `Painter` carried in the [EntrySummary]. Unknown URLs return null
+ * so the markdown renderer falls back to its own missing-image placeholder
+ * (a blank box) — better than a hard crash on a missing image index.
+ *
+ * Only [transform] is overridden; `intrinsicSize` + `placeholderConfig`
+ * inherit the library defaults.
+ */
+private class SpkImageTransformer(
+    private val painters: Map<Int, Painter>,
+    private val rawImages: List<EntryImage>,
+    private val onClick: (EntryImage) -> Unit,
+) : ImageTransformer {
+    @Composable
+    override fun transform(link: String): ImageData? {
+        val index = link.removePrefix("spk-image://").toIntOrNull() ?: return null
+        val painter = painters[index] ?: return null
+        val image = rawImages.firstOrNull { it.index == index } ?: return null
+        // Cap the long edge at 240dp. Tap → caller-supplied dialog.
+        return ImageData(
+            painter = painter,
+            modifier = Modifier
+                .sizeIn(maxWidth = 240.dp, maxHeight = 240.dp)
+                .clickable { onClick(image) },
+            contentDescription = "Inline image #$index",
+            alignment = Alignment.Center,
+            contentScale = ContentScale.Fit,
+            alpha = 1f,
+            colorFilter = null,
+        )
+    }
+}
+
+/**
+ * Decode a base64 PNG/JPEG payload into a [BitmapPainter]. Failures (bad
+ * base64, malformed image) yield a 1×1 transparent painter — the bubble
+ * still renders and the dialog tap is a no-op.
+ */
+private fun bitmapPainterFromBase64(data: String): Painter {
+    val bytes = runCatching { Base64.decode(data, Base64.DEFAULT) }.getOrNull()
+        ?: return emptyBitmapPainter()
+    val bitmap = runCatching {
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull() ?: return emptyBitmapPainter()
+    return BitmapPainter(bitmap.asImageBitmap())
+}
+
+private fun emptyBitmapPainter(): Painter {
+    val bm = android.graphics.Bitmap.createBitmap(1, 1, android.graphics.Bitmap.Config.ARGB_8888)
+    return BitmapPainter(bm.asImageBitmap())
+}
+
+@Composable
+private fun ToolCallBubble(call: ToolCallSummary) {
+    var expanded by rememberSaveable(call.name + call.argsPreview) { mutableStateOf(false) }
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+        Surface(
+            color = MaterialTheme.colorScheme.tertiaryContainer,
+            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier
+                .widthIn(max = 360.dp)
+                .clickable { expanded = !expanded },
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Build,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(
+                        text = call.name,
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    ToolStatusPill(status = call.status)
+                }
+                Spacer(Modifier.padding(top = 4.dp))
+                // Collapsed view: first line of args preview only.
+                if (!expanded) {
+                    Text(
+                        text = call.argsPreview.lineSequence().firstOrNull().orEmpty(),
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                AnimatedVisibility(visible = expanded) {
+                    Column {
+                        Text(
+                            text = "args",
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                        Text(
+                            text = call.argsPreview,
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        )
+                        if (call.resultPreview.isNotEmpty()) {
+                            Text(
+                                text = "result",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.padding(top = 6.dp),
+                            )
+                            Text(
+                                text = call.resultPreview,
+                                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Status pill colour-coded by the tool-call's documented status families.
+ * Keeps the raw status label on the pill (spaces and all) so the user sees
+ * the same phrase the editor logged.
+ */
+@Composable
+private fun ToolStatusPill(status: String) {
+    val (bg, fg) = when (status) {
+        "done" -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        "failed", "rejected" -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+        "running", "pending", "waiting for confirmation" ->
+            MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+        "canceled" -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.surface to MaterialTheme.colorScheme.onSurface
+    }
+    Surface(color = bg, contentColor = fg, shape = MaterialTheme.shapes.small) {
+        Text(
+            text = status,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+        )
+    }
+}
+
+@Composable
+private fun PlanBubble(plan: PlanSummary) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+        Surface(
+            color = MaterialTheme.colorScheme.secondaryContainer,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.widthIn(max = 360.dp),
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.List,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Text(text = "plan", style = MaterialTheme.typography.labelLarge)
+                }
+                Spacer(Modifier.padding(top = 4.dp))
+                if (plan.items.isEmpty()) {
+                    Text(
+                        text = "(no items)",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    for (item in plan.items) {
+                        Text(
+                            text = "• $item",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
         }
     }
 }

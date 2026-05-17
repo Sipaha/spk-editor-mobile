@@ -50,17 +50,106 @@ data class ListSessionsResult(val sessions: List<SessionSummary>)
 /**
  * One transcript entry returned by `remote.solution_agent.get_session`.
  *
- * The server-side `EntrySummary` collapses arbitrary entry content (markdown,
- * image blocks, tool-call args/results) into a single truncated `preview`
- * string (~200 chars, ellipsised on overflow). That is the only message
- * content available remotely today — full content / images / tool details
- * require a future server-side extension. See R-5d follow-up notes.
+ * The wire-side `EntrySummary` always carries a truncated `preview` (~200
+ * chars). When the caller asks for `include_full_content=true` the server
+ * also populates [markdown] with the entry's full markdown body. When
+ * `include_images=true` and the entry is an assistant message containing
+ * inline images, [images] is populated with base64-encoded blobs indexed by
+ * their position in the markdown (referenced as `spk-image://N` URLs).
+ *
+ * For `role=tool_call` the server populates [toolCall] with name/status/args/
+ * result; for `role=plan` it populates [plan] with the list of plan items.
+ * These per-role payloads are absent on entries of other roles, so older
+ * clients can ignore them safely.
+ *
+ * Backwards compatible with R-5d's flat `{role, preview}` shape — every new
+ * field is nullable and defaulted, so the legacy minimal payload still
+ * deserialises cleanly.
  */
 @Serializable
 data class EntrySummary(
     /** Role tag: `user`, `assistant`, `tool_call`, or `plan`. Use [parseEntryRole]. */
     val role: String,
-    /** Truncated markdown rendering of the entry. */
+    /** Truncated markdown rendering of the entry (≤200 chars, ellipsised). */
+    val preview: String,
+    /**
+     * Full markdown body — only present when the request set
+     * `include_full_content=true` AND the entry has more than the preview.
+     */
+    val markdown: String? = null,
+    /**
+     * Inline images referenced from [markdown] via `spk-image://N` URLs.
+     * Present only when the request set `include_images=true` and the
+     * entry actually carries image blocks. Index of each [EntryImage]
+     * matches the `N` in the URL.
+     */
+    val images: List<EntryImage>? = null,
+    /** Tool-call detail — present only on entries with `role=tool_call`. */
+    @SerialName("tool_call") val toolCall: ToolCallSummary? = null,
+    /** Plan detail — present only on entries with `role=plan`. */
+    val plan: PlanSummary? = null,
+)
+
+/**
+ * Base64-encoded inline image carried alongside an [EntrySummary].
+ *
+ * The server emits unpadded standard-alphabet base64. [index] matches the
+ * `N` used to reference this image from markdown as `spk-image://N`.
+ */
+@Serializable
+data class EntryImage(
+    val index: Int,
+    @SerialName("mime_type") val mimeType: String,
+    @SerialName("data_base64") val dataBase64: String,
+)
+
+/**
+ * Server-side `EntrySummary.tool_call` payload for `role=tool_call` rows.
+ *
+ * [status] is a human-readable phrase: one of `"pending"`,
+ * `"waiting for confirmation"`, `"running"`, `"done"`, `"failed"`,
+ * `"rejected"`, `"canceled"`. Note the spaces (not underscores) and that
+ * we DO NOT classify these into an enum — UI surfaces just render the
+ * raw string with role-coloured pills.
+ */
+@Serializable
+data class ToolCallSummary(
+    val name: String,
+    val status: String,
+    @SerialName("args_preview") val argsPreview: String,
+    @SerialName("result_preview") val resultPreview: String = "",
+)
+
+/**
+ * Server-side `EntrySummary.plan` payload for `role=plan` rows.
+ *
+ * Each entry in [items] is a single plan step the agent committed to.
+ */
+@Serializable
+data class PlanSummary(val items: List<String>)
+
+/**
+ * Result envelope for `remote.solution_agent.get_session_entry`.
+ *
+ * The server wraps the entry in a `{ entry: ... }` object rather than
+ * returning it bare so future fields (cursor, neighbour ids, …) can be
+ * added alongside without breaking clients that decode this type.
+ */
+@Serializable
+data class GetSessionEntryResult(val entry: EntrySummary)
+
+/**
+ * Decoded payload of an `agent_session_message_appended` notification.
+ *
+ * Carries the entry index (post-R-5e); diff-streaming clients fetch the
+ * full entry via `remote.solution_agent.get_session_entry { index }`
+ * rather than re-polling the entire transcript on every append.
+ */
+@Serializable
+data class MessageAppendedPayload(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("entry_index") val entryIndex: Int,
+    val role: String,
     val preview: String,
 )
 

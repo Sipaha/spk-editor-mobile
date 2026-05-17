@@ -273,5 +273,202 @@ class RemoteDtosTest {
         assertEquals(EntryRole.Unknown, parseEntryRole(""))
     }
 
+    @Test
+    fun `EntrySummary round-trips with all rich fields populated`() {
+        val text = """
+            {
+              "role": "assistant",
+              "preview": "Here is an image: ![image #0](spk-image://0)",
+              "markdown": "Here is an image: ![image #0](spk-image://0)\n\nAnd more text after.",
+              "images": [
+                {"index": 0, "mime_type": "image/png", "data_base64": "iVBORw0KGgo="}
+              ],
+              "tool_call": null,
+              "plan": null
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
+        assertEquals("assistant", parsed.role)
+        assertEquals(
+            "Here is an image: ![image #0](spk-image://0)\n\nAnd more text after.",
+            parsed.markdown,
+        )
+        assertEquals(1, parsed.images?.size)
+        assertEquals("image/png", parsed.images?.get(0)?.mimeType)
+        assertEquals("iVBORw0KGgo=", parsed.images?.get(0)?.dataBase64)
+        assertNull(parsed.toolCall)
+        assertNull(parsed.plan)
+
+        val reencoded = JsonRpc.json.encodeToString(EntrySummary.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(EntrySummary.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `EntrySummary is backwards compatible with R-5d flat shape`() {
+        // Older server / minimal payload: only role+preview, no rich fields.
+        // Must decode cleanly with every optional field defaulting to null.
+        val text = """{"role":"user","preview":"hello"}"""
+        val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
+        assertEquals("user", parsed.role)
+        assertEquals("hello", parsed.preview)
+        assertNull(parsed.markdown)
+        assertNull(parsed.images)
+        assertNull(parsed.toolCall)
+        assertNull(parsed.plan)
+    }
+
+    @Test
+    fun `EntryImage round-trips standalone`() {
+        val text = """
+            {"index": 3, "mime_type": "image/jpeg", "data_base64": "/9j/4AAQ"}
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(EntryImage.serializer(), text)
+        assertEquals(3, parsed.index)
+        assertEquals("image/jpeg", parsed.mimeType)
+        assertEquals("/9j/4AAQ", parsed.dataBase64)
+
+        val reencoded = JsonRpc.json.encodeToString(EntryImage.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(EntryImage.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `ToolCallSummary round-trips every documented status string`() {
+        // The seven server-side status phrases are part of the wire contract;
+        // any client that wants to colour-code them MUST tolerate all of
+        // these verbatim (with spaces, not underscores).
+        val statuses = listOf(
+            "pending",
+            "waiting for confirmation",
+            "running",
+            "done",
+            "failed",
+            "rejected",
+            "canceled",
+        )
+        for (status in statuses) {
+            val text = """
+                {
+                  "name": "Read",
+                  "status": "$status",
+                  "args_preview": "{ \"path\": \"foo.kt\" }",
+                  "result_preview": "ok"
+                }
+            """.trimIndent()
+            val parsed = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), text)
+            assertEquals(status, parsed.status)
+            assertEquals("Read", parsed.name)
+            assertEquals("{ \"path\": \"foo.kt\" }", parsed.argsPreview)
+            assertEquals("ok", parsed.resultPreview)
+
+            val reencoded = JsonRpc.json.encodeToString(ToolCallSummary.serializer(), parsed)
+            val again = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), reencoded)
+            assertEquals(parsed, again)
+        }
+    }
+
+    @Test
+    fun `ToolCallSummary defaults result_preview to empty when omitted`() {
+        // Pending / running tool-calls won't yet have a result; the server
+        // omits the field entirely rather than emit `""`. The DTO must
+        // default it so decoding still succeeds.
+        val text = """
+            {
+              "name": "Edit",
+              "status": "running",
+              "args_preview": "edit args"
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), text)
+        assertEquals("", parsed.resultPreview)
+    }
+
+    @Test
+    fun `PlanSummary round-trips empty and non-empty item lists`() {
+        val empty = JsonRpc.json.decodeFromString(
+            PlanSummary.serializer(),
+            """{"items": []}""",
+        )
+        assertTrue(empty.items.isEmpty())
+
+        val populated = JsonRpc.json.decodeFromString(
+            PlanSummary.serializer(),
+            """{"items": ["First step", "Second step", "Third step"]}""",
+        )
+        assertEquals(3, populated.items.size)
+        assertEquals("First step", populated.items[0])
+
+        val reencoded = JsonRpc.json.encodeToString(PlanSummary.serializer(), populated)
+        val again = JsonRpc.json.decodeFromString(PlanSummary.serializer(), reencoded)
+        assertEquals(populated, again)
+    }
+
+    @Test
+    fun `GetSessionEntryResult round-trips a tool_call entry`() {
+        val text = """
+            {
+              "entry": {
+                "role": "tool_call",
+                "preview": "Read(foo.kt)",
+                "markdown": "Read(foo.kt) → 42 lines",
+                "tool_call": {
+                  "name": "Read",
+                  "status": "done",
+                  "args_preview": "{\"path\":\"foo.kt\"}",
+                  "result_preview": "42 lines"
+                }
+              }
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(GetSessionEntryResult.serializer(), text)
+        assertEquals("tool_call", parsed.entry.role)
+        assertEquals("Read", parsed.entry.toolCall?.name)
+        assertEquals("done", parsed.entry.toolCall?.status)
+
+        val reencoded = JsonRpc.json.encodeToString(GetSessionEntryResult.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(GetSessionEntryResult.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `MessageAppendedPayload round-trips`() {
+        // Wire shape sent inside the `data` field of an
+        // `agent_session_message_appended` notification.
+        val text = """
+            {
+              "session_id": "ses-1",
+              "entry_index": 7,
+              "role": "assistant",
+              "preview": "Hello, world."
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(MessageAppendedPayload.serializer(), text)
+        assertEquals("ses-1", parsed.sessionId)
+        assertEquals(7, parsed.entryIndex)
+        assertEquals("assistant", parsed.role)
+        assertEquals("Hello, world.", parsed.preview)
+
+        val reencoded = JsonRpc.json.encodeToString(MessageAppendedPayload.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(MessageAppendedPayload.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `EntrySummary with plan payload round-trips`() {
+        val text = """
+            {
+              "role": "plan",
+              "preview": "1. Foo\n2. Bar",
+              "markdown": "1. Foo\n2. Bar",
+              "plan": {"items": ["Foo", "Bar"]}
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
+        assertEquals(2, parsed.plan?.items?.size)
+        assertEquals("Foo", parsed.plan?.items?.get(0))
+        assertEquals("Bar", parsed.plan?.items?.get(1))
+    }
+
     private fun parsedDisplayStateOf(s: SessionSummary): DisplayState = parseDisplayState(s.state)
 }

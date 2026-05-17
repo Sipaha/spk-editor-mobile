@@ -18,6 +18,7 @@ import ru.sipaha.spkremote.core.GetSessionResult
 import ru.sipaha.spkremote.core.JsonRpc
 import ru.sipaha.spkremote.core.ListSessionsResult
 import ru.sipaha.spkremote.core.ListSolutionsResult
+import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.PairingUrl
 import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.SessionSummary
@@ -202,12 +203,28 @@ class MainViewModel : ViewModel() {
     }
 
     /**
-     * Open the chat surface for one session — initial poll + live updates.
+     * Open the chat surface for one session — initial poll + diff streaming.
      *
-     * The server sends id-only `agent_session_message_appended` notifications
-     * (no delta, no entry index) so the only way to keep the transcript in
-     * sync is to re-call `get_session` on every relevant frame. Lists are
-     * small (single session, ≤200-char previews); the round-trip is cheap.
+     * **Initial fetch:** `get_session` with `include_full_content=true` and
+     * `include_images=true` so the first paint already has rich content.
+     *
+     * **Diff streaming (R-5e wire shape):** the post-R-5e
+     * `agent_session_message_appended` notification carries the new
+     * `entry_index` + `preview`. We append a placeholder entry built from
+     * those fields immediately (so the bubble appears with truncated text
+     * the moment the frame lands), then fire a per-entry
+     * `get_session_entry` request in the background to upgrade the
+     * placeholder to its full markdown + images. Same flow on mutate (when
+     * `entry_index < currentEntries.size`).
+     *
+     * The previous R-5d behaviour re-fetched the whole transcript on every
+     * append. With long sessions and tool-heavy turns that was bandwidth-
+     * happy and added ≥1-RTT lag per append; the new flow keeps the user
+     * looking at a stable list and stitches one entry at a time.
+     *
+     * `agent_session_state_changed` is handled by re-polling `get_session`
+     * — state changes are infrequent and we want a clean rebase against
+     * the server's view (handles edge cases like cancelled-then-resumed).
      *
      * Subscriptions for `agent_session_message_appended` and
      * `agent_session_state_changed` happen here too — they overlap with
@@ -245,17 +262,134 @@ class MainViewModel : ViewModel() {
             active.notifications.collect { frame ->
                 val params = (frame as? JsonObject)?.get("params") as? JsonObject ?: return@collect
                 val kind = params["kind"]?.jsonPrimitive?.content ?: return@collect
-                if (kind != "agent_session_message_appended" && kind != "agent_session_state_changed") {
-                    return@collect
-                }
                 val data = params["data"] as? JsonObject
-                val notifSessionId = data?.get("session_id")?.jsonPrimitive?.content
-                // Defensive: data may be absent or session_id may be missing.
-                // If we can't narrow, refetch anyway — better stale-than-stale.
-                if (notifSessionId != null && notifSessionId != openSessionId) return@collect
-                refreshSession(sessionId)
+                when (kind) {
+                    "agent_session_message_appended" -> {
+                        if (data == null) {
+                            // Defensive — refetch whole transcript so we
+                            // never miss an entry from a malformed frame.
+                            refreshSession(sessionId)
+                            return@collect
+                        }
+                        val payload = runCatching {
+                            JsonRpc.json.decodeFromJsonElement(
+                                MessageAppendedPayload.serializer(),
+                                data,
+                            )
+                        }.getOrNull()
+                        if (payload == null) {
+                            // Older server (pre-R-5e) sends frames without
+                            // entry_index — fall back to full refetch.
+                            refreshSession(sessionId)
+                            return@collect
+                        }
+                        if (payload.sessionId != openSessionId) return@collect
+                        applyAppendedPlaceholder(payload)
+                        fetchAndReplaceEntry(sessionId, payload.entryIndex)
+                    }
+                    "agent_session_state_changed" -> {
+                        val notifSessionId = data?.get("session_id")?.jsonPrimitive?.content
+                        if (notifSessionId != null && notifSessionId != openSessionId) return@collect
+                        refreshSession(sessionId)
+                    }
+                    else -> return@collect
+                }
             }
         }
+    }
+
+    /**
+     * Apply the optimistic placeholder for an `agent_session_message_appended`
+     * notification. Two cases:
+     *
+     *  - `entryIndex == entries.size`: pure append. We extend the entries
+     *    list with a placeholder built from `(role, preview)`.
+     *  - `entryIndex < entries.size`: mutation of an existing entry (e.g.
+     *    tool-call status flipped from `running` to `done`). We replace
+     *    the slot in place.
+     *  - `entryIndex > entries.size`: gap (we missed frames or the server
+     *    skipped indices). Fall back to a full transcript refetch — safer
+     *    than fabricating empty intermediate entries.
+     *
+     * Either way the per-entry RPC then runs to upgrade the placeholder
+     * to its full markdown + images.
+     */
+    private fun applyAppendedPlaceholder(payload: MessageAppendedPayload) {
+        val current = _session.value
+        if (current !is UiData.Loaded) {
+            // No baseline yet — let the in-flight `get_session` settle.
+            return
+        }
+        val entries = current.value.entries
+        val placeholder = EntrySummary(role = payload.role, preview = payload.preview)
+        val newEntries = when {
+            payload.entryIndex == entries.size -> entries + placeholder
+            payload.entryIndex < entries.size ->
+                entries.toMutableList().also { it[payload.entryIndex] = placeholder }
+            else -> {
+                // Index past the end with a gap — defer to a full refetch.
+                val active = client ?: return
+                viewModelScope.launch {
+                    runCatching { fetchFullSession(active, payload.sessionId) }
+                }
+                return
+            }
+        }
+        _session.value = UiData.Loaded(current.value.copy(entries = newEntries))
+    }
+
+    /**
+     * Fetch one entry by index and splice it into the loaded transcript,
+     * replacing whatever placeholder is currently at that slot. Silently
+     * no-ops if the user navigated away mid-flight, or if the index is
+     * past the (possibly stale) entries list after the RPC returns.
+     */
+    private fun fetchAndReplaceEntry(sessionId: String, index: Int) {
+        val active = client ?: return
+        viewModelScope.launch {
+            val result = runCatching {
+                active.getSessionEntry(sessionId, index, includeImages = true)
+            }.getOrNull() ?: return@launch
+            if (openSessionId != sessionId) return@launch
+            val current = _session.value as? UiData.Loaded ?: return@launch
+            val entries = current.value.entries
+            val newEntries = when {
+                index < entries.size ->
+                    entries.toMutableList().also { it[index] = result.entry }
+                index == entries.size -> entries + result.entry
+                else -> {
+                    // Gap appeared — full refetch is the simplest recovery.
+                    runCatching { fetchFullSession(active, sessionId) }
+                    return@launch
+                }
+            }
+            _session.value = UiData.Loaded(current.value.copy(entries = newEntries))
+            // Optimistic user bubbles get reconciled against the upgraded
+            // entry too — if the new entry is the user echo, the bubble
+            // can now drop.
+            reconcileOptimistic(newEntries)
+        }
+    }
+
+    /** Side-effecting helper that re-runs `refreshSession` from a coroutine. */
+    private suspend fun fetchFullSession(active: RemoteClient, sessionId: String) {
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("include_full_content", true)
+            put("include_images", true)
+        }
+        runCatching { active.call("remote.solution_agent.get_session", params) }
+            .mapCatching { resp ->
+                val err = resp.error
+                if (err != null) error(err.message)
+                val result = resp.result ?: error("missing result")
+                JsonRpc.json.decodeFromJsonElement(GetSessionResult.serializer(), result)
+            }
+            .onSuccess { result ->
+                if (openSessionId != sessionId) return@onSuccess
+                _session.value = UiData.Loaded(result)
+                reconcileOptimistic(result.entries)
+            }
     }
 
     fun closeSession() {
@@ -268,7 +402,15 @@ class MainViewModel : ViewModel() {
 
     private fun refreshSession(sessionId: String) {
         val active = client ?: return
-        val params = buildJsonObject { put("session_id", sessionId) }
+        // Ask for rich content + images on every full refetch — the per-
+        // entry RPC handles diff streaming, but full refetches happen on
+        // initial open, on state_changed, and on the gap-recovery path so
+        // we want them to land as fully-populated as the wire allows.
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("include_full_content", true)
+            put("include_images", true)
+        }
         viewModelScope.launch {
             runCatching { active.call("remote.solution_agent.get_session", params) }
                 .mapCatching { resp ->
