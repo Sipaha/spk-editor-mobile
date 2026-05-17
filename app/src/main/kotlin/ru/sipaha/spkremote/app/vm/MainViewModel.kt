@@ -12,6 +12,10 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import ru.sipaha.spkremote.app.data.DraftRepository
+import ru.sipaha.spkremote.app.data.EncryptedQueueStore
+import ru.sipaha.spkremote.app.data.LastSeenRepository
+import ru.sipaha.spkremote.app.data.NavStateRepository
 import ru.sipaha.spkremote.app.data.PairingRepository
 import ru.sipaha.spkremote.core.AgentSummary
 import ru.sipaha.spkremote.core.ConnectionState
@@ -24,6 +28,7 @@ import ru.sipaha.spkremote.core.ListSessionsResult
 import ru.sipaha.spkremote.core.ListSolutionsResult
 import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.PairingUrl
+import ru.sipaha.spkremote.core.QueuedMessage
 import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.SolutionSummary
@@ -63,6 +68,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * [PairingRepository] for the cold-start contract.
      */
     private val pairingRepository: PairingRepository = PairingRepository.get(application)
+
+    /**
+     * Disk-backed outbound-queue store for [RemoteClient.queueCall]
+     * (R-6d). Stored separately from [pairingRepository] in a dedicated
+     * `spk_queue` prefs file so we can clear queue entries without
+     * touching the pairing URL (e.g. on forget-pairing the queue is
+     * irrelevant; on a per-session reset, the pairing stays).
+     */
+    private val queueStore: EncryptedQueueStore = EncryptedQueueStore.get(application)
+
+    /**
+     * Per-session compose-bar drafts + bounced-on-failure recovery slots.
+     * See [DraftRepository] for the two-channel semantics.
+     */
+    val draftRepository: DraftRepository = DraftRepository.get(application)
+
+    /**
+     * Per-session "last seen entry index" markers. Today only persisted
+     * for restart durability; R-6e will wire the incremental-resume RPC
+     * that actually uses the marker on reconnect.
+     */
+    private val lastSeenRepository: LastSeenRepository = LastSeenRepository.get(application)
+
+    /**
+     * Active navigation route for cold-start resume. Persisted from
+     * `AppNavGraph` on every back-stack change; read from `MainActivity`
+     * after the pairing replay completes.
+     */
+    val navStateRepository: NavStateRepository = NavStateRepository.get(application)
 
     private val _state = MutableStateFlow<UiState>(UiState.Disconnected())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -146,11 +180,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Last entry index we observed for each session via
-     * `agent_session_message_appended`. Used after a reconnect — if the
-     * currently-open session has progressed past what we last saw, we
-     * trigger a full re-fetch to catch up. Map is intentionally bounded
-     * by the user's lifetime in-process (no persistence) since this is a
-     * UX hint, not authoritative state.
+     * `agent_session_message_appended`.
+     *
+     * R-6d: now persisted to [lastSeenRepository] on every advance, so
+     * a force-kill doesn't lose the high-water mark. The in-memory map
+     * is the fast path (read on every notification); the disk write is
+     * synchronous (`SharedPreferences.apply()` queues to a background
+     * writer, so the call returns instantly). R-6e will wire the
+     * incremental-resume RPC path that actually uses the marker post-
+     * reconnect — for now the marker is just durably saved.
+     *
+     * Read-through behaviour: [openSession] seeds this map from
+     * [lastSeenRepository] when a session is first opened in-process,
+     * so the marker survives a cold-start mid-chat.
      */
     private val lastSeenEntryIndex = mutableMapOf<String, Int>()
 
@@ -165,7 +207,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _pairing.value = parsed
         _state.value = UiState.Connecting
         viewModelScope.launch {
-            val newClient = RemoteClient(parsed)
+            // Drain TTL-expired queue entries before [RemoteClient.rehydrateQueue]
+            // sees them — that way the bounce-to-input recovery fires once
+            // here (with the synthesized "expired while app was closed"
+            // semantics) rather than waiting for the next reconnect to
+            // notice. flushQueue inside RemoteClient also runs the TTL
+            // check on every Connected transition, but doing it here keeps
+            // the user-visible bounce path tied to the boot moment.
+            drainExpiredQueueEntries()
+            val newClient = RemoteClient(
+                url = parsed,
+                queueStore = queueStore,
+                onMessageExpired = ::handleExpiredMessage,
+            )
             client = newClient
             // Hand the lifecycle our viewModelScope so reconnects keep
             // running as long as the ViewModel is alive (cancelled on
@@ -200,6 +254,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * Walk the disk-backed queue and TTL-expire any entry older than
+     * [RemoteClient.DEFAULT_QUEUE_TTL_MS]. Each expired message gets
+     * routed through [handleExpiredMessage] so the bounce-to-input
+     * recovery fires once at boot — equivalent to what
+     * [RemoteClient.flushQueue] would do on the next Connected
+     * transition, but earlier so the user sees the bounce as soon as
+     * they open the offending session.
+     *
+     * Called from [connect] before constructing the new
+     * [RemoteClient] so the rehydrate-on-connect path inside the client
+     * only sees surviving entries.
+     */
+    private fun drainExpiredQueueEntries() {
+        val now = System.currentTimeMillis()
+        val ttl = RemoteClient.DEFAULT_QUEUE_TTL_MS
+        for (msg in queueStore.loadAll()) {
+            if (now - msg.enqueuedAtMs >= ttl) {
+                handleExpiredMessage(msg)
+                queueStore.remove(msg.id)
+            }
+        }
+    }
+
+    /**
+     * Bounce-to-input recovery: when a queued send expires or fails
+     * terminally, stash the user's content as a pending bounce on
+     * [draftRepository] so the next time the user opens that session,
+     * the OutlinedTextField prefills with the failed text and a
+     * snackbar surfaces. Survives app restarts because both halves
+     * (the queue + the bounce slot) are on disk.
+     *
+     * Only `remote.solution_agent.send_message` payloads carry a
+     * recoverable user-visible body. Other queued methods (none today,
+     * but the API is open) are dropped silently — the bounce contract
+     * is specifically about "the text I typed shouldn't disappear",
+     * not generic RPC recovery.
+     */
+    private fun handleExpiredMessage(message: QueuedMessage) {
+        if (message.method != "remote.solution_agent.send_message") return
+        val params = (message.params as? JsonObject) ?: return
+        val sessionId = params["session_id"]?.jsonPrimitive?.content ?: return
+        val content = params["content"]?.jsonPrimitive?.content ?: return
+        if (content.isBlank()) return
+        draftRepository.setBounced(sessionId, content)
+    }
+
+    /**
      * Returns the previously-persisted pairing URL, if any, suitable for
      * passing to [connect] directly. Called from `MainActivity.onCreate`
      * on cold start to skip the QR scan flow when we already know a server.
@@ -220,6 +321,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun forgetPairing() {
         pairingRepository.clear()
+        // R-6d: wipe every per-server piece of disk state so re-pairing
+        // (potentially against a *different* server) doesn't surface
+        // stale drafts, stale queued sends, stale last-seen markers, or
+        // a saved deep-route from a session that doesn't exist on the
+        // new server.
+        queueStore.clear()
+        draftRepository.clearAll()
+        lastSeenRepository.clearAll()
+        navStateRepository.clear()
         connectionObserverJob?.cancel()
         sessionObserverJob?.cancel()
         sessionDetailObserverJob?.cancel()
@@ -424,6 +534,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         openSessionId = sessionId
         _session.value = UiData.Loading
         _optimisticEntries.value = emptyList()
+        // Seed the in-memory high-water marker from disk if absent —
+        // a cold-started VM doesn't have any previous-process state.
+        // The disk read is one SharedPreferences.getInt call; trivial.
+        if (lastSeenEntryIndex[sessionId] == null) {
+            lastSeenRepository.get(sessionId)?.let { lastSeenEntryIndex[sessionId] = it }
+        }
         refreshSession(sessionId)
         sessionDetailObserverJob?.cancel()
         sessionDetailObserverJob = viewModelScope.launch {
@@ -472,6 +588,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val prev = lastSeenEntryIndex[payload.sessionId] ?: -1
                         if (payload.entryIndex > prev) {
                             lastSeenEntryIndex[payload.sessionId] = payload.entryIndex
+                            // R-6d: persist on every advance. Disk writes
+                            // are debounced inside SharedPreferences;
+                            // a burst of 5 message_appended frames in a
+                            // running turn won't trash the I/O scheduler.
+                            lastSeenRepository.set(payload.sessionId, payload.entryIndex)
                         }
                         applyAppendedPlaceholder(payload)
                         fetchAndReplaceEntry(sessionId, payload.entryIndex)

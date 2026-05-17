@@ -17,6 +17,8 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 /**
@@ -45,6 +47,8 @@ class RemoteClientLifecycleTest {
 
     private fun TestScope.newClient(
         backoff: BackoffStrategy = BackoffStrategy.fixed(100L),
+        queueStore: QueueStore = InMemoryQueueStore(),
+        onMessageExpired: ((QueuedMessage) -> Unit)? = null,
     ): Pair<RemoteClient, FakeRemoteTransportFactory> {
         val factory = FakeRemoteTransportFactory()
         val client = RemoteClient(
@@ -52,6 +56,8 @@ class RemoteClientLifecycleTest {
             transportFactory = factory,
             backoff = backoff,
             nowMs = { testScheduler.currentTime },
+            queueStore = queueStore,
+            onMessageExpired = onMessageExpired,
         )
         return client to factory
     }
@@ -420,6 +426,118 @@ class RemoteClientLifecycleTest {
         assertFailsWith<IllegalStateException> {
             withTimeout(1_000L) { client.call("remote.editor.capabilities") }
         }
+    }
+
+    @Test
+    fun `queueCall persists to QueueStore while disconnected`() = runTest(StandardTestDispatcher()) {
+        val store = InMemoryQueueStore()
+        val (client, factory) = newClient(
+            backoff = BackoffStrategy.fixed(10 * 60 * 1000L),
+            queueStore = store,
+        )
+        connectAndHandshake(client, factory)
+        factory.latest().closeFromServer()
+        runCurrent()
+        assertEquals(0, store.loadAll().size, "no entries before queueCall")
+        val supervisor = SupervisorJob()
+        launch(supervisor) {
+            runCatching {
+                client.queueCall(
+                    "remote.solution_agent.send_message",
+                    buildJsonObject {
+                        put("session_id", "s1")
+                        put("content", "persist-me")
+                    },
+                    ttlMs = 30 * 60 * 1000L,
+                )
+            }
+        }
+        runCurrent()
+        val persisted = store.loadAll()
+        assertEquals(1, persisted.size, "queueCall should write to QueueStore: $persisted")
+        assertEquals("remote.solution_agent.send_message", persisted[0].method)
+        client.close()
+        // close() must NOT clear the store — the next process incarnation
+        // is responsible for replay. forgetPairing() in :app is the only
+        // path that intentionally clears.
+        assertEquals(1, store.loadAll().size, "close should not clear the store")
+        supervisor.cancel()
+        runCurrent()
+    }
+
+    @Test
+    fun `rehydrateQueue replays surviving entries on connect`() = runTest(StandardTestDispatcher()) {
+        val store = InMemoryQueueStore()
+        // Pre-populate as if a previous process left it behind.
+        store.add(
+            QueuedMessage(
+                id = "msg-1",
+                method = "remote.solution_agent.send_message",
+                params = buildJsonObject {
+                    put("session_id", "s1")
+                    put("content", "from-previous-life")
+                },
+                enqueuedAtMs = testScheduler.currentTime,
+            ),
+        )
+        val (client, factory) = newClient(queueStore = store)
+        connectAndHandshake(client, factory)
+        runCurrent()
+        val sentFrames = factory.latest().sent.toList()
+        val replay = sentFrames.firstOrNull { it.contains("from-previous-life") }
+        assertTrue(replay != null, "rehydrated entry must replay on Connected: $sentFrames")
+        // Server response settles the deferred + removes from disk.
+        val id = JSON_ID_REGEX.find(replay!!)!!.groupValues[1].toLong()
+        factory.latest().emit("""{"jsonrpc":"2.0","id":$id,"result":{"ok":true}}""")
+        runCurrent()
+        assertEquals(0, store.loadAll().size, "successful replay clears the disk entry")
+        client.close()
+        runCurrent()
+    }
+
+    @Test
+    fun `TTL expiry removes from QueueStore and fires onMessageExpired`() = runTest(StandardTestDispatcher()) {
+        val store = InMemoryQueueStore()
+        val expired = mutableListOf<QueuedMessage>()
+        val (client, factory) = newClient(
+            backoff = BackoffStrategy.fixed(10 * 60 * 1000L),
+            queueStore = store,
+            onMessageExpired = { expired += it },
+        )
+        connectAndHandshake(client, factory)
+        factory.latest().closeFromServer()
+        runCurrent()
+        val supervisor = SupervisorJob()
+        launch(supervisor) {
+            runCatching {
+                client.queueCall(
+                    method = "remote.solution_agent.send_message",
+                    params = buildJsonObject {
+                        put("session_id", "s1")
+                        put("content", "bounce-me")
+                    },
+                    ttlMs = 1_000L,
+                )
+            }
+        }
+        runCurrent()
+        assertEquals(1, store.loadAll().size, "queued before TTL")
+        advanceTimeBy(2_000L)
+        runCurrent()
+        assertEquals(0, store.loadAll().size, "TTL must clear the disk entry")
+        assertEquals(1, expired.size, "onMessageExpired must fire: $expired")
+        assertEquals(
+            "bounce-me",
+            expired[0].params!!.jsonObject["content"]!!.jsonPrimitive.content,
+        )
+        client.close()
+        supervisor.cancel()
+        runCurrent()
+    }
+
+    @Test
+    fun `default TTL is 24 hours`() {
+        assertEquals(24L * 60L * 60L * 1_000L, RemoteClient.DEFAULT_QUEUE_TTL_MS)
     }
 
     companion object {

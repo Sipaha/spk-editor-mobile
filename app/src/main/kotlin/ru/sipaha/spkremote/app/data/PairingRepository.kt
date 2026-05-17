@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
 
 /**
  * Persists the most-recently-successful pairing URL so the app skips the
@@ -46,9 +45,7 @@ class PairingRepository(private val context: Context) {
      * reset of credential store, etc.).
      */
     private fun openPrefs(): SharedPreferences? = runCatching {
-        val masterKey = MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
+        val masterKey = AppMasterKey.get(context) ?: return@runCatching null
         EncryptedSharedPreferences.create(
             context,
             PREFS_NAME,

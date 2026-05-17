@@ -13,9 +13,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -52,13 +56,36 @@ fun AppNav(viewModel: MainViewModel) {
     val navController = rememberNavController()
     val uiState by viewModel.state.collectAsState()
     val banner by viewModel.connectionBanner.collectAsState()
+    val navStateRepository = viewModel.navStateRepository
+
+    // R-6d: persist the resolved nav route on every back-stack change so
+    // a cold-start can land the user back on the deepest screen they
+    // were on. The route string includes substituted arguments (e.g.
+    // `solutions/abc/sessions/xyz`) — we rebuild that from the entry's
+    // NavArguments because Compose-Navigation only exposes the route
+    // *template* on `currentDestination`. See [resolvedRoute] below.
+    LaunchedEffect(navController) {
+        navController.currentBackStackEntryFlow.collect { entry ->
+            val resolved = resolvedRoute(entry) ?: return@collect
+            navStateRepository.saveRoute(resolved)
+        }
+    }
+
+    // One-shot deep-link restore after a successful pairing replay. The
+    // route is restored at most once per VM instance — the `restored`
+    // flag prevents a `popBackStack()` later in the session from re-
+    // triggering navigation back to the saved deep route.
+    var restored by remember { mutableStateOf(false) }
 
     LaunchedEffect(uiState) {
         when (uiState) {
             is UiState.Connected -> {
                 val current = navController.currentDestination?.route
                 if (current == null || current == "pairing" || current == "connecting") {
-                    navController.navigate("solutions") {
+                    val savedRoute = if (!restored) navStateRepository.loadRoute() else null
+                    val target = savedRoute?.takeIf { it.startsWith("solutions") } ?: "solutions"
+                    restored = true
+                    navController.navigate(target) {
                         popUpTo("pairing") { inclusive = false }
                         launchSingleTop = true
                     }
@@ -158,6 +185,30 @@ fun AppNav(viewModel: MainViewModel) {
                 )
             }
         }
+    }
+}
+
+/**
+ * Build the *resolved* route string for [entry] — substituting any
+ * `{argName}` placeholders in the destination route template with the
+ * actual argument values from the back-stack entry.
+ *
+ * Compose-Navigation only exposes the template on `destination.route`,
+ * not the resolved form (e.g. it gives us `solutions/{solutionId}` even
+ * though the user is on `solutions/abc`). This helper closes that gap
+ * so [NavStateRepository.saveRoute] can persist a route that
+ * `navController.navigate(...)` will accept verbatim on the next cold
+ * start.
+ *
+ * Returns `null` when the entry has no route (synthetic back-stack
+ * entries, e.g. the root graph node).
+ */
+private fun resolvedRoute(entry: NavBackStackEntry): String? {
+    val template = entry.destination.route ?: return null
+    val args = entry.arguments ?: return template
+    return Regex("""\{([^}]+)\}""").replace(template) { match ->
+        val key = match.groupValues[1]
+        args.getString(key) ?: match.value
     }
 }
 

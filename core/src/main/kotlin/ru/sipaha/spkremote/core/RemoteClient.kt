@@ -1,5 +1,6 @@
 package ru.sipaha.spkremote.core
 
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
@@ -75,13 +76,36 @@ class RemoteClient internal constructor(
      * Tests inject a fake whose progression is driven by `TestScope`.
      */
     private val nowMs: () -> Long = System::currentTimeMillis,
+    /**
+     * Persistence backend for the outbound queue (R-6d). Defaults to the
+     * pure-in-memory store for backwards compatibility with `:cli`,
+     * `:core` tests, and any caller that hasn't opted into disk-backed
+     * persistence. `:app` injects an `EncryptedQueueStore` so typed-but-
+     * unsent messages survive a process kill.
+     */
+    private val queueStore: QueueStore = InMemoryQueueStore(),
+    /**
+     * Optional hook invoked when a queued message is dropped without
+     * delivery — TTL expiry, terminal failure during replay, or
+     * programmatic [close]. The handler receives the persisted
+     * [QueuedMessage] (NOT the in-memory wrapper) so it can route the
+     * payload back to the user via the `:app` draft repository.
+     *
+     * Always called from the lifecycle coroutine. Implementations must
+     * not block — schedule disk I/O on a separate dispatcher if needed.
+     */
+    private val onMessageExpired: ((QueuedMessage) -> Unit)? = null,
 ) {
     constructor(
         url: PairingUrl,
         httpClientBuilder: OkHttpClient.Builder = OkHttpRemoteTransportFactory.defaultBuilder(url),
+        queueStore: QueueStore = InMemoryQueueStore(),
+        onMessageExpired: ((QueuedMessage) -> Unit)? = null,
     ) : this(
         url = url,
         transportFactory = OkHttpRemoteTransportFactory { _ -> httpClientBuilder },
+        queueStore = queueStore,
+        onMessageExpired = onMessageExpired,
     )
 
     private val auth = HmacChallengeAuth(url.secret)
@@ -101,7 +125,13 @@ class RemoteClient internal constructor(
     private val activeSubscriptions = mutableSetOf<String>()
     private val stateLock = Any()
 
-    /** Outbound queue — items waiting for a live connection. */
+    /**
+     * Outbound queue — in-memory wrappers pairing each persisted
+     * [QueuedMessage] with its caller-side [CompletableDeferred]. The
+     * authoritative ordering and survival across restarts comes from
+     * [queueStore]; this deque is just a fast lookup for the in-flight
+     * coroutines awaiting their response.
+     */
     private val queued = ArrayDeque<QueuedCall>()
 
     /** Events the lifecycle coroutine consumes. */
@@ -128,11 +158,45 @@ class RemoteClient internal constructor(
         val target = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
         check(lifecycleJob == null) { "RemoteClient already connecting/connected" }
         this.scope = target
+        // Rehydrate the queue from disk before the lifecycle loop boots.
+        // The 24h TTL is enforced by [flushQueue] on every reconnect, so
+        // we just have to walk the persisted entries and wire them into
+        // the in-memory wrappers — already-expired ones get bounced (and
+        // removed from disk) by the next [flushQueue] tick which happens
+        // on Connected.
+        rehydrateQueue()
         val gate = CompletableDeferred<Unit>()
         firstConnect = gate
         lifecycleJob = target.launch { lifecycleLoop() }
         // Caller awaits the first Connected transition (or terminal failure).
         gate.await()
+    }
+
+    /**
+     * Read every previously-persisted [QueuedMessage] from [queueStore]
+     * into [queued], wrapping each in a fresh [CompletableDeferred].
+     *
+     * **Bounce semantics for orphaned deferreds:** an entry restored
+     * from disk has no caller awaiting its [CompletableDeferred] — the
+     * coroutine that originally called [queueCall] died with the
+     * previous process. We still complete the deferred on success /
+     * failure so the bookkeeping is symmetric, but no one will observe
+     * the result. The user-visible recovery path is [onMessageExpired]
+     * — that's where the `:app` layer plumbs the bounced text back into
+     * the draft repository for retry.
+     */
+    private fun rehydrateQueue() {
+        val persisted = queueStore.loadAll()
+        if (persisted.isEmpty()) return
+        synchronized(stateLock) {
+            for (msg in persisted.sortedBy { it.enqueuedAtMs }) {
+                queued += QueuedCall(
+                    message = msg,
+                    deferred = CompletableDeferred(),
+                    ttlMs = DEFAULT_QUEUE_TTL_MS,
+                )
+            }
+        }
     }
 
     /** Whether a programmatic close has been requested (lifecycle ends). */
@@ -144,7 +208,13 @@ class RemoteClient internal constructor(
         // Fail pending in-flight calls — the wire is gone.
         pending.values.forEach { it.cancel() }
         pending.clear()
-        // Queued items are dropped with TimeoutException for symmetry with TTL.
+        // Queued items are dropped with ClosedException for symmetry with TTL.
+        // We deliberately do NOT remove them from [queueStore] — close() can
+        // mean "tear down before process exit / config change" and persistent
+        // entries should survive into the next RemoteClient incarnation.
+        // forgetPairing() in :app calls queueStore.clear() explicitly when
+        // the user re-pairs, which is the only situation where draining is
+        // correct.
         synchronized(stateLock) {
             queued.forEach { it.deferred.completeExceptionally(ClosedException()) }
             queued.clear()
@@ -195,10 +265,15 @@ class RemoteClient internal constructor(
      * immediately. Fails the deferred response after [ttlMs] of total time
      * spent queued + in flight.
      *
-     * Default TTL is **5 minutes** — long enough that a user who taps Send
-     * inside a tunnel and emerges before the next subway stop still gets
-     * their message through, short enough that a multi-hour outage doesn't
-     * fire a one-day-old "send" on resume.
+     * Default TTL is **24 hours** (R-6d). The realistic offline scenario
+     * is a metro / flight / overnight outage — the user expects a tapped
+     * Send to wake up and deliver itself. The bounce-to-input recovery
+     * path in `:app` (`MainViewModel.handleExpiredMessage`) gives the
+     * user a second chance even when the TTL does fire.
+     *
+     * **Persistence:** the message is written to [queueStore] before
+     * this call awaits, so a force-kill between enqueue and reconnect
+     * preserves it for the next [connect] / [rehydrateQueue] pair.
      *
      * @throws TimeoutException via the returned response promise on TTL
      *   expiry (wrapped as a [JsonRpcResponse] failure).
@@ -217,11 +292,16 @@ class RemoteClient internal constructor(
             return call(method, params)
         }
         val deferred = CompletableDeferred<JsonRpcResponse>()
-        val item = QueuedCall(
+        val message = QueuedMessage(
+            id = UUID.randomUUID().toString(),
             method = method,
             params = params,
-            deferred = deferred,
             enqueuedAtMs = nowMs(),
+            attemptCount = 0,
+        )
+        val item = QueuedCall(
+            message = message,
+            deferred = deferred,
             ttlMs = ttlMs,
         )
         val sendSynchronously = synchronized(stateLock) {
@@ -234,9 +314,15 @@ class RemoteClient internal constructor(
             }
         }
         if (sendSynchronously) {
-            // Connected raced us; send directly.
+            // Connected raced us; send directly. No need to persist —
+            // the call is one round-trip away from a real response.
             return call(method, params)
         }
+        // Persist *after* adding to the in-memory deque so the lifecycle
+        // coroutine can see the entry as soon as it picks up QueueChanged.
+        // EncryptedSharedPreferences performs synchronous I/O on commit();
+        // we rely on the `:app` impl using apply()-equivalent semantics.
+        runCatching { queueStore.add(message) }
         events.trySend(LifecycleEvent.QueueChanged)
         return awaitWithTtl(item)
     }
@@ -430,25 +516,38 @@ class RemoteClient internal constructor(
      *
      * On transport loss mid-flush, items not yet dispatched are re-enqueued
      * at the head of the deque so FIFO order survives across reconnects.
+     *
+     * **Persistence:** expired entries are removed from [queueStore] and
+     * [onMessageExpired] fires before the deferred fails so the `:app`
+     * bounce-to-input path sees the payload exactly once.
      */
     private fun flushQueue() {
-        val toSend = synchronized(stateLock) {
+        val (survivors, expired) = synchronized(stateLock) {
             val now = nowMs()
-            val survivors = ArrayList<QueuedCall>(queued.size)
-            val expired = ArrayList<QueuedCall>()
+            val sv = ArrayList<QueuedCall>(queued.size)
+            val ex = ArrayList<QueuedCall>()
             for (item in queued) {
-                if (now - item.enqueuedAtMs >= item.ttlMs) {
-                    expired += item
+                if (now - item.message.enqueuedAtMs >= item.ttlMs) {
+                    ex += item
                 } else {
-                    survivors += item
+                    sv += item
                 }
             }
             queued.clear()
-            expired.forEach { it.deferred.completeExceptionally(QueueTtlException()) }
-            survivors
+            sv to ex
         }
+        for (item in expired) {
+            runCatching { queueStore.remove(item.message.id) }
+            runCatching { onMessageExpired?.invoke(item.message) }
+            item.deferred.completeExceptionally(QueueTtlException())
+        }
+        val toSend = survivors
         if (toSend.isEmpty()) return
-        val activeScope = scope ?: return
+        val activeScope = scope ?: run {
+            // Without a scope we can't fire — restore everything.
+            synchronized(stateLock) { queued.addAll(toSend) }
+            return
+        }
         for ((index, item) in toSend.withIndex()) {
             val active = transport
             if (active == null) {
@@ -463,8 +562,10 @@ class RemoteClient internal constructor(
                 }
                 return
             }
-            val remainingTtl = item.ttlMs - (nowMs() - item.enqueuedAtMs)
+            val remainingTtl = item.ttlMs - (nowMs() - item.message.enqueuedAtMs)
             if (remainingTtl <= 0) {
+                runCatching { queueStore.remove(item.message.id) }
+                runCatching { onMessageExpired?.invoke(item.message) }
                 item.deferred.completeExceptionally(QueueTtlException())
                 continue
             }
@@ -475,9 +576,16 @@ class RemoteClient internal constructor(
             // tests even when no real network latency exists.
             activeScope.launch {
                 try {
-                    val resp = call(item.method, item.params)
+                    val resp = call(item.message.method, item.message.params)
+                    // Successful round-trip — remove from disk so the next
+                    // restart doesn't replay.
+                    runCatching { queueStore.remove(item.message.id) }
                     item.deferred.complete(resp)
                 } catch (t: Throwable) {
+                    // Transient (transport drop) — leave in the persisted
+                    // store so the next reconnect retries. The deferred
+                    // failure is observed by [awaitWithTtl] which will
+                    // bounce-on-TTL if the retries don't succeed in time.
                     item.deferred.completeExceptionally(t)
                 }
             }
@@ -489,7 +597,17 @@ class RemoteClient internal constructor(
         return try {
             withTimeout(item.ttlMs) { item.deferred.await() }
         } catch (t: TimeoutCancellationException) {
-            synchronized(stateLock) { queued.remove(item) }
+            val removed = synchronized(stateLock) { queued.remove(item) }
+            // If we were still queued (not yet dispatched), clean up disk +
+            // fire the bounce callback. If we'd already been dispatched on
+            // the wire and the response just hasn't landed yet, do neither —
+            // the in-flight pending entry will resolve via [dispatchJsonRpc]
+            // or fail via [failPendingOnDisconnect], at which point its
+            // disk entry is cleaned up there.
+            if (removed) {
+                runCatching { queueStore.remove(item.message.id) }
+                runCatching { onMessageExpired?.invoke(item.message) }
+            }
             if (!item.deferred.isCompleted) {
                 item.deferred.completeExceptionally(QueueTtlException())
             }
@@ -649,11 +767,15 @@ class RemoteClient internal constructor(
         data object QueueChanged : LifecycleEvent
     }
 
+    /**
+     * In-memory wrapper around a persisted [QueuedMessage] holding its
+     * caller-side [CompletableDeferred] + the TTL chosen by the caller.
+     * The [message] is the disk-canonical view; [deferred] is process-
+     * local and re-created (orphaned) on rehydrate.
+     */
     private data class QueuedCall(
-        val method: String,
-        val params: JsonElement?,
+        val message: QueuedMessage,
         val deferred: CompletableDeferred<JsonRpcResponse>,
-        val enqueuedAtMs: Long,
         val ttlMs: Long,
     )
 
@@ -664,7 +786,16 @@ class RemoteClient internal constructor(
     class ClosedException : RuntimeException("client closed before flush")
 
     companion object {
-        /** Default TTL for [queueCall] — 5 minutes. */
-        const val DEFAULT_QUEUE_TTL_MS: Long = 5L * 60L * 1_000L
+        /**
+         * Default TTL for [queueCall] — **24 hours** (R-6d).
+         *
+         * Trade-off vs the original 5-minute value: the realistic offline
+         * scenario the user complained about is a metro ride / flight /
+         * overnight outage, all of which are well above 5 min. The cost
+         * of overshooting (a 24h-old "send" firing on resume) is
+         * mitigated by the bounce-to-input recovery in `:app` — if the
+         * intent's stale, the user notices the bubble and edits.
+         */
+        const val DEFAULT_QUEUE_TTL_MS: Long = 24L * 60L * 60L * 1_000L
     }
 }

@@ -128,6 +128,38 @@ fun SessionDetailScreen(
         viewModel.sendError.collect { msg -> snackbarHostState.showSnackbar(msg) }
     }
 
+    // R-6d: bounce-to-input recovery. If a previous queueCall expired
+    // (TTL hit / process kill while offline / terminal RPC failure), the
+    // ViewModel stashed the text on DraftRepository's bounced channel.
+    // Reading it here clears the slot, so the snackbar appears exactly
+    // once per expiry event.
+    //
+    // The bounce text takes precedence over the regular draft because
+    // it's the more recent intent — if the user was typing AND a
+    // background queued send expired, the typed text is in the draft
+    // slot and the failed-send text is in the bounce slot. Surfacing
+    // the bounce gets the lost content back into view; once the user
+    // edits/sends/cancels it, the typed draft can be recovered by hand
+    // from anywhere they pasted it. (Alternative: append the bounce
+    // to the typed draft separated by `\n\n`. Kept simpler for v1.)
+    val draftRepository = viewModel.draftRepository
+    data class InitialDraftSeed(val text: String, val isBounce: Boolean)
+    val seed: InitialDraftSeed = remember(sessionId) {
+        val bounced = draftRepository.bouncedFor(sessionId)
+        if (bounced != null) {
+            InitialDraftSeed(bounced, isBounce = true)
+        } else {
+            InitialDraftSeed(draftRepository.load(sessionId), isBounce = false)
+        }
+    }
+    LaunchedEffect(sessionId, seed.isBounce) {
+        if (seed.isBounce) {
+            snackbarHostState.showSnackbar(
+                "Couldn't send earlier — added back to your message for retry.",
+            )
+        }
+    }
+
     val displayTitle: String = (sessionState as? UiData.Loaded)?.value?.title?.ifBlank { "Session" }
         ?: "Session"
     val displayState: DisplayState = (sessionState as? UiData.Loaded)?.value
@@ -161,9 +193,20 @@ fun SessionDetailScreen(
                 enabled = sessionState is UiData.Loaded,
                 state = displayState,
                 cancelInFlight = cancelInFlight,
-                onSend = viewModel::sendMessage,
+                onSend = { text ->
+                    viewModel.sendMessage(text)
+                    // On send, the regular draft is invalidated. We
+                    // optimistically clear here so a quick re-open
+                    // doesn't repopulate the field even before the
+                    // server echo lands. Bounce-on-failure is handled
+                    // separately by handleExpiredMessage.
+                    draftRepository.clear(sessionId)
+                },
                 onCancel = viewModel::cancelTurn,
                 rawState = rawState,
+                sessionId = sessionId,
+                initialDraft = seed.text,
+                onDraftChanged = { text -> draftRepository.save(sessionId, text) },
             )
         },
     ) { padding ->
@@ -710,9 +753,20 @@ private fun ComposeBar(
     onSend: (String) -> Unit,
     onCancel: () -> Unit,
     rawState: String,
+    sessionId: String,
+    initialDraft: String,
+    onDraftChanged: (String) -> Unit,
 ) {
-    // Persist draft across config changes — emptied on successful send.
-    var draft by rememberSaveable { mutableStateOf("") }
+    // R-6d: rememberSaveable for config-change resilience + draft-on-disk
+    // for cross-restart resilience. `mutableStateOf(initialDraft)` keyed
+    // on sessionId resets when the user navigates between sessions; the
+    // disk write below is debounced 500 ms so the I/O scheduler isn't
+    // hammered by every keystroke.
+    var draft by rememberSaveable(sessionId) { mutableStateOf(initialDraft) }
+    LaunchedEffect(draft, sessionId) {
+        kotlinx.coroutines.delay(500)
+        onDraftChanged(draft)
+    }
     val isRunning = state == DisplayState.Running
     val sendEnabled = enabled && !isRunning && draft.isNotBlank()
     val showCancel = isRunning
