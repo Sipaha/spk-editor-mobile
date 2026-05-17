@@ -1,80 +1,171 @@
 package ru.sipaha.spkremote.core
 
-import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
-import javax.net.ssl.SSLContext
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
-import okio.ByteString
-import okio.ByteString.Companion.toByteString
 
 /**
- * Connection lifecycle to one SPK Editor instance.
+ * Resilient connection to one SPK Editor instance.
  *
- * Stages:
- *   1. WebSocket upgrade to `wss://host:port/remote` (TLS pinned by [PairingUrl.fingerprint]).
+ * **Handshake (each attempt):**
+ *   1. WebSocket upgrade to `wss://host:port/remote` (TLS pinned by
+ *      [PairingUrl.fingerprint]).
  *   2. Receive 16-byte binary nonce.
  *   3. Send 32-byte binary HMAC-SHA256 response (see [HmacChallengeAuth]).
  *   4. Receive ASCII verdict `OK` (accept) or `REJECT` (terminate).
  *   5. Carry JSON-RPC text frames in both directions. Frames with an `id`
- *      that matches an outstanding [call] resolve that call. Frames without an
- *      `id` (or with an unknown id) are emitted on [notifications].
+ *      that matches an outstanding [call] resolve that call. Frames without
+ *      an `id` (or with an unknown id) are emitted on [notifications].
  *
- * This class is intentionally minimal — it does no reconnection, no backoff,
- * no message buffering. Higher-level concerns (queued send while connecting,
- * exponential reconnect) are deferred to later phases; the ViewModel can wrap
- * a `RemoteClient` and supply that policy.
+ * **Resilience (R-6a):**
+ *   - A long-running lifecycle coroutine owns the WS. When a transport-level
+ *     drop happens (network change, NAT timeout, server restart), the
+ *     coroutine transitions [connectionState] to [ConnectionState.Reconnecting]
+ *     and retries with [BackoffStrategy.Default].
+ *   - Terminal failures (TLS pin mismatch, HMAC reject, version skew) drop
+ *     to [ConnectionState.FailedTerminal] without auto-retry — the user
+ *     must re-pair.
+ *   - [subscribe]/[unsubscribe] track the active event-kind set; on every
+ *     successful reconnect handshake the set is replayed so subscribers see
+ *     no notification gap longer than the reconnect window itself.
+ *   - [queueCall] is the production-grade send entry point — if the wire is
+ *     down, the request is held in an in-memory FIFO until the next
+ *     [ConnectionState.Connected] transition or until its TTL expires.
+ *
+ * **Concurrency model:** every state mutation that's visible across awaits
+ * (pending requests, subscription set, queued items) goes through suspending
+ * methods running on the supplied [scope]; OkHttp's I/O threads only drive
+ * the [RemoteTransportListener] callbacks, which post events onto the
+ * lifecycle channel and return immediately.
  */
-class RemoteClient(
+class RemoteClient internal constructor(
     private val url: PairingUrl,
-    httpClientBuilder: OkHttpClient.Builder = defaultClientBuilder(url),
+    private val transportFactory: RemoteTransportFactory,
+    private val backoff: BackoffStrategy = BackoffStrategy.Default,
+    /**
+     * `now()` source for queue-TTL arithmetic. Defaults to wall clock.
+     * Tests inject a fake whose progression is driven by `TestScope`.
+     */
+    private val nowMs: () -> Long = System::currentTimeMillis,
 ) {
-    private val client: OkHttpClient = httpClientBuilder.build()
+    constructor(
+        url: PairingUrl,
+        httpClientBuilder: OkHttpClient.Builder = OkHttpRemoteTransportFactory.defaultBuilder(url),
+    ) : this(
+        url = url,
+        transportFactory = OkHttpRemoteTransportFactory { _ -> httpClientBuilder },
+    )
+
+    private val auth = HmacChallengeAuth(url.secret)
     private val nextId = AtomicLong(1L)
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<JsonRpcResponse>>()
     private val _notifications = MutableSharedFlow<JsonElement>(extraBufferCapacity = 64)
     val notifications: SharedFlow<JsonElement> = _notifications.asSharedFlow()
 
-    @Volatile private var webSocket: WebSocket? = null
-    @Volatile private var handshakeStage: HandshakeStage = HandshakeStage.AwaitingNonce
-    @Volatile private var handshakeResult: CompletableDeferred<Unit>? = null
-    private val auth = HmacChallengeAuth(url.secret)
+    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
-    suspend fun connect(): Result<Unit> = runCatching {
-        check(webSocket == null) { "RemoteClient already connected" }
+    /**
+     * Event kinds the caller has asked to receive. Mutated under [stateLock]
+     * to keep [subscribe]/[unsubscribe] linearizable, and replayed on every
+     * successful reconnect handshake.
+     */
+    private val activeSubscriptions = mutableSetOf<String>()
+    private val stateLock = Any()
+
+    /** Outbound queue — items waiting for a live connection. */
+    private val queued = ArrayDeque<QueuedCall>()
+
+    /** Events the lifecycle coroutine consumes. */
+    private val events = Channel<LifecycleEvent>(Channel.UNLIMITED)
+
+    /** Set after the first successful [connect]; reused by subsequent reconnects. */
+    @Volatile private var scope: CoroutineScope? = null
+    @Volatile private var lifecycleJob: Job? = null
+    @Volatile private var firstConnect: CompletableDeferred<Unit>? = null
+
+    /** Current transport (or null while reconnecting). Mutated only from the lifecycle coroutine. */
+    private var transport: RemoteTransport? = null
+
+    /**
+     * Connect (and from then on, stay connected) using [scope] as the
+     * supervisor. Returns success once the first handshake completes; later
+     * disconnects do **not** propagate to this caller — they show up as
+     * [ConnectionState.Reconnecting] on [connectionState].
+     *
+     * If [scope] is omitted, the client creates an internal supervisor; the
+     * caller must remember to invoke [close] to release it.
+     */
+    suspend fun connect(scope: CoroutineScope? = null): Result<Unit> = runCatching {
+        val target = scope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        check(lifecycleJob == null) { "RemoteClient already connecting/connected" }
+        this.scope = target
         val gate = CompletableDeferred<Unit>()
-        handshakeResult = gate
-        handshakeStage = HandshakeStage.AwaitingNonce
-
-        val request = Request.Builder()
-            .url("https://${url.host}:${url.port}/remote".toWsUrl())
-            .header("X-Spk-Remote-Client", url.client)
-            .build()
-
-        webSocket = client.newWebSocket(request, listener)
+        firstConnect = gate
+        lifecycleJob = target.launch { lifecycleLoop() }
+        // Caller awaits the first Connected transition (or terminal failure).
         gate.await()
     }
 
+    /** Whether a programmatic close has been requested (lifecycle ends). */
+    @Volatile private var closing = false
+
+    fun close() {
+        closing = true
+        events.trySend(LifecycleEvent.UserClose)
+        // Fail pending in-flight calls — the wire is gone.
+        pending.values.forEach { it.cancel() }
+        pending.clear()
+        // Queued items are dropped with TimeoutException for symmetry with TTL.
+        synchronized(stateLock) {
+            queued.forEach { it.deferred.completeExceptionally(ClosedException()) }
+            queued.clear()
+        }
+        // Unblock callers still awaiting their first handshake.
+        firstConnect?.takeIf { !it.isCompleted }
+            ?.completeExceptionally(ClosedException())
+        transport?.close()
+        transport = null
+        lifecycleJob?.cancel()
+        lifecycleJob = null
+        _connectionState.value = ConnectionState.Disconnected
+    }
+
+    /**
+     * Fire a JSON-RPC call now, expecting the wire to be live. If the
+     * transport is closed or refuses the frame, fails with
+     * [IllegalStateException]. Most call sites should prefer [queueCall].
+     */
     suspend fun call(method: String, params: JsonElement? = null): JsonRpcResponse {
-        val ws = checkNotNull(webSocket) { "not connected" }
+        val active = transport ?: throw IllegalStateException("not connected")
         val id = nextId.getAndIncrement()
         val deferred = CompletableDeferred<JsonRpcResponse>()
         pending[id] = deferred
@@ -84,14 +175,13 @@ class RemoteClient(
                 if (cause != null) {
                     cont.resumeWithException(cause)
                 } else {
-                    @Suppress("UNCHECKED_CAST")
-                    cont.resume((deferred as CompletableDeferred<JsonRpcResponse>).getCompleted())
+                    cont.resume(deferred.getCompleted())
                 }
             }
             cont.invokeOnCancellation {
                 pending.remove(id)?.cancel()
             }
-            val sent = ws.send(req)
+            val sent = active.send(req)
             if (!sent) {
                 pending.remove(id)
                 cont.resumeWithException(IllegalStateException("websocket refused frame"))
@@ -100,17 +190,90 @@ class RemoteClient(
     }
 
     /**
+     * Queue a JSON-RPC call to be sent when (or as soon as) the connection
+     * is [ConnectionState.Connected]. If already connected, sends
+     * immediately. Fails the deferred response after [ttlMs] of total time
+     * spent queued + in flight.
+     *
+     * Default TTL is **5 minutes** — long enough that a user who taps Send
+     * inside a tunnel and emerges before the next subway stop still gets
+     * their message through, short enough that a multi-hour outage doesn't
+     * fire a one-day-old "send" on resume.
+     *
+     * @throws TimeoutException via the returned response promise on TTL
+     *   expiry (wrapped as a [JsonRpcResponse] failure).
+     */
+    suspend fun queueCall(
+        method: String,
+        params: JsonElement? = null,
+        ttlMs: Long = DEFAULT_QUEUE_TTL_MS,
+    ): JsonRpcResponse {
+        // Fast path: if we're connected, hand off to `call` directly. The
+        // TTL only applies while the call is *queued* — once the wire
+        // delivers it, the server's per-method timeout is what we trust.
+        // (Wrapping in withTimeout here would interfere with TestScope
+        //  virtual-time advancement and isn't what the spec asked for.)
+        if (_connectionState.value is ConnectionState.Connected) {
+            return call(method, params)
+        }
+        val deferred = CompletableDeferred<JsonRpcResponse>()
+        val item = QueuedCall(
+            method = method,
+            params = params,
+            deferred = deferred,
+            enqueuedAtMs = nowMs(),
+            ttlMs = ttlMs,
+        )
+        val sendSynchronously = synchronized(stateLock) {
+            // Re-check inside the lock so a flush in flight doesn't strand us.
+            if (_connectionState.value is ConnectionState.Connected) {
+                true
+            } else {
+                queued += item
+                false
+            }
+        }
+        if (sendSynchronously) {
+            // Connected raced us; send directly.
+            return call(method, params)
+        }
+        events.trySend(LifecycleEvent.QueueChanged)
+        return awaitWithTtl(item)
+    }
+
+    /** Add [kinds] to the active subscription set and notify the server. */
+    suspend fun subscribe(kinds: List<String>): JsonRpcResponse {
+        synchronized(stateLock) { activeSubscriptions += kinds }
+        return call(
+            "remote.editor.subscribe",
+            buildJsonObject {
+                put("kinds", JsonArray(kinds.map { JsonPrimitive(it) }))
+            },
+        )
+    }
+
+    /** Remove [kinds] from the active subscription set and notify the server. */
+    suspend fun unsubscribe(kinds: List<String>): JsonRpcResponse {
+        synchronized(stateLock) { activeSubscriptions -= kinds.toSet() }
+        return call(
+            "remote.editor.unsubscribe",
+            buildJsonObject {
+                put("kinds", JsonArray(kinds.map { JsonPrimitive(it) }))
+            },
+        )
+    }
+
+    /**
+     * Snapshot of currently-tracked subscription kinds. Read-only,
+     * exposed for tests and the UI layer.
+     */
+    fun activeSubscriptionKinds(): Set<String> =
+        synchronized(stateLock) { activeSubscriptions.toSet() }
+
+    /**
      * Convenience helper around `remote.solution_agent.get_session_entry`.
-     *
-     * Used by R-5f's diff-streaming flow: on
-     * `agent_session_message_appended` we only re-fetch the single new (or
-     * mutated) entry rather than the whole transcript. The returned
-     * [EntrySummary] always carries `markdown` populated; `images` is
-     * populated only when [includeImages] is true and the entry has
-     * inline images.
-     *
-     * Throws [IllegalStateException] if the server returns a JSON-RPC
-     * error (typically `entry_index_out_of_range`).
+     * See R-5f: on `agent_session_message_appended` we re-fetch only the
+     * single new (or mutated) entry rather than the whole transcript.
      */
     suspend fun getSessionEntry(
         sessionId: String,
@@ -131,40 +294,246 @@ class RemoteClient(
         return JsonRpc.json.decodeFromJsonElement(GetSessionEntryResult.serializer(), result)
     }
 
-    fun close() {
-        webSocket?.close(1000, "client closing")
-        webSocket = null
-        pending.values.forEach { it.cancel() }
+    // ---------------------------------------------------------------------
+    // Lifecycle coroutine
+    // ---------------------------------------------------------------------
+
+    private suspend fun lifecycleLoop() {
+        var attempt = 0
+        while (!closing && (scope?.isActive == true)) {
+            if (attempt == 0) {
+                _connectionState.value = ConnectionState.Connecting
+            } else {
+                val delayMs = backoff.nextDelayMs(attempt)
+                _connectionState.value = ConnectionState.Reconnecting(attempt, delayMs)
+                delay(delayMs)
+                if (closing) break
+                _connectionState.value = ConnectionState.Connecting
+            }
+            val outcome = runOneAttempt()
+            when (outcome) {
+                AttemptOutcome.Connected -> {
+                    attempt = 0
+                    // Wait for a close/failure event before looping.
+                    val end = awaitDisconnect()
+                    if (closing || end is DisconnectReason.UserClose) break
+                    if (end is DisconnectReason.Terminal) {
+                        _connectionState.value = ConnectionState.FailedTerminal(end.reason)
+                        firstConnect?.takeIf { !it.isCompleted }
+                            ?.completeExceptionally(IllegalStateException(end.reason))
+                        return
+                    }
+                    // Transient — loop with attempt=1.
+                    attempt = 1
+                }
+                is AttemptOutcome.TerminalFailure -> {
+                    _connectionState.value = ConnectionState.FailedTerminal(outcome.reason)
+                    firstConnect?.takeIf { !it.isCompleted }
+                        ?.completeExceptionally(IllegalStateException(outcome.reason))
+                    return
+                }
+                is AttemptOutcome.TransientFailure -> {
+                    attempt = if (attempt == 0) 1 else attempt + 1
+                }
+            }
+        }
+        _connectionState.value = ConnectionState.Disconnected
+    }
+
+    /**
+     * Drive one transport from connect → handshake → ready or → failure.
+     * Returns once the handshake completes, fails, or the transport hangs
+     * up before reaching Established.
+     */
+    private suspend fun runOneAttempt(): AttemptOutcome {
+        val handshake = CompletableDeferred<AttemptOutcome>()
+        val stage = HandshakeStageRef()
+        val listener = HandshakeListener(handshake, stage)
+        val tx = transportFactory.connect(url, listener)
+        transport = tx
+        return try {
+            handshake.await().also { outcome ->
+                if (outcome is AttemptOutcome.Connected) {
+                    _connectionState.value = ConnectionState.Connected
+                    onConnected()
+                    firstConnect?.takeIf { !it.isCompleted }?.complete(Unit)
+                } else {
+                    tx.close()
+                    transport = null
+                }
+            }
+        } catch (t: Throwable) {
+            tx.close()
+            transport = null
+            AttemptOutcome.TransientFailure(t.message ?: "handshake error")
+        }
+    }
+
+    /** Wait for a Close / Failure event from the active transport listener. */
+    private suspend fun awaitDisconnect(): DisconnectReason {
+        for (event in events) {
+            when (event) {
+                LifecycleEvent.UserClose -> return DisconnectReason.UserClose
+                is LifecycleEvent.TransportClosed -> {
+                    transport = null
+                    failPendingOnDisconnect(event.reason)
+                    return DisconnectReason.Transient(event.reason)
+                }
+                is LifecycleEvent.TransportFailure -> {
+                    transport = null
+                    failPendingOnDisconnect(event.reason)
+                    return if (event.terminal) {
+                        DisconnectReason.Terminal(event.reason)
+                    } else {
+                        DisconnectReason.Transient(event.reason)
+                    }
+                }
+                LifecycleEvent.QueueChanged -> {
+                    // We're Connected here — flush whatever just arrived.
+                    flushQueue()
+                }
+            }
+        }
+        return DisconnectReason.UserClose
+    }
+
+    /**
+     * Re-subscribe + flush queued calls after a successful handshake.
+     *
+     * The re-subscribe RPC is fired on a child coroutine — we don't want to
+     * block the lifecycle loop on its response, and a failure is non-fatal
+     * (the next reconnect retries). Queue flushing is synchronous w.r.t.
+     * the deque scan but dispatches each item on its own coroutine.
+     */
+    private fun onConnected() {
+        val kinds = synchronized(stateLock) { activeSubscriptions.toList() }
+        val activeScope = scope
+        if (kinds.isNotEmpty() && activeScope != null) {
+            activeScope.launch {
+                runCatching {
+                    call(
+                        "remote.editor.subscribe",
+                        buildJsonObject {
+                            put("kinds", JsonArray(kinds.map { JsonPrimitive(it) }))
+                        },
+                    )
+                }
+            }
+        }
+        flushQueue()
+    }
+
+    /**
+     * Send every still-fresh queued item; TTL-expire the stale ones. Held
+     * under [stateLock] just long enough to drain the deque into a local
+     * list so we don't hold the monitor across `call()`.
+     *
+     * On transport loss mid-flush, items not yet dispatched are re-enqueued
+     * at the head of the deque so FIFO order survives across reconnects.
+     */
+    private fun flushQueue() {
+        val toSend = synchronized(stateLock) {
+            val now = nowMs()
+            val survivors = ArrayList<QueuedCall>(queued.size)
+            val expired = ArrayList<QueuedCall>()
+            for (item in queued) {
+                if (now - item.enqueuedAtMs >= item.ttlMs) {
+                    expired += item
+                } else {
+                    survivors += item
+                }
+            }
+            queued.clear()
+            expired.forEach { it.deferred.completeExceptionally(QueueTtlException()) }
+            survivors
+        }
+        if (toSend.isEmpty()) return
+        val activeScope = scope ?: return
+        for ((index, item) in toSend.withIndex()) {
+            val active = transport
+            if (active == null) {
+                // Wire dropped mid-flush — push the rest back at the head.
+                synchronized(stateLock) {
+                    val remaining = toSend.subList(index, toSend.size)
+                    val combined = ArrayDeque<QueuedCall>(remaining.size + queued.size)
+                    combined.addAll(remaining)
+                    combined.addAll(queued)
+                    queued.clear()
+                    queued.addAll(combined)
+                }
+                return
+            }
+            val remainingTtl = item.ttlMs - (nowMs() - item.enqueuedAtMs)
+            if (remainingTtl <= 0) {
+                item.deferred.completeExceptionally(QueueTtlException())
+                continue
+            }
+            // The caller-side awaitWithTtl already enforces the overall TTL
+            // budget. We just send + resolve here without an additional
+            // timeout wrapper — wrapping with withTimeout would schedule a
+            // virtual-time job that `advanceUntilIdle` can run past in
+            // tests even when no real network latency exists.
+            activeScope.launch {
+                try {
+                    val resp = call(item.method, item.params)
+                    item.deferred.complete(resp)
+                } catch (t: Throwable) {
+                    item.deferred.completeExceptionally(t)
+                }
+            }
+        }
+    }
+
+    private suspend fun awaitWithTtl(item: QueuedCall): JsonRpcResponse {
+        // Race: TTL timer vs the deferred completing via flushQueue.
+        return try {
+            withTimeout(item.ttlMs) { item.deferred.await() }
+        } catch (t: TimeoutCancellationException) {
+            synchronized(stateLock) { queued.remove(item) }
+            if (!item.deferred.isCompleted) {
+                item.deferred.completeExceptionally(QueueTtlException())
+            }
+            throw QueueTtlException()
+        }
+    }
+
+    private fun failPendingOnDisconnect(reason: String) {
+        val cause = IllegalStateException("connection closed: $reason")
+        pending.values.forEach { it.completeExceptionally(cause) }
         pending.clear()
     }
 
-    private val listener = object : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            // Wait for nonce; nothing to send yet.
-        }
+    // ---------------------------------------------------------------------
+    // Handshake listener
+    // ---------------------------------------------------------------------
 
-        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            when (handshakeStage) {
+    private class HandshakeStageRef {
+        @Volatile var stage: HandshakeStage = HandshakeStage.AwaitingNonce
+    }
+
+    private inner class HandshakeListener(
+        private val handshake: CompletableDeferred<AttemptOutcome>,
+        private val ref: HandshakeStageRef,
+    ) : RemoteTransportListener {
+
+        override fun onBinary(bytes: ByteArray) {
+            val tx = transport ?: return
+            when (ref.stage) {
                 HandshakeStage.AwaitingNonce -> {
-                    val nonce = bytes.toByteArray()
-                    if (nonce.size != HmacChallengeAuth.NONCE_LEN) {
-                        failHandshake(
-                            IllegalStateException(
-                                "expected ${HmacChallengeAuth.NONCE_LEN}B nonce, got ${nonce.size}B"
-                            )
-                        )
+                    if (bytes.size != HmacChallengeAuth.NONCE_LEN) {
+                        completeTerminal("expected ${HmacChallengeAuth.NONCE_LEN}B nonce, got ${bytes.size}B")
                         return
                     }
-                    val response = auth.respond(nonce)
-                    handshakeStage = HandshakeStage.AwaitingVerdict
-                    webSocket.send(response.toByteString())
+                    val response = auth.respond(bytes)
+                    ref.stage = HandshakeStage.AwaitingVerdict
+                    tx.send(response)
                 }
                 HandshakeStage.AwaitingVerdict -> {
-                    if (auth.isAccepted(bytes.toByteArray())) {
-                        handshakeStage = HandshakeStage.Established
-                        handshakeResult?.complete(Unit)
+                    if (auth.isAccepted(bytes)) {
+                        ref.stage = HandshakeStage.Established
+                        handshake.complete(AttemptOutcome.Connected)
                     } else {
-                        failHandshake(IllegalStateException("server rejected HMAC"))
+                        completeTerminal("server rejected HMAC")
                     }
                 }
                 HandshakeStage.Established -> {
@@ -173,35 +542,68 @@ class RemoteClient(
             }
         }
 
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            when (handshakeStage) {
+        override fun onText(text: String) {
+            when (ref.stage) {
                 HandshakeStage.AwaitingVerdict -> {
                     if (text.trim() == HmacChallengeAuth.VERDICT_OK) {
-                        handshakeStage = HandshakeStage.Established
-                        handshakeResult?.complete(Unit)
+                        ref.stage = HandshakeStage.Established
+                        handshake.complete(AttemptOutcome.Connected)
                     } else {
-                        failHandshake(IllegalStateException("server verdict: $text"))
+                        completeTerminal("server verdict: $text")
                     }
                 }
                 HandshakeStage.Established -> dispatchJsonRpc(text)
                 HandshakeStage.AwaitingNonce ->
-                    failHandshake(IllegalStateException("unexpected text frame before nonce"))
+                    completeTransient("unexpected text frame before nonce")
             }
         }
 
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            failHandshake(t)
-            pending.values.forEach { it.completeExceptionally(t) }
-            pending.clear()
+        override fun onFailure(t: Throwable) {
+            val msg = t.message ?: t.toString()
+            if (isTerminal(t, msg)) {
+                if (ref.stage == HandshakeStage.Established) {
+                    events.trySend(LifecycleEvent.TransportFailure(msg, terminal = true))
+                } else if (!handshake.isCompleted) {
+                    handshake.complete(AttemptOutcome.TerminalFailure(msg))
+                }
+            } else {
+                if (ref.stage == HandshakeStage.Established) {
+                    events.trySend(LifecycleEvent.TransportFailure(msg, terminal = false))
+                } else if (!handshake.isCompleted) {
+                    handshake.complete(AttemptOutcome.TransientFailure(msg))
+                }
+            }
         }
 
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            failHandshake(IllegalStateException("connection closed: $code $reason"))
-            pending.values.forEach {
-                it.completeExceptionally(IllegalStateException("connection closed"))
+        override fun onClosed(code: Int, reason: String) {
+            if (ref.stage == HandshakeStage.Established) {
+                events.trySend(LifecycleEvent.TransportClosed(reason.ifBlank { "code=$code" }))
+            } else if (!handshake.isCompleted) {
+                handshake.complete(AttemptOutcome.TransientFailure(reason.ifBlank { "code=$code" }))
             }
-            pending.clear()
         }
+
+        private fun completeTerminal(reason: String) {
+            if (!handshake.isCompleted) handshake.complete(AttemptOutcome.TerminalFailure(reason))
+        }
+        private fun completeTransient(reason: String) {
+            if (!handshake.isCompleted) handshake.complete(AttemptOutcome.TransientFailure(reason))
+        }
+    }
+
+    private fun isTerminal(t: Throwable, msg: String): Boolean {
+        // Heuristic: TLS pinning failures and TLS handshake aborts surface
+        // as javax.net.ssl.SSLHandshakeException / SSLPeerUnverifiedException
+        // with messages mentioning "fingerprint" / "pinning" / "certificate".
+        // Anything network-shaped (Socket / connection reset / EOF) is
+        // transient.
+        val cls = t.javaClass.name
+        if (cls.startsWith("javax.net.ssl.") &&
+            (msg.contains("fingerprint", ignoreCase = true) ||
+                msg.contains("pinning", ignoreCase = true) ||
+                msg.contains("certificate", ignoreCase = true))
+        ) return true
+        return false
     }
 
     private fun dispatchJsonRpc(text: String) {
@@ -222,30 +624,47 @@ class RemoteClient(
         _notifications.tryEmit(parsed)
     }
 
-    private fun failHandshake(cause: Throwable) {
-        val gate = handshakeResult ?: return
-        if (!gate.isCompleted) gate.completeExceptionally(cause)
+    // ---------------------------------------------------------------------
+    // Internal types
+    // ---------------------------------------------------------------------
+
+    internal enum class HandshakeStage { AwaitingNonce, AwaitingVerdict, Established }
+
+    private sealed interface AttemptOutcome {
+        data object Connected : AttemptOutcome
+        data class TerminalFailure(val reason: String) : AttemptOutcome
+        data class TransientFailure(val reason: String) : AttemptOutcome
     }
 
-    private enum class HandshakeStage { AwaitingNonce, AwaitingVerdict, Established }
+    private sealed interface DisconnectReason {
+        data object UserClose : DisconnectReason
+        data class Transient(val reason: String) : DisconnectReason
+        data class Terminal(val reason: String) : DisconnectReason
+    }
+
+    private sealed interface LifecycleEvent {
+        data object UserClose : LifecycleEvent
+        data class TransportClosed(val reason: String) : LifecycleEvent
+        data class TransportFailure(val reason: String, val terminal: Boolean) : LifecycleEvent
+        data object QueueChanged : LifecycleEvent
+    }
+
+    private data class QueuedCall(
+        val method: String,
+        val params: JsonElement?,
+        val deferred: CompletableDeferred<JsonRpcResponse>,
+        val enqueuedAtMs: Long,
+        val ttlMs: Long,
+    )
+
+    /** Surface marker for TTL-expired queue items. */
+    class QueueTtlException : RuntimeException("queued call timed out")
+
+    /** Surface marker for queue items dropped at [close]. */
+    class ClosedException : RuntimeException("client closed before flush")
 
     companion object {
-        private val secureRandom = SecureRandom()
-
-        fun defaultClientBuilder(url: PairingUrl): OkHttpClient.Builder {
-            val trustManager = FingerprintPinningTrustManager(url.fingerprint)
-            val sslContext = SSLContext.getInstance("TLSv1.3").apply {
-                init(null, arrayOf(trustManager), secureRandom)
-            }
-            return OkHttpClient.Builder()
-                .sslSocketFactory(sslContext.socketFactory, trustManager)
-                .hostnameVerifier { _, _ -> true } // fingerprint pin obsoletes hostname check
-                .pingInterval(20, TimeUnit.SECONDS)
-                .readTimeout(0, TimeUnit.MILLISECONDS)
-        }
-
-        // OkHttp WebSocket builder requires an http(s):// URL — it does the
-        // ws/wss upgrade internally. Translate the user-facing https URL.
-        private fun String.toWsUrl(): String = this
+        /** Default TTL for [queueCall] — 5 minutes. */
+        const val DEFAULT_QUEUE_TTL_MS: Long = 5L * 60L * 1_000L
     }
 }

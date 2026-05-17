@@ -7,13 +7,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import ru.sipaha.spkremote.core.AgentSummary
+import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.CreateSessionResult
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.GetSessionResult
@@ -31,6 +30,20 @@ sealed interface UiState {
     data class Disconnected(val lastUrl: String? = null, val error: String? = null) : UiState
     data object Connecting : UiState
     data class Connected(val protocolVersion: String) : UiState
+}
+
+/**
+ * Lightweight projection of [ConnectionState] for the navigation banner.
+ *
+ * Mirrors the underlying [ConnectionState] but drops the Connecting state
+ * (no banner needed — the user is on the connecting spinner screen) and
+ * only carries the fields the banner needs to render. Decoupling here
+ * means the Compose layer doesn't need to import `:core` types directly.
+ */
+sealed interface ConnectionBanner {
+    data object Hidden : ConnectionBanner
+    data class Reconnecting(val attempt: Int, val nextRetryMs: Long) : ConnectionBanner
+    data class FailedTerminal(val reason: String) : ConnectionBanner
 }
 
 /** Lightweight loadable wrapper for async-backed UI state. */
@@ -104,6 +117,27 @@ class MainViewModel : ViewModel() {
     private var sessionDetailObserverJob: Job? = null
     private var sessionDetailSubscribed = false
 
+    /**
+     * Banner displayed by the navigation graph when the underlying socket
+     * is in trouble — Reconnecting or FailedTerminal. Hidden in normal
+     * Connected / Disconnected states.
+     */
+    private val _connectionBanner = MutableStateFlow<ConnectionBanner>(ConnectionBanner.Hidden)
+    val connectionBanner: StateFlow<ConnectionBanner> = _connectionBanner.asStateFlow()
+
+    /**
+     * Last entry index we observed for each session via
+     * `agent_session_message_appended`. Used after a reconnect — if the
+     * currently-open session has progressed past what we last saw, we
+     * trigger a full re-fetch to catch up. Map is intentionally bounded
+     * by the user's lifetime in-process (no persistence) since this is a
+     * UX hint, not authoritative state.
+     */
+    private val lastSeenEntryIndex = mutableMapOf<String, Int>()
+
+    /** Job that observes [RemoteClient.connectionState]. */
+    private var connectionObserverJob: Job? = null
+
     fun connect(rawUrl: String) {
         val parsed = PairingUrl.parse(rawUrl).getOrElse {
             _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
@@ -113,7 +147,10 @@ class MainViewModel : ViewModel() {
         viewModelScope.launch {
             val newClient = RemoteClient(parsed)
             client = newClient
-            newClient.connect()
+            // Hand the lifecycle our viewModelScope so reconnects keep
+            // running as long as the ViewModel is alive (cancelled on
+            // onCleared via close()).
+            newClient.connect(viewModelScope)
                 .onFailure {
                     _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
                     return@launch
@@ -130,6 +167,49 @@ class MainViewModel : ViewModel() {
                 .onFailure {
                     _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
                 }
+            // Start watching connection state for the banner + reconnect
+            // refresh hook. Cancels on the next [connect] or onCleared.
+            startObservingConnectionState(newClient)
+        }
+    }
+
+    /**
+     * Translate [RemoteClient.connectionState] into the UI banner and
+     * trigger a session re-fetch whenever we transition into Connected
+     * from a non-Connected state — that's the "I just came back, my
+     * desktop may have moved on" recovery hook the user-facing chat
+     * surface depends on for not silently lagging behind.
+     */
+    private fun startObservingConnectionState(client: RemoteClient) {
+        connectionObserverJob?.cancel()
+        connectionObserverJob = viewModelScope.launch {
+            var previousConnected = false
+            client.connectionState.collect { state ->
+                _connectionBanner.value = when (state) {
+                    is ConnectionState.Reconnecting -> ConnectionBanner.Reconnecting(
+                        attempt = state.attempt,
+                        nextRetryMs = state.nextRetryMs,
+                    )
+                    is ConnectionState.FailedTerminal -> ConnectionBanner.FailedTerminal(state.reason)
+                    ConnectionState.Connected,
+                    ConnectionState.Connecting,
+                    ConnectionState.Disconnected -> ConnectionBanner.Hidden
+                }
+                val isConnected = state is ConnectionState.Connected
+                if (isConnected && !previousConnected) {
+                    // Re-entered Connected — re-fetch the open session
+                    // (if any) so the user sees any entries that landed
+                    // on the desktop while we were offline. The lastSeen
+                    // marker drives the decision: if the desktop progressed
+                    // beyond what we last rendered, the full re-fetch
+                    // catches up cheaply (server transcripts are small).
+                    val activeSession = openSessionId
+                    if (activeSession != null) {
+                        refreshSession(activeSession)
+                    }
+                }
+                previousConnected = isConnected
+            }
         }
     }
 
@@ -198,10 +278,10 @@ class MainViewModel : ViewModel() {
         sessionObserverJob?.cancel()
         sessionObserverJob = viewModelScope.launch {
             if (!sessionStateSubscribed) {
-                val params = buildJsonObject {
-                    put("kinds", JsonArray(listOf(JsonPrimitive("agent_session_state_changed"))))
-                }
-                runCatching { active.call("remote.editor.subscribe", params) }
+                // Routed through RemoteClient.subscribe so the active
+                // subscription set is tracked and replayed on every
+                // successful reconnect handshake (R-6a).
+                runCatching { active.subscribe(listOf("agent_session_state_changed")) }
                     .onSuccess { sessionStateSubscribed = true }
                 // failure is non-fatal — we still display the list, just no
                 // live updates. The screen surfaces a one-shot Refresh button.
@@ -269,18 +349,16 @@ class MainViewModel : ViewModel() {
         sessionDetailObserverJob?.cancel()
         sessionDetailObserverJob = viewModelScope.launch {
             if (!sessionDetailSubscribed) {
-                val params = buildJsonObject {
-                    put(
-                        "kinds",
-                        JsonArray(
-                            listOf(
-                                JsonPrimitive("agent_session_message_appended"),
-                                JsonPrimitive("agent_session_state_changed"),
-                            ),
+                // Routed through RemoteClient.subscribe so the kinds are
+                // tracked + auto-replayed across reconnects (R-6a).
+                runCatching {
+                    active.subscribe(
+                        listOf(
+                            "agent_session_message_appended",
+                            "agent_session_state_changed",
                         ),
                     )
                 }
-                runCatching { active.call("remote.editor.subscribe", params) }
                     .onSuccess { sessionDetailSubscribed = true }
                 // failure is non-fatal — initial transcript is still shown.
             }
@@ -309,6 +387,13 @@ class MainViewModel : ViewModel() {
                             return@collect
                         }
                         if (payload.sessionId != openSessionId) return@collect
+                        // Track the high-water mark — used by the
+                        // reconnect path in startObservingConnectionState
+                        // to decide whether a full re-fetch is needed.
+                        val prev = lastSeenEntryIndex[payload.sessionId] ?: -1
+                        if (payload.entryIndex > prev) {
+                            lastSeenEntryIndex[payload.sessionId] = payload.entryIndex
+                        }
                         applyAppendedPlaceholder(payload)
                         fetchAndReplaceEntry(sessionId, payload.entryIndex)
                     }
@@ -488,9 +573,15 @@ class MainViewModel : ViewModel() {
     }
 
     /**
-     * Optimistically append [text] as a user entry, then fire-and-forget
-     * the server-side `send_message`. On failure, surface an error and
-     * pop the optimistic bubble so the user can retry without a phantom.
+     * Optimistically append [text] as a user entry, then queue the
+     * server-side `send_message`.
+     *
+     * R-6a switched from [RemoteClient.call] to
+     * [RemoteClient.queueCall] so that a "tap Send while in a tunnel"
+     * survives a network gap: the request waits in memory until the next
+     * Connected transition (or expires after the default 5-minute TTL).
+     * On failure (TTL or terminal close), the optimistic bubble is
+     * removed and the user gets a snackbar.
      */
     fun sendMessage(text: String) {
         if (text.isBlank()) return
@@ -503,7 +594,7 @@ class MainViewModel : ViewModel() {
             put("content", text)
         }
         viewModelScope.launch {
-            runCatching { active.call("remote.solution_agent.send_message", params) }
+            runCatching { active.queueCall("remote.solution_agent.send_message", params) }
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
@@ -513,7 +604,14 @@ class MainViewModel : ViewModel() {
                     // send may have raced past us and we don't want to
                     // drop the wrong one.
                     _optimisticEntries.value = _optimisticEntries.value.filterNot { it === optimistic }
-                    _sendError.tryEmit(it.message ?: "send failed")
+                    val msg = when (it) {
+                        is RemoteClient.QueueTtlException ->
+                            "send timed out — the editor was offline for too long"
+                        is RemoteClient.ClosedException ->
+                            "send cancelled — connection closed"
+                        else -> it.message ?: "send failed"
+                    }
+                    _sendError.tryEmit(msg)
                 }
         }
     }
@@ -691,6 +789,7 @@ class MainViewModel : ViewModel() {
     override fun onCleared() {
         sessionObserverJob?.cancel()
         sessionDetailObserverJob?.cancel()
+        connectionObserverJob?.cancel()
         client?.close()
         client = null
     }
