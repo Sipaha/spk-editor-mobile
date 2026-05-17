@@ -26,6 +26,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import ru.sipaha.spkremote.app.ui.qr.QrPairingScreen
+import ru.sipaha.spkremote.app.ui.servers.ServersListScreen
 import ru.sipaha.spkremote.app.ui.settings.SettingsScreen
 import ru.sipaha.spkremote.app.ui.solutions.SessionDetailScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionDetailScreen
@@ -38,6 +39,7 @@ import ru.sipaha.spkremote.app.vm.UiState
  * Routes:
  *   pairing                                              — QR + manual URL entry (R-5a/b).
  *   connecting                                           — handshake spinner.
+ *   servers                                              — paired-server picker (R-6c-multi, ≥2 servers).
  *   solutions                                            — list of solutions on the paired editor.
  *   solutions/{solutionId}                               — sessions in one solution.
  *   solutions/{solutionId}/sessions/{sessionId}          — chat surface (R-5d).
@@ -47,16 +49,27 @@ import ru.sipaha.spkremote.app.vm.UiState
  * we push `solutions` onto the back stack (popping any prior pairing entry).
  * When it flips back to Disconnected we pop everything except `pairing`.
  *
+ * **R-6c-multi:** [initialRoute] picks the cold-start landing destination
+ * based on the paired-server count:
+ *   - `null` (recreated activity) → start at `pairing` and rely on the
+ *     surviving VM state to push us forward.
+ *   - `"pairing"` (first launch / no servers paired) → identical to the
+ *     R-6b unpaired path.
+ *   - `"solutions"` (single server) → R-6b auto-resume preserved.
+ *   - `"servers"` (multi-server) → user picks which one to connect to.
+ *
  * R-6a adds a persistent banner above the NavHost surfaced from
  * [MainViewModel.connectionBanner]. It's hidden in Connected/Disconnected
  * and surfaces a one-line "reconnecting…" or "re-pair required" state.
  */
 @Composable
-fun AppNav(viewModel: MainViewModel) {
+fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
     val navController = rememberNavController()
     val uiState by viewModel.state.collectAsState()
     val banner by viewModel.connectionBanner.collectAsState()
     val navStateRepository = viewModel.navStateRepository
+
+    val startDestination = initialRoute ?: "pairing"
 
     // R-6d: persist the resolved nav route on every back-stack change so
     // a cold-start can land the user back on the deepest screen they
@@ -86,29 +99,40 @@ fun AppNav(viewModel: MainViewModel) {
                     val target = savedRoute?.takeIf { it.startsWith("solutions") } ?: "solutions"
                     restored = true
                     navController.navigate(target) {
-                        popUpTo("pairing") { inclusive = false }
+                        // Pop to the earliest entry in the back stack —
+                        // `pairing` for cold-start landed on pairing,
+                        // `servers` for the multi-server landing. Either
+                        // way the connecting/spinner entries get
+                        // discarded so back-press doesn't bounce there.
+                        popUpTo(startDestination) { inclusive = false }
                         launchSingleTop = true
                     }
                 }
             }
             is UiState.Connecting -> {
                 val current = navController.currentDestination?.route
-                if (current != "connecting" && current != "solutions") {
+                // Don't push `connecting` over `servers` — the per-row
+                // pill on the Servers screen surfaces the connecting
+                // state inline. Pushing the spinner would hide the
+                // useful picker the user just landed on.
+                if (current != "connecting" && current != "solutions" && current != "servers") {
                     navController.navigate("connecting") {
-                        popUpTo("pairing") { inclusive = false }
+                        popUpTo(startDestination) { inclusive = false }
                         launchSingleTop = true
                     }
                 }
             }
             is UiState.Disconnected -> {
-                navController.popBackStack(route = "pairing", inclusive = false)
+                // Pop to either `servers` (if multi-server) or `pairing`.
+                val target = if (viewModel.pairedServers.value.size >= 2) "servers" else "pairing"
+                navController.popBackStack(route = target, inclusive = false)
             }
         }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
         ConnectionStateBanner(banner)
-        NavHost(navController = navController, startDestination = "pairing") {
+        NavHost(navController = navController, startDestination = startDestination) {
             composable("pairing") {
                 val s = uiState
                 val initialUrl = (s as? UiState.Disconnected)?.lastUrl.orEmpty()
@@ -116,7 +140,7 @@ fun AppNav(viewModel: MainViewModel) {
                 QrPairingScreen(
                     initialUrl = initialUrl,
                     error = error,
-                    onPair = viewModel::connect,
+                    onPair = { rawUrl -> viewModel.addServer(rawUrl) },
                 )
             }
             composable("connecting") {
@@ -124,6 +148,25 @@ fun AppNav(viewModel: MainViewModel) {
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center,
                 ) { CircularProgressIndicator() }
+            }
+            composable("servers") {
+                ServersListScreen(
+                    viewModel = viewModel,
+                    onOpenServer = {
+                        navController.navigate("solutions") {
+                            popUpTo("servers") { inclusive = false }
+                            launchSingleTop = true
+                        }
+                    },
+                    onAddNew = {
+                        navController.navigate("pairing") {
+                            // Don't pop `servers` — the user is adding
+                            // *another* server, not replacing.
+                            launchSingleTop = true
+                        }
+                    },
+                    onOpenSettings = { navController.navigate("settings") },
+                )
             }
             composable("solutions") {
                 SolutionsListScreen(
@@ -138,16 +181,21 @@ fun AppNav(viewModel: MainViewModel) {
                 SettingsScreen(
                     viewModel = viewModel,
                     onBack = { navController.popBackStack() },
-                    // Forget Server: clear persistence + connection, then
-                    // pop everything back to `pairing`. We don't rely on
-                    // the UiState-watching LaunchedEffect because the user
-                    // may have arrived at Settings via a freshly persisted
-                    // connection that already pushed `solutions` onto the
-                    // back stack.
+                    // Forget Server: clear THIS server (R-6c-multi) then
+                    // route to either `servers` (others survive) or
+                    // `pairing` (last server gone).
                     onForget = {
                         viewModel.forgetPairing()
-                        navController.navigate("pairing") {
-                            popUpTo("pairing") { inclusive = true }
+                        val remainingCount = viewModel.pairedServers.value.size
+                        val target = if (remainingCount >= 1) "servers" else "pairing"
+                        navController.navigate(target) {
+                            popUpTo(target) { inclusive = remainingCount == 0 }
+                            launchSingleTop = true
+                        }
+                    },
+                    onSwitchServer = {
+                        navController.navigate("servers") {
+                            popUpTo("solutions") { inclusive = false }
                             launchSingleTop = true
                         }
                     },
@@ -196,9 +244,9 @@ fun AppNav(viewModel: MainViewModel) {
  * Compose-Navigation only exposes the template on `destination.route`,
  * not the resolved form (e.g. it gives us `solutions/{solutionId}` even
  * though the user is on `solutions/abc`). This helper closes that gap
- * so [NavStateRepository.saveRoute] can persist a route that
- * `navController.navigate(...)` will accept verbatim on the next cold
- * start.
+ * so [ru.sipaha.spkremote.app.data.NavStateRepository.saveRoute] can
+ * persist a route that `navController.navigate(...)` will accept verbatim
+ * on the next cold start.
  *
  * Returns `null` when the entry has no route (synthetic back-stack
  * entries, e.g. the root graph node).

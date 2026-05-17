@@ -16,6 +16,7 @@ import ru.sipaha.spkremote.app.data.DraftRepository
 import ru.sipaha.spkremote.app.data.EncryptedQueueStore
 import ru.sipaha.spkremote.app.data.LastSeenRepository
 import ru.sipaha.spkremote.app.data.NavStateRepository
+import ru.sipaha.spkremote.app.data.PairedServer
 import ru.sipaha.spkremote.app.data.PairingRepository
 import ru.sipaha.spkremote.core.AgentSummary
 import ru.sipaha.spkremote.core.ConnectionState
@@ -32,6 +33,7 @@ import ru.sipaha.spkremote.core.QueuedMessage
 import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.SolutionSummary
+import java.util.UUID
 
 sealed interface UiState {
     data class Disconnected(val lastUrl: String? = null, val error: String? = null) : UiState
@@ -66,40 +68,64 @@ private const val SESSION_PAGE_SIZE = 50
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
-     * Persistence backend for the pairing URL. Lazily opens an
-     * EncryptedSharedPreferences file on first read/write; see
-     * [PairingRepository] for the cold-start contract.
+     * Persistence backend for the paired-server list. Lazily opens an
+     * EncryptedSharedPreferences file on first read/write and runs the
+     * R-6b → R-6c-multi migration there; see [PairingRepository] for
+     * the cold-start contract.
      */
     private val pairingRepository: PairingRepository = PairingRepository.get(application)
+
+    /**
+     * R-6c-multi: active server id, observed by the per-server scoped
+     * repositories via their `activeServerProvider` closures. Mutated
+     * by [switchToServer] / [removeServer] / [addServer] — every state
+     * change rebuilds the underlying [RemoteClient].
+     */
+    private val _activeServerId = MutableStateFlow<String?>(pairingRepository.activeServerId())
+    val activeServerId: StateFlow<String?> = _activeServerId.asStateFlow()
+
+    /**
+     * Observable paired-server list for the Servers screen and the
+     * Settings "All servers" sub-section. Updated synchronously on
+     * every [addServer] / [removeServer] / [switchToServer].
+     */
+    private val _pairedServers = MutableStateFlow<List<PairedServer>>(pairingRepository.loadAll())
+    val pairedServers: StateFlow<List<PairedServer>> = _pairedServers.asStateFlow()
 
     /**
      * Disk-backed outbound-queue store for [RemoteClient.queueCall]
      * (R-6d). Stored separately from [pairingRepository] in a dedicated
      * `spk_queue` prefs file so we can clear queue entries without
      * touching the pairing URL (e.g. on forget-pairing the queue is
-     * irrelevant; on a per-session reset, the pairing stays).
+     * irrelevant; on a per-session reset, the pairing stays). The
+     * R-6c-multi scoping keys each server's queue under its own blob.
      */
-    private val queueStore: EncryptedQueueStore = EncryptedQueueStore.get(application)
+    private val queueStore: EncryptedQueueStore =
+        EncryptedQueueStore.get(application) { _activeServerId.value }
 
     /**
      * Per-session compose-bar drafts + bounced-on-failure recovery slots.
-     * See [DraftRepository] for the two-channel semantics.
+     * See [DraftRepository] for the two-channel semantics. R-6c-multi
+     * scopes keys by the active server id.
      */
-    val draftRepository: DraftRepository = DraftRepository.get(application)
+    val draftRepository: DraftRepository =
+        DraftRepository.get(application) { _activeServerId.value }
 
     /**
-     * Per-session "last seen entry index" markers. Today only persisted
-     * for restart durability; R-6e will wire the incremental-resume RPC
-     * that actually uses the marker on reconnect.
+     * Per-session "last seen entry index" markers, scoped per-server
+     * (R-6c-multi). R-6e wires the incremental-resume RPC that uses
+     * the marker on reconnect.
      */
-    private val lastSeenRepository: LastSeenRepository = LastSeenRepository.get(application)
+    private val lastSeenRepository: LastSeenRepository =
+        LastSeenRepository.get(application) { _activeServerId.value }
 
     /**
-     * Active navigation route for cold-start resume. Persisted from
-     * `AppNavGraph` on every back-stack change; read from `MainActivity`
-     * after the pairing replay completes.
+     * Active navigation route for cold-start resume, scoped per-server
+     * (R-6c-multi). Persisted from `AppNavGraph` on every back-stack
+     * change; read from `MainActivity` after the pairing replay completes.
      */
-    val navStateRepository: NavStateRepository = NavStateRepository.get(application)
+    val navStateRepository: NavStateRepository =
+        NavStateRepository.get(application) { _activeServerId.value }
 
     private val _state = MutableStateFlow<UiState>(UiState.Disconnected())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -130,11 +156,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * in `SessionDetailScreen` can dedupe re-fires while a previous slice
      * is still on the wire — without churning the `_session` value (which
      * would trigger a recomposition cycle for every entry row).
-     *
-     * Conceptually this is half of the `SessionView` shape from the R-6e
-     * spec; the other half (`entries`, `totalCount`) already lives on
-     * `_session.value` as the existing `GetSessionResult.entries` and the
-     * new `GetSessionResult.totalCount` field.
      */
     private val _isLoadingOlder = MutableStateFlow(false)
     val isLoadingOlder: StateFlow<Boolean> = _isLoadingOlder.asStateFlow()
@@ -202,38 +223,85 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Last entry index we observed for each session via
      * `agent_session_message_appended`.
      *
-     * R-6d: now persisted to [lastSeenRepository] on every advance, so
-     * a force-kill doesn't lose the high-water mark. The in-memory map
-     * is the fast path (read on every notification); the disk write is
-     * synchronous (`SharedPreferences.apply()` queues to a background
-     * writer, so the call returns instantly). R-6e will wire the
-     * incremental-resume RPC path that actually uses the marker post-
-     * reconnect — for now the marker is just durably saved.
-     *
-     * Read-through behaviour: [openSession] seeds this map from
-     * [lastSeenRepository] when a session is first opened in-process,
-     * so the marker survives a cold-start mid-chat.
+     * R-6c-multi: this in-memory map is wiped on every [switchToServer]
+     * because the marker is now scoped to the active server in
+     * [lastSeenRepository]. Stale entries from server A would shadow
+     * the on-disk markers for server B.
      */
     private val lastSeenEntryIndex = mutableMapOf<String, Int>()
 
     /** Job that observes [RemoteClient.connectionState]. */
     private var connectionObserverJob: Job? = null
 
-    fun connect(rawUrl: String) {
+    /**
+     * Pair a NEW server from a freshly-scanned QR code.
+     *
+     * Parses [rawUrl], generates a UUID for the entry, persists it as
+     * a [PairedServer] in [pairingRepository], marks it active, and
+     * connects via [switchToServer]. The "is this URL a duplicate of
+     * an already-paired server" question is answered by fingerprint
+     * equality — pairing twice with the same editor (e.g. user
+     * re-scans because the previous secret expired) reuses the
+     * existing entry id so per-server scoped state (drafts, queue,
+     * nav state, lastSeen markers) is preserved.
+     *
+     * [onAdded] is invoked from the main thread with the resulting
+     * server id once persistence completes, so callers can navigate
+     * to `solutions` for the newly-paired server.
+     */
+    fun addServer(rawUrl: String, onAdded: (serverId: String) -> Unit = {}) {
         val parsed = PairingUrl.parse(rawUrl).getOrElse {
             _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
             return
         }
+        val fingerprintHex = parsed.fingerprint.joinToString("") { "%02x".format(it) }
+        val existing = pairingRepository.loadAll().firstOrNull { it.fingerprintHex == fingerprintHex }
+        val server = if (existing != null) {
+            existing.copy(pairingUrl = rawUrl, label = "${parsed.host}:${parsed.port}")
+        } else {
+            PairedServer(
+                id = UUID.randomUUID().toString(),
+                pairingUrl = rawUrl,
+                label = "${parsed.host}:${parsed.port}",
+                fingerprintHex = fingerprintHex,
+                firstPairedAtMs = System.currentTimeMillis(),
+                lastConnectedAtMs = null,
+            )
+        }
+        pairingRepository.upsert(server)
+        _pairedServers.value = pairingRepository.loadAll()
+        switchToServer(server.id)
+        onAdded(server.id)
+    }
+
+    /**
+     * Switch the active connection to [serverId]: tear down the
+     * existing [RemoteClient], reset per-session UI caches, and connect
+     * to the new server's pairing URL.
+     *
+     * No-op when [serverId] is already active. Returns silently when
+     * the server id is unknown — caller is responsible for ensuring it
+     * came from [pairedServers].
+     */
+    fun switchToServer(serverId: String) {
+        if (_activeServerId.value == serverId && client != null) return
+        val server = pairingRepository.get(serverId) ?: return
+        val parsed = PairingUrl.parse(server.pairingUrl).getOrElse {
+            _state.value = UiState.Disconnected(lastUrl = server.pairingUrl, error = it.message)
+            return
+        }
+        // Tear down anything tied to the previous server. Per-session
+        // caches are wiped here (not on the new connect) so the user
+        // doesn't briefly see server A's transcript while server B's
+        // initial fetch is pending.
+        tearDownConnection()
+        _activeServerId.value = serverId
+        pairingRepository.setActive(serverId)
+        pairingRepository.setLastConnected(serverId, System.currentTimeMillis())
+        _pairedServers.value = pairingRepository.loadAll()
         _pairing.value = parsed
         _state.value = UiState.Connecting
         viewModelScope.launch {
-            // Drain TTL-expired queue entries before [RemoteClient.rehydrateQueue]
-            // sees them — that way the bounce-to-input recovery fires once
-            // here (with the synthesized "expired while app was closed"
-            // semantics) rather than waiting for the next reconnect to
-            // notice. flushQueue inside RemoteClient also runs the TTL
-            // check on every Connected transition, but doing it here keeps
-            // the user-visible bounce path tied to the boot moment.
             drainExpiredQueueEntries()
             val newClient = RemoteClient(
                 url = parsed,
@@ -241,12 +309,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 onMessageExpired = ::handleExpiredMessage,
             )
             client = newClient
-            // Hand the lifecycle our viewModelScope so reconnects keep
-            // running as long as the ViewModel is alive (cancelled on
-            // onCleared via close()).
             newClient.connect(viewModelScope)
                 .onFailure {
-                    _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
+                    _state.value = UiState.Disconnected(lastUrl = server.pairingUrl, error = it.message)
                     return@launch
                 }
             runCatching { newClient.call("remote.editor.capabilities") }
@@ -257,20 +322,105 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         ?.content
                         ?: "unknown"
                     _state.value = UiState.Connected(version)
-                    // Persist only after the handshake + capabilities round-trip
-                    // succeeded. A poisoned QR (wrong fingerprint, expired
-                    // secret) never reaches disk this way — the user always
-                    // lands on the QR screen on the next cold start if the
-                    // first attempt didn't authenticate.
-                    pairingRepository.save(rawUrl)
                 }
                 .onFailure {
-                    _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
+                    _state.value = UiState.Disconnected(lastUrl = server.pairingUrl, error = it.message)
                 }
-            // Start watching connection state for the banner + reconnect
-            // refresh hook. Cancels on the next [connect] or onCleared.
             startObservingConnectionState(newClient)
         }
+    }
+
+    /**
+     * Remove [serverId] from the paired-server list, also wiping its
+     * scoped repository state (drafts, queue, lastSeen markers, nav
+     * route). If it was the active server, fall back to the next-most-
+     * recently-connected entry; if none remain, drop into the
+     * unpaired / pairing-screen state.
+     */
+    fun removeServer(serverId: String) {
+        val wasActive = _activeServerId.value == serverId
+        // Wipe per-server scoped state BEFORE removing the entry so
+        // the active-server provider still reports [serverId] for the
+        // clearAll() calls below.
+        if (wasActive) {
+            queueStore.clear()
+            draftRepository.clearAll()
+            lastSeenRepository.clearAll()
+            navStateRepository.clear()
+        } else {
+            // Briefly point repositories at [serverId] so we wipe the
+            // *right* server's keys, then restore.
+            val previous = _activeServerId.value
+            _activeServerId.value = serverId
+            queueStore.clear()
+            draftRepository.clearAll()
+            lastSeenRepository.clearAll()
+            navStateRepository.clear()
+            _activeServerId.value = previous
+        }
+        pairingRepository.remove(serverId)
+        _pairedServers.value = pairingRepository.loadAll()
+        if (wasActive) {
+            tearDownConnection()
+            _activeServerId.value = null
+            val next = _pairedServers.value.firstOrNull()
+            if (next != null) {
+                switchToServer(next.id)
+            } else {
+                _state.value = UiState.Disconnected()
+            }
+        }
+    }
+
+    /**
+     * Forget every paired server in one shot — the destructive
+     * "factory reset" path. Used by `:app/test` smoke or a hypothetical
+     * "Forget all" affordance; the per-server Settings screen calls
+     * [removeServer] instead.
+     */
+    fun forgetAllServers() {
+        for (server in pairingRepository.loadAll()) {
+            pairingRepository.remove(server.id)
+        }
+        _pairedServers.value = emptyList()
+        tearDownConnection()
+        _activeServerId.value = null
+        // Wipe the scoped repositories' entire prefs files — the
+        // active-server provider is now null so clearAll falls back to
+        // wiping the whole file.
+        queueStore.clear()
+        draftRepository.clearAll()
+        lastSeenRepository.clearAll()
+        navStateRepository.clear()
+        _state.value = UiState.Disconnected()
+    }
+
+    /**
+     * Tear down the per-server connection / observers / UI caches.
+     * Does NOT clear the active-server pointer — that's the caller's
+     * responsibility (because [switchToServer] reassigns it
+     * immediately, while [removeServer] sometimes routes through
+     * "fall back to another server").
+     */
+    private fun tearDownConnection() {
+        connectionObserverJob?.cancel()
+        sessionObserverJob?.cancel()
+        sessionDetailObserverJob?.cancel()
+        client?.close()
+        client = null
+        sessionStateSubscribed = false
+        sessionDetailSubscribed = false
+        openSessionId = null
+        lastSeenEntryIndex.clear()
+        _pairing.value = null
+        _solutions.value = UiData.Loading
+        _sessions.value = UiData.Loading
+        _session.value = UiData.Loading
+        _agents.value = UiData.Loading
+        _optimisticEntries.value = emptyList()
+        _isLoadingOlder.value = false
+        _connectionBanner.value = ConnectionBanner.Hidden
+        _rawConnectionState.value = ConnectionState.Disconnected
     }
 
     /**
@@ -282,9 +432,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * transition, but earlier so the user sees the bounce as soon as
      * they open the offending session.
      *
-     * Called from [connect] before constructing the new
-     * [RemoteClient] so the rehydrate-on-connect path inside the client
-     * only sees surviving entries.
+     * Called from [switchToServer] before constructing the new
+     * [RemoteClient] so the rehydrate-on-connect path inside the
+     * client only sees surviving entries.
      */
     private fun drainExpiredQueueEntries() {
         val now = System.currentTimeMillis()
@@ -321,54 +471,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Returns the previously-persisted pairing URL, if any, suitable for
-     * passing to [connect] directly. Called from `MainActivity.onCreate`
-     * on cold start to skip the QR scan flow when we already know a server.
+     * Auto-resume entry point called from `MainActivity.onCreate`.
      *
-     * No parsing happens here — the caller (`connect`) re-parses and surfaces
-     * the failure path identically to a fresh manual entry. If the persisted
-     * blob is corrupted, the user lands on the QR screen with an inline
-     * error, identical to a typo.
+     * Returns the cold-start landing destination based on the paired-
+     * server count:
+     *   - `pairing` when nothing is paired (true first-launch).
+     *   - `solutions` when exactly one server is paired (R-6b
+     *     auto-resume behavior preserved).
+     *   - `servers` when 2+ are paired so the user picks which to
+     *     connect to.
+     *
+     * Side-effect: in the single- and multi-server cases, also
+     * synchronously kicks off the connect for whichever server should
+     * be active (the previously-active one if set, else the first in
+     * the [PairingRepository.loadAll] sort order). Multi-server callers
+     * land on `servers` regardless — the connect-while-on-Servers state
+     * is harmless (the screen shows the per-row connection pill from
+     * [rawConnectionState]).
      */
-    fun loadPersistedPairingUrl(): String? = pairingRepository.load()
+    fun coldStartLandingRoute(): String {
+        val servers = pairingRepository.loadAll()
+        _pairedServers.value = servers
+        if (servers.isEmpty()) return "pairing"
+        val preferredId = pairingRepository.activeServerId()
+            ?.takeIf { id -> servers.any { it.id == id } }
+            ?: servers.first().id
+        switchToServer(preferredId)
+        return if (servers.size == 1) "solutions" else "servers"
+    }
 
     /**
-     * Forget the persisted pairing and tear down the active connection.
-     *
-     * Called from the Settings screen (Forget Server / Re-pair). Resets
-     * every cached piece of UI state so the next `connect` doesn't see
-     * stale solutions / sessions / agents from the previous server.
+     * Forget the persisted pairing for the currently-active server and
+     * tear down the active connection. Used by the Settings screen's
+     * "Forget this server" affordance — multi-paired case keeps the
+     * other entries; single-server case falls back to the unpaired
+     * state and the user lands on the pairing screen.
      */
     fun forgetPairing() {
-        pairingRepository.clear()
-        // R-6d: wipe every per-server piece of disk state so re-pairing
-        // (potentially against a *different* server) doesn't surface
-        // stale drafts, stale queued sends, stale last-seen markers, or
-        // a saved deep-route from a session that doesn't exist on the
-        // new server.
-        queueStore.clear()
-        draftRepository.clearAll()
-        lastSeenRepository.clearAll()
-        navStateRepository.clear()
-        connectionObserverJob?.cancel()
-        sessionObserverJob?.cancel()
-        sessionDetailObserverJob?.cancel()
-        client?.close()
-        client = null
-        sessionStateSubscribed = false
-        sessionDetailSubscribed = false
-        openSessionId = null
-        lastSeenEntryIndex.clear()
-        _pairing.value = null
-        _solutions.value = UiData.Loading
-        _sessions.value = UiData.Loading
-        _session.value = UiData.Loading
-        _agents.value = UiData.Loading
-        _optimisticEntries.value = emptyList()
-        _isLoadingOlder.value = false
-        _connectionBanner.value = ConnectionBanner.Hidden
-        _rawConnectionState.value = ConnectionState.Disconnected
-        _state.value = UiState.Disconnected()
+        val active = _activeServerId.value ?: return
+        removeServer(active)
     }
 
     /**
@@ -417,6 +558,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     val activeSession = openSessionId
                     if (activeSession != null) {
                         resumeSession(activeSession)
+                    }
+                    // Stamp last-connected on the active server so the
+                    // Servers screen reflects "most recently used" order.
+                    _activeServerId.value?.let { sid ->
+                        pairingRepository.setLastConnected(sid, System.currentTimeMillis())
+                        _pairedServers.value = pairingRepository.loadAll()
                     }
                 }
                 previousConnected = isConnected

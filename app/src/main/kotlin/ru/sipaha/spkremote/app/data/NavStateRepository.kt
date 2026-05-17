@@ -8,6 +8,11 @@ import android.util.Log
  * Persists the active navigation route so cold start can land the user
  * back where they were (R-6d).
  *
+ * **R-6c-multi per-server scoping:** the route key embeds the active
+ * server id (`route:<serverId>`), so switching from server A → server B
+ * doesn't carry over A's deep-link target. The cold-start replay reads
+ * the route for whichever server is being auto-resumed.
+ *
  * **Why disk:** R-6b's auto-resume lands the user on `solutions` after
  * a successful pairing replay, which is correct when they last had the
  * solutions list open — but jarring when they were mid-chat on a deep
@@ -34,7 +39,10 @@ import android.util.Log
  * cosmetic (no auth secret), and encrypting it would slow cold-start
  * unnecessarily.
  */
-class NavStateRepository(private val context: Context) {
+class NavStateRepository(
+    private val context: Context,
+    private val activeServerProvider: () -> String?,
+) {
 
     private val prefs: SharedPreferences? by lazy { openPrefs() }
 
@@ -44,46 +52,70 @@ class NavStateRepository(private val context: Context) {
         .getOrNull()
 
     /**
-     * Persist [route] as the last-known nav destination. Routes shallower
-     * than `solutions` (i.e. `pairing` / `connecting`) are deliberately
-     * NOT saved — those screens already auto-resolve on cold start from
-     * the pairing-replay path, and persisting them would cause harmless
+     * Persist [route] as the last-known nav destination for the active
+     * server. Routes shallower than `solutions` (i.e. `pairing` /
+     * `connecting` / `servers`) are deliberately NOT saved — those
+     * screens already auto-resolve on cold start from the
+     * pairing-replay path, and persisting them would cause harmless
      * but ugly thrash where the nav controller "navigates" to itself.
      */
     fun saveRoute(route: String) {
         if (route.isBlank()) return
-        if (route == "pairing" || route == "connecting") return
+        if (route == "pairing" || route == "connecting" || route == "servers") return
         val p = prefs ?: return
-        runCatching { p.edit().putString(KEY_ROUTE, route).apply() }
+        val key = scopedKey() ?: return
+        runCatching { p.edit().putString(key, route).apply() }
             .onFailure { Log.w(TAG, "saveRoute() failed", it) }
     }
 
-    /** The most-recently-saved route, or `null` if none. */
+    /**
+     * The most-recently-saved route for the active server, or `null`
+     * if none. Falls back to the legacy R-6d unscoped key when no
+     * scoped value exists — gives the upgrade path one free resume
+     * before being overwritten by the next [saveRoute].
+     */
     fun loadRoute(): String? {
         val p = prefs ?: return null
-        return runCatching { p.getString(KEY_ROUTE, null) }
+        val key = scopedKey() ?: return null
+        val scoped = runCatching { p.getString(key, null) }
             .onFailure { Log.w(TAG, "loadRoute() failed", it) }
             .getOrNull()
+        if (scoped != null) return scoped
+        return runCatching { p.getString(LEGACY_KEY_ROUTE, null) }.getOrNull()
     }
 
-    /** Drop the saved route. Called when the resume target 404s. */
+    /**
+     * Drop the saved route for the active server. Called when the resume
+     * target 404s. Also clears the legacy R-6d unscoped key so a follow-up
+     * cold-start doesn't fall back into it.
+     */
     fun clear() {
         val p = prefs ?: return
-        runCatching { p.edit().remove(KEY_ROUTE).apply() }
-            .onFailure { Log.w(TAG, "clear() failed", it) }
+        val key = scopedKey()
+        runCatching {
+            val editor = p.edit()
+            if (key != null) editor.remove(key)
+            editor.remove(LEGACY_KEY_ROUTE).apply()
+        }.onFailure { Log.w(TAG, "clear() failed", it) }
+    }
+
+    private fun scopedKey(): String? {
+        val serverId = activeServerProvider() ?: return null
+        return "route:$serverId"
     }
 
     companion object {
         private const val TAG = "NavStateRepository"
         private const val PREFS_NAME = "spk_nav_state"
-        private const val KEY_ROUTE = "route"
+        private const val LEGACY_KEY_ROUTE = "route"
 
         @Volatile
         private var instance: NavStateRepository? = null
 
-        fun get(context: Context): NavStateRepository =
+        fun get(context: Context, activeServerProvider: () -> String?): NavStateRepository =
             instance ?: synchronized(this) {
-                instance ?: NavStateRepository(context.applicationContext).also { instance = it }
+                instance ?: NavStateRepository(context.applicationContext, activeServerProvider)
+                    .also { instance = it }
             }
     }
 }

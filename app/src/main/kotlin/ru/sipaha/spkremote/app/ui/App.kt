@@ -6,6 +6,6 @@ import ru.sipaha.spkremote.app.ui.nav.AppNav
 import ru.sipaha.spkremote.app.vm.MainViewModel
 
 @Composable
-fun App(vm: MainViewModel = viewModel()) {
-    AppNav(viewModel = vm)
+fun App(vm: MainViewModel = viewModel(), initialRoute: String? = null) {
+    AppNav(viewModel = vm, initialRoute = initialRoute)
 }

@@ -14,24 +14,24 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Cold-start auto-resume: if EncryptedSharedPreferences has a
-        // persisted pairing URL from a previous session, kick off the
-        // connect immediately. The nav graph reacts to the resulting
-        // [UiState.Connecting] / [UiState.Connected] transitions and pushes
-        // the user past the QR screen without a flicker.
-        //
-        // Parse failure (corrupted prefs, schema change between versions)
-        // falls back to the pairing screen with the inline error — same as
-        // a hand-typed bad URL.
-        if (savedInstanceState == null) {
-            val persisted = viewModel.loadPersistedPairingUrl()
-            if (!persisted.isNullOrBlank()) {
-                viewModel.connect(persisted)
-            }
+        // Cold-start auto-resume: the VM inspects [PairingRepository.loadAll]
+        // and returns the appropriate landing destination — `pairing` when
+        // nothing is paired, `solutions` for the single-server R-6b
+        // auto-resume path, or `servers` when 2+ are paired. The VM also
+        // kicks off [switchToServer] synchronously for the
+        // most-recently-active server in the latter two cases, so by the
+        // time the nav graph renders we're already in Connecting state.
+        val initialRoute = if (savedInstanceState == null) {
+            viewModel.coldStartLandingRoute()
+        } else {
+            // Recreated activity (e.g. orientation change). The VM survived
+            // and is already in the right state — let the nav graph
+            // restore its own back stack.
+            null
         }
         setContent {
             SpkRemoteTheme {
-                App(vm = viewModel)
+                App(vm = viewModel, initialRoute = initialRoute)
             }
         }
     }

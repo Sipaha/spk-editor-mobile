@@ -35,26 +35,30 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import ru.sipaha.spkremote.app.BuildConfig
+import ru.sipaha.spkremote.app.data.PairedServer
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.PairingUrl
 
 /**
  * Settings / About screen. Reachable from the gear icon on
- * [ru.sipaha.spkremote.app.ui.solutions.SolutionsListScreen].
+ * [ru.sipaha.spkremote.app.ui.solutions.SolutionsListScreen] and the
+ * Servers list (R-6c-multi).
  *
  * Surfaces:
  *  - **Server info** — host:port + client name + fingerprint excerpt
  *    (first 8 + last 8 hex chars of the SHA-256 cert pin, monospace).
  *  - **Connection** — live [ConnectionState] from the underlying transport.
- *  - **Actions** — Forget paired server (destructive, with confirm dialog)
- *    + Re-pair (clear + jump to the QR screen — same destination, just
- *    skipping the confirm step because Re-pair is the explicit "I know
- *    what I'm doing" choice).
+ *  - **Actions** — Forget THIS server (destructive, with confirm dialog).
+ *    R-6c-multi: also a "Switch server" affordance when 2+ paired.
+ *  - **All servers (R-6c-multi)** — quick switcher to other paired
+ *    servers when ≥2 exist.
  *  - **About** — version, GitHub link, license blurb.
  *
- * [onForget] is invoked after a confirmed Forget; the nav graph wires it
- * to `forgetPairing()` + `navigate("pairing", popUpTo("pairing", inclusive=true))`.
+ * [onForget] is invoked after a confirmed Forget; the nav graph
+ * decides whether to land on `servers` (multi-paired) or `pairing`
+ * (none left). [onSwitchServer] is invoked when the user taps "Switch
+ * server" — the nav graph navigates to `servers`.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -62,17 +66,22 @@ fun SettingsScreen(
     viewModel: MainViewModel,
     onBack: () -> Unit,
     onForget: () -> Unit,
+    onSwitchServer: () -> Unit = {},
 ) {
     val pairing by viewModel.pairing.collectAsState()
     val connectionState by viewModel.rawConnectionState.collectAsState()
+    val pairedServers by viewModel.pairedServers.collectAsState()
+    val activeServerId by viewModel.activeServerId.collectAsState()
     val context = LocalContext.current
 
     var showForgetDialog by remember { mutableStateOf(false) }
 
+    val otherServers = pairedServers.filter { it.id != activeServerId }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Settings") },
+                title = { Text("Server settings") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
@@ -107,22 +116,39 @@ fun SettingsScreen(
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                // Re-pair is non-destructive in intent ("I want to scan a
-                // new QR") — it still wipes persistence, but the user is
-                // about to immediately overwrite it. Skip the confirm.
-                OutlinedButton(
-                    onClick = onForget,
-                    modifier = Modifier.fillMaxWidth(),
-                ) { Text("Re-pair (scan a new QR)") }
+                if (pairedServers.size >= 2) {
+                    OutlinedButton(
+                        onClick = onSwitchServer,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Switch server (${pairedServers.size} paired)") }
+                }
                 OutlinedButton(
                     onClick = { showForgetDialog = true },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.outlinedButtonColors(
                         contentColor = MaterialTheme.colorScheme.error,
                     ),
-                ) { Text("Forget paired server") }
+                ) { Text("Forget this server") }
             }
             HorizontalDivider()
+
+            if (otherServers.isNotEmpty()) {
+                SectionHeader("All servers")
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    for (other in otherServers) {
+                        OtherServerRow(
+                            server = other,
+                            onSwitch = { viewModel.switchToServer(other.id) },
+                        )
+                    }
+                }
+                HorizontalDivider()
+            }
 
             SectionHeader("About")
             AboutInfo(
@@ -140,11 +166,13 @@ fun SettingsScreen(
     if (showForgetDialog) {
         AlertDialog(
             onDismissRequest = { showForgetDialog = false },
-            title = { Text("Forget paired server?") },
+            title = { Text("Forget this server?") },
             text = {
                 Text(
-                    "This will remove the pairing from this device. " +
-                        "You'll need to scan the QR again to reconnect.",
+                    "This server will be removed from this device, along with " +
+                        "any drafts, queued messages, and saved chat history. " +
+                        "Other paired servers are unaffected. You'll need to " +
+                        "scan the QR again to reconnect.",
                 )
             },
             confirmButton = {
@@ -234,6 +262,32 @@ private fun ConnectionRow(state: ConnectionState) {
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 12.dp),
     )
+}
+
+@Composable
+private fun OtherServerRow(server: PairedServer, onSwitch: () -> Unit) {
+    val parsed = PairingUrl.parse(server.pairingUrl).getOrNull()
+    val hostPort = if (parsed != null) "${parsed.host}:${parsed.port}" else "(unparseable URL)"
+    androidx.compose.foundation.layout.Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = server.label,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                text = hostPort,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        OutlinedButton(onClick = onSwitch) { Text("Switch") }
+    }
 }
 
 @Composable

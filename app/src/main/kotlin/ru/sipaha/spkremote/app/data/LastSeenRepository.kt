@@ -14,6 +14,11 @@ import android.util.Log
  * today) or — once R-6e lands the incremental-resume RPC — fetch just
  * the entries past the marker.
  *
+ * **R-6c-multi per-server scoping:** every marker key is prefixed with
+ * `<serverId>:` so two paired servers with overlapping session ids don't
+ * step on each other's marker. The active server is read on every call
+ * via [activeServerProvider].
+ *
  * **Why disk:** without persistence, every restart resets the marker
  * to "we know nothing" and forces a full transcript refetch, which on a
  * long session (hundreds of entries) is bandwidth-happy and visibly
@@ -23,7 +28,10 @@ import android.util.Log
  * **Storage:** plain [SharedPreferences]. The marker is an integer index,
  * not user content — no encryption value-add.
  */
-class LastSeenRepository(private val context: Context) {
+class LastSeenRepository(
+    private val context: Context,
+    private val activeServerProvider: () -> String?,
+) {
 
     private val prefs: SharedPreferences? by lazy { openPrefs() }
 
@@ -35,11 +43,12 @@ class LastSeenRepository(private val context: Context) {
     /** Returns the persisted marker for [sessionId], or `null` if absent. */
     fun get(sessionId: String): Int? {
         val p = prefs ?: return null
+        val key = scopedKey(sessionId) ?: return null
         return runCatching {
             // SharedPreferences.getInt requires a default — sentinel -1
             // disambiguates "absent" from "0" since entry indices are
             // 0-based and 0 is a legitimate marker after the first append.
-            val v = p.getInt(sessionId, SENTINEL)
+            val v = p.getInt(key, SENTINEL)
             if (v == SENTINEL) null else v
         }.onFailure { Log.w(TAG, "get() failed", it) }
             .getOrNull()
@@ -54,24 +63,50 @@ class LastSeenRepository(private val context: Context) {
      */
     fun set(sessionId: String, index: Int) {
         val p = prefs ?: return
-        val current = runCatching { p.getInt(sessionId, SENTINEL) }.getOrDefault(SENTINEL)
+        val key = scopedKey(sessionId) ?: return
+        val current = runCatching { p.getInt(key, SENTINEL) }.getOrDefault(SENTINEL)
         if (current != SENTINEL && index <= current) return
-        runCatching { p.edit().putInt(sessionId, index).apply() }
+        runCatching { p.edit().putInt(key, index).apply() }
             .onFailure { Log.w(TAG, "set() failed", it) }
     }
 
     /** Drop the marker for [sessionId] — used when a session is deleted. */
     fun clear(sessionId: String) {
         val p = prefs ?: return
-        runCatching { p.edit().remove(sessionId).apply() }
+        val key = scopedKey(sessionId) ?: return
+        runCatching { p.edit().remove(key).apply() }
             .onFailure { Log.w(TAG, "clear() failed", it) }
     }
 
-    /** Wipe every marker. Called from `forgetPairing` on Settings. */
+    /**
+     * Wipe every marker belonging to the currently-active server.
+     * Called when that server is removed via the Servers screen
+     * (R-6c-multi).
+     *
+     * If no server is active (all paired servers removed) this falls
+     * back to clearing the whole prefs file — equivalent to the R-6d
+     * forget-pairing behavior.
+     */
     fun clearAll() {
         val p = prefs ?: return
-        runCatching { p.edit().clear().apply() }
-            .onFailure { Log.w(TAG, "clearAll() failed", it) }
+        val serverId = activeServerProvider()
+        runCatching {
+            if (serverId == null) {
+                p.edit().clear().apply()
+                return@runCatching
+            }
+            val prefix = "$serverId:"
+            val editor = p.edit()
+            for (key in p.all.keys) {
+                if (key.startsWith(prefix)) editor.remove(key)
+            }
+            editor.apply()
+        }.onFailure { Log.w(TAG, "clearAll() failed", it) }
+    }
+
+    private fun scopedKey(sessionId: String): String? {
+        val serverId = activeServerProvider() ?: return null
+        return "$serverId:$sessionId"
     }
 
     companion object {
@@ -82,9 +117,10 @@ class LastSeenRepository(private val context: Context) {
         @Volatile
         private var instance: LastSeenRepository? = null
 
-        fun get(context: Context): LastSeenRepository =
+        fun get(context: Context, activeServerProvider: () -> String?): LastSeenRepository =
             instance ?: synchronized(this) {
-                instance ?: LastSeenRepository(context.applicationContext).also { instance = it }
+                instance ?: LastSeenRepository(context.applicationContext, activeServerProvider)
+                    .also { instance = it }
             }
     }
 }

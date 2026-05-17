@@ -8,15 +8,23 @@ import android.util.Log
  * Persists per-session compose-bar drafts across process death (R-6d).
  *
  * **Two channels, one prefs file:**
- *   - `draft:<sessionId>` — the live typing buffer. Saved on every keystroke
- *     (debounced 500 ms by the caller), cleared after a successful send.
- *   - `bounced:<sessionId>` — the read-once recovery slot for TTL-expired
- *     or terminally-failed messages. Written by
+ *   - `draft:<serverId>:<sessionId>` — the live typing buffer. Saved on
+ *     every keystroke (debounced 500 ms by the caller), cleared after a
+ *     successful send.
+ *   - `bounced:<serverId>:<sessionId>` — the read-once recovery slot for
+ *     TTL-expired or terminally-failed messages. Written by
  *     [ru.sipaha.spkremote.app.vm.MainViewModel.handleExpiredMessage] when
  *     [ru.sipaha.spkremote.core.RemoteClient.onMessageExpired] fires. Read
  *     once via [bouncedFor] when the user next opens the session, which
  *     also clears the slot — so the bounce surfaces exactly once per
  *     expiry event.
+ *
+ * **R-6c-multi per-server scoping:** every key now embeds the active
+ * server id (provided via [activeServerProvider]). Same session id on
+ * two paired servers no longer collide. The provider is read on every
+ * call rather than captured at construction, so a `switchToServer` in
+ * [MainViewModel] is reflected immediately in subsequent
+ * [save] / [load] / [bouncedFor].
  *
  * **Storage:** plain [SharedPreferences] (not encrypted). Drafts aren't
  * secrets in the threat model — the server has the same text the moment
@@ -30,7 +38,10 @@ import android.util.Log
  * but the JVM-level instance also serves as a process-wide synchronization
  * point if multiple ViewModels ever share a draft (today, only [MainViewModel]).
  */
-class DraftRepository(private val context: Context) {
+class DraftRepository(
+    private val context: Context,
+    private val activeServerProvider: () -> String?,
+) {
 
     private val prefs: SharedPreferences? by lazy { openPrefs() }
 
@@ -42,7 +53,7 @@ class DraftRepository(private val context: Context) {
     /** Save the in-progress draft for [sessionId]. Empty string clears it. */
     fun save(sessionId: String, text: String) {
         val p = prefs ?: return
-        val key = draftKey(sessionId)
+        val key = draftKey(sessionId) ?: return
         runCatching {
             if (text.isEmpty()) {
                 p.edit().remove(key).apply()
@@ -55,7 +66,8 @@ class DraftRepository(private val context: Context) {
     /** Return the typing-buffer draft for [sessionId], or `""` if absent. */
     fun load(sessionId: String): String {
         val p = prefs ?: return ""
-        return runCatching { p.getString(draftKey(sessionId), null) ?: "" }
+        val key = draftKey(sessionId) ?: return ""
+        return runCatching { p.getString(key, null) ?: "" }
             .onFailure { Log.w(TAG, "load() failed", it) }
             .getOrDefault("")
     }
@@ -63,7 +75,8 @@ class DraftRepository(private val context: Context) {
     /** Drop any saved draft for [sessionId]. Called after a successful send. */
     fun clear(sessionId: String) {
         val p = prefs ?: return
-        runCatching { p.edit().remove(draftKey(sessionId)).apply() }
+        val key = draftKey(sessionId) ?: return
+        runCatching { p.edit().remove(key).apply() }
             .onFailure { Log.w(TAG, "clear() failed", it) }
     }
 
@@ -77,7 +90,7 @@ class DraftRepository(private val context: Context) {
      */
     fun bouncedFor(sessionId: String): String? {
         val p = prefs ?: return null
-        val key = bouncedKey(sessionId)
+        val key = bouncedKey(sessionId) ?: return null
         return runCatching {
             val text = p.getString(key, null) ?: return@runCatching null
             // apply() vs commit(): we don't strictly need a barrier here —
@@ -102,7 +115,7 @@ class DraftRepository(private val context: Context) {
      */
     fun setBounced(sessionId: String, text: String) {
         val p = prefs ?: return
-        val key = bouncedKey(sessionId)
+        val key = bouncedKey(sessionId) ?: return
         runCatching {
             val existing = p.getString(key, null)
             val merged = if (existing.isNullOrBlank()) text else "$existing\n\n$text"
@@ -113,19 +126,56 @@ class DraftRepository(private val context: Context) {
     /** Forcibly drop a pending bounce — used by `forgetPairing`. */
     fun clearBounced(sessionId: String) {
         val p = prefs ?: return
-        runCatching { p.edit().remove(bouncedKey(sessionId)).apply() }
+        val key = bouncedKey(sessionId) ?: return
+        runCatching { p.edit().remove(key).apply() }
             .onFailure { Log.w(TAG, "clearBounced() failed", it) }
     }
 
-    /** Wipe every draft + bounce. Called from `forgetPairing` on Settings. */
+    /**
+     * Wipe every draft + bounce belonging to the currently-active server.
+     * Called when a single server is removed from the multi-server list
+     * (R-6c-multi).
+     *
+     * If no server is active (the user removed the last one) this falls
+     * back to clearing the entire prefs file — equivalent to the R-6d
+     * forget-pairing behavior.
+     */
     fun clearAll() {
         val p = prefs ?: return
-        runCatching { p.edit().clear().apply() }
-            .onFailure { Log.w(TAG, "clearAll() failed", it) }
+        val serverId = activeServerProvider()
+        runCatching {
+            if (serverId == null) {
+                p.edit().clear().apply()
+                return@runCatching
+            }
+            val draftPrefix = "draft:$serverId:"
+            val bouncedPrefix = "bounced:$serverId:"
+            val editor = p.edit()
+            for (key in p.all.keys) {
+                if (key.startsWith(draftPrefix) || key.startsWith(bouncedPrefix)) {
+                    editor.remove(key)
+                }
+            }
+            editor.apply()
+        }.onFailure { Log.w(TAG, "clearAll() failed", it) }
     }
 
-    private fun draftKey(sessionId: String) = "draft:$sessionId"
-    private fun bouncedKey(sessionId: String) = "bounced:$sessionId"
+    /** Wipe every draft + bounce regardless of server. Used by tests / hard resets. */
+    fun clearAllServers() {
+        val p = prefs ?: return
+        runCatching { p.edit().clear().apply() }
+            .onFailure { Log.w(TAG, "clearAllServers() failed", it) }
+    }
+
+    private fun draftKey(sessionId: String): String? {
+        val serverId = activeServerProvider() ?: return null
+        return "draft:$serverId:$sessionId"
+    }
+
+    private fun bouncedKey(sessionId: String): String? {
+        val serverId = activeServerProvider() ?: return null
+        return "bounced:$serverId:$sessionId"
+    }
 
     companion object {
         private const val TAG = "DraftRepository"
@@ -134,9 +184,10 @@ class DraftRepository(private val context: Context) {
         @Volatile
         private var instance: DraftRepository? = null
 
-        fun get(context: Context): DraftRepository =
+        fun get(context: Context, activeServerProvider: () -> String?): DraftRepository =
             instance ?: synchronized(this) {
-                instance ?: DraftRepository(context.applicationContext).also { instance = it }
+                instance ?: DraftRepository(context.applicationContext, activeServerProvider)
+                    .also { instance = it }
             }
     }
 }

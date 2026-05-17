@@ -1,6 +1,9 @@
 plugins {
     id("com.android.application")
     kotlin("android")
+    // R-6c-multi: needed by [PairedServer] which is JSON-serialised into
+    // the EncryptedSharedPreferences-backed paired-server list.
+    kotlin("plugin.serialization")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
