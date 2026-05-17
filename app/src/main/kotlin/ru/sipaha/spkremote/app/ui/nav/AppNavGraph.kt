@@ -27,6 +27,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import ru.sipaha.spkremote.app.ui.qr.QrPairingScreen
 import ru.sipaha.spkremote.app.ui.servers.ServersListScreen
+import ru.sipaha.spkremote.app.ui.settings.CrashLogsScreen
 import ru.sipaha.spkremote.app.ui.settings.SettingsScreen
 import ru.sipaha.spkremote.app.ui.solutions.SessionDetailScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionDetailScreen
@@ -199,7 +200,11 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                             launchSingleTop = true
                         }
                     },
+                    onOpenCrashLogs = { navController.navigate("crash-logs") },
                 )
+            }
+            composable("crash-logs") {
+                CrashLogsScreen(onBack = { navController.popBackStack() })
             }
             composable(
                 route = "solutions/{solutionId}",

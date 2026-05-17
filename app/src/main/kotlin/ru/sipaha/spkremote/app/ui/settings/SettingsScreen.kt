@@ -2,6 +2,7 @@ package ru.sipaha.spkremote.app.ui.settings
 
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -12,12 +13,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -36,6 +40,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import ru.sipaha.spkremote.app.BuildConfig
 import ru.sipaha.spkremote.app.data.PairedServer
+import ru.sipaha.spkremote.app.diagnostics.CrashLogger
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.PairingUrl
@@ -67,6 +72,7 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onForget: () -> Unit,
     onSwitchServer: () -> Unit = {},
+    onOpenCrashLogs: () -> Unit = {},
 ) {
     val pairing by viewModel.pairing.collectAsState()
     val connectionState by viewModel.rawConnectionState.collectAsState()
@@ -149,6 +155,43 @@ fun SettingsScreen(
                 }
                 HorizontalDivider()
             }
+
+            SectionHeader("Diagnostics")
+            // The file count is read at composition time and is *not*
+            // reactive. Crash files only appear between process
+            // lifetimes (the process is being killed when one is
+            // written), so we can't observe new files arriving from
+            // within a running Settings screen — and a `remember` is
+            // enough.
+            val crashFileCount = remember { CrashLogger.listCrashFiles(context).size }
+            ListItem(
+                headlineContent = { Text("Crash logs") },
+                supportingContent = {
+                    Text(
+                        if (crashFileCount == 0) "No crashes recorded"
+                        else "$crashFileCount file(s) — tap to view",
+                    )
+                },
+                leadingContent = {
+                    // material-icons-core ships ~30 commonly used icons;
+                    // `Icons.Filled.BugReport` is only in the
+                    // extended set (~3 MB). `Warning` is in core and
+                    // reads as "diagnostics-y" well enough.
+                    Icon(Icons.Filled.Warning, contentDescription = null)
+                },
+                trailingContent = {
+                    if (crashFileCount > 0) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                        )
+                    }
+                },
+                modifier = Modifier.clickable(enabled = crashFileCount > 0) {
+                    onOpenCrashLogs()
+                },
+            )
+            HorizontalDivider()
 
             SectionHeader("About")
             AboutInfo(
