@@ -1,30 +1,39 @@
 # spk-editor-android-client
 
-Android remote-control client for [SPK Editor](https://github.com/Sipaha/spk-editor).
-Pairs with an editor instance over WebSocket + TLS, authenticates via HMAC, and
-proxies tool calls into the editor's embedded MCP server.
+The mobile companion for [SPK Editor](https://github.com/Sipaha/spk-editor) —
+pair via QR, see your open solutions and AI sessions, send messages and watch
+responses stream in.
 
-This is the **Remote Control** counterpart for the protocol established in the
-spk-editor repo. The corresponding plan docs live there (same machine):
+This repo is the **Remote Control** counterpart for the protocol established
+in the spk-editor main repo. The roadmap docs that drove this client live there
+(same machine):
 
-- `/home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor/docs/plans/2026-05-15-remote-control.md`
-  — overall Remote Control roadmap (R-1 .. R-5).
-- `/home/spk/.spk/spk-editor/solutions/spk-solutions/spk-editor/docs/plans/2026-05-16-remote-control-R5a-android-bootstrap.md`
-  — the inline plan that produced this scaffold.
+- `docs/plans/2026-05-15-remote-control.md` — overall Remote Control roadmap
+  (R-1 .. R-6).
+- `docs/plans/2026-05-16-remote-control-R5a-android-bootstrap.md` — the inline
+  plan that produced the initial scaffold.
 
-## Layout
+## Modules
 
 ```
 spk-editor-android-client/
-  core/   # Pure JVM library (Kotlin). Pairing URL parsing, fingerprint pinning,
-          # HMAC handshake, JSON-RPC envelope, WebSocket client. JDK-only,
-          # no Android dependencies — easy to unit-test on CI without an SDK.
-  cli/    # Pure JVM smoke client built on :core. No Android. Use it to issue
-          # a single JSON-RPC call against a live editor for debugging.
-  app/    # Android Compose UI. Depends on :core. Requires Android SDK to build.
+  core/   # Pure JVM library (Kotlin). Pairing URL parsing, TLS pinning,
+          # HMAC handshake, JSON-RPC envelope, reconnect with backoff,
+          # outbound queue. JDK-only, no Android dependencies — easy to
+          # unit-test on CI without an SDK.
+  cli/    # Pure JVM smoke client built on :core. No Android. Issues a
+          # single JSON-RPC call against a live editor for debugging.
+  app/    # Android Compose UI. Depends on :core. Requires Android SDK
+          # to build.
 ```
 
-## Building
+## Build
+
+### Prerequisites
+
+- JDK 21+ (Temurin 21 recommended). Older JDKs (17) work for `:core` and
+  `:cli` but AGP 8.7 needs ≥ 21 for `:app`.
+- Android SDK (cmdline-tools is enough) for `:app`. Set `ANDROID_HOME`.
 
 ### `:core` (no Android SDK required)
 
@@ -33,66 +42,58 @@ spk-editor-android-client/
 ```
 
 This is the surface that gets exercised in CI. Tests cover URL parsing,
-fingerprint pinning, the HMAC challenge round, and JSON-RPC envelope
-serialisation.
+fingerprint pinning, the HMAC challenge round, JSON-RPC envelope serialisation,
+reconnect/backoff, and the outbound queue's TTL behaviour.
 
-JDK 17+ is required (Kotlin JVM target is `17`). On this machine, JDK 25
-(`~/.jdks/temurin-25.0.2`) is what we develop against.
-
-### `:app` (Android SDK required)
+### `:app` debug APK
 
 ```sh
 export ANDROID_HOME=$HOME/Android/Sdk   # or wherever your SDK lives
 ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Without `ANDROID_HOME` (or a `local.properties` with `sdk.dir=...`), the
 Android plugin halts at configure time with `SDK location not found`. That's
-expected — the `:core` build is the one that's portable.
+expected — the `:core` build is the portable one.
 
-## Pairing URL
+### `:app` release APK (R8 / signed)
 
-The editor produces a pairing URL of the form:
+The release build runs R8 minification + resource shrinking. The keystore is
+configured via Gradle properties (or env vars); if none are present, the
+build still completes and emits `app-release-unsigned.apk` so R8 can be
+verified on any dev machine without secrets.
 
-```
-spk-remote://<host>:<port>?secret=<base64>&client=<name>&fp=<sha256-hex>
-```
+1. Generate a keystore (one-time):
 
-- `secret` — 32 bytes (base64-encoded) of shared key for HMAC handshake.
-- `fp` — 32 bytes (lowercase hex) SHA-256 fingerprint of the server's leaf cert.
-- `client` — display name shown in the editor's connections list.
+   ```sh
+   keytool -genkeypair -v -keystore release.keystore -alias spk \
+       -keyalg RSA -keysize 2048 -validity 36500
+   ```
 
-`PairingUrl.parse(...)` validates all of these.
+2. Configure Gradle (in `~/.gradle/gradle.properties` — keep these out of
+   the repo and out of `local.properties`):
 
-## Integration test
+   ```
+   SPK_RELEASE_STORE_FILE=/abs/path/to/release.keystore
+   SPK_RELEASE_STORE_PASSWORD=...
+   SPK_RELEASE_KEY_ALIAS=spk
+   SPK_RELEASE_KEY_PASSWORD=...
+   ```
 
-`:core` has an opt-in end-to-end probe gated on the `SPK_EDITOR_PAIRING_URL`
-environment variable. It exercises six assertions against a live editor:
+   Equivalent `SPK_RELEASE_*` environment variables also work (useful for CI).
 
-1. `RemoteClient.connect()` succeeds (TLS pin + HMAC handshake).
-2. `remote.editor.capabilities` returns a result containing `protocol_version`.
-3. `remote.solutions.list` returns a (possibly empty) result.
-4. `remote.lsp.start` is rejected with JSON-RPC `-32601` — proves the R-4
-   allow-list filter is active.
-5. `remote.editor.subscribe` with `kinds=["agent_session_message_appended"]`
-   succeeds.
-6. After `client.close()`, a follow-up call does not succeed.
+3. Build:
 
-To run it:
+   ```sh
+   ./gradlew :app:assembleRelease
+   ```
 
-```sh
-SPK_EDITOR_PAIRING_URL='spk-remote://...' ./gradlew :core:test \
-    -DincludeTags=integration
-```
+   - With keystore properties present: `app/build/outputs/apk/release/app-release.apk`.
+   - Without: `app/build/outputs/apk/release/app-release-unsigned.apk` — R8
+     still runs end-to-end, just no signature.
 
-The default `:core:test` run skips integration tests (they're tagged
-`integration` and excluded by the JUnit Platform filter in
-`core/build.gradle.kts`).
-
-## `:cli` smoke client
-
-`:cli` is a pure-JVM terminal client over `:core`. Use it for quick manual
-verification against a live editor without spinning up the Android UI:
+### `:cli` smoke client
 
 ```sh
 ./gradlew :cli:run --args="<pairing-url> [method] [params-json]"
@@ -116,6 +117,55 @@ Example:
     --args='spk-remote://... remote.editor.subscribe {"kinds":["buffer_opened"]}'
 ```
 
+## Pairing URL
+
+The editor produces a pairing URL of the form:
+
+```
+spk-remote://<host>:<port>?secret=<base64>&client=<name>&fp=<sha256-hex>
+```
+
+- `secret` — 32 bytes (base64-encoded) of shared key for HMAC handshake.
+- `fp` — 32 bytes (lowercase hex) SHA-256 fingerprint of the server's leaf cert.
+- `client` — display name shown in the editor's connections list.
+
+`PairingUrl.parse(...)` validates all of these.
+
+## Pairing flow
+
+1. Open Remote Control on the desktop (status bar → Remote Control).
+2. Add a client, tap "Show QR".
+3. On the phone, tap **Scan pairing QR** and point at the QR.
+4. The app handshakes the editor (TLS pin + HMAC), pulls solutions, and lands
+   you on the Solutions list.
+
+Pairing URLs are persisted in **EncryptedSharedPreferences** (Android-Keystore
+master key, AES256-GCM values). On every cold start, `MainActivity.onCreate`
+reads the saved URL and reconnects without prompting. To wipe the pairing,
+open **Settings** (gear icon on the Solutions list) → **Forget paired server**
+or **Re-pair**.
+
+## Integration test (live editor)
+
+`:core` has an opt-in end-to-end probe gated on the `SPK_EDITOR_PAIRING_URL`
+environment variable. It exercises six assertions against a live editor:
+
+1. `RemoteClient.connect()` succeeds (TLS pin + HMAC handshake).
+2. `remote.editor.capabilities` returns a result containing `protocol_version`.
+3. `remote.solutions.list` returns a (possibly empty) result.
+4. `remote.lsp.start` is rejected with JSON-RPC `-32601` — proves the R-4
+   allow-list filter is active.
+5. `remote.editor.subscribe` with `kinds=["agent_session_message_appended"]`
+   succeeds.
+6. After `client.close()`, a follow-up call does not succeed.
+
+```sh
+SPK_EDITOR_PAIRING_URL='spk-remote://...' ./gradlew :core:test \
+    -DincludeTags=integration
+```
+
+The default `:core:test` run skips integration tests.
+
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. © 2026 Pavel Simonov. See [LICENSE](LICENSE).

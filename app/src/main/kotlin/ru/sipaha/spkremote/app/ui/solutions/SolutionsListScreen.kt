@@ -11,6 +11,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -40,6 +41,7 @@ import ru.sipaha.spkremote.core.SolutionSummary
 fun SolutionsListScreen(
     viewModel: MainViewModel,
     onOpenSolution: (SolutionSummary) -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val solutionsState by viewModel.solutions.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -60,6 +62,9 @@ fun SolutionsListScreen(
                 actions = {
                     IconButton(onClick = { viewModel.refreshSolutions() }) {
                         Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
                 },
             )

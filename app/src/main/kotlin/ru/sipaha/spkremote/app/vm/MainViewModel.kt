@@ -1,6 +1,7 @@
 package ru.sipaha.spkremote.app.vm
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -11,6 +12,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import ru.sipaha.spkremote.app.data.PairingRepository
 import ru.sipaha.spkremote.core.AgentSummary
 import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.CreateSessionResult
@@ -53,9 +55,26 @@ sealed interface UiData<out T> {
     data class Error(val message: String) : UiData<Nothing>
 }
 
-class MainViewModel : ViewModel() {
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    /**
+     * Persistence backend for the pairing URL. Lazily opens an
+     * EncryptedSharedPreferences file on first read/write; see
+     * [PairingRepository] for the cold-start contract.
+     */
+    private val pairingRepository: PairingRepository = PairingRepository.get(application)
+
     private val _state = MutableStateFlow<UiState>(UiState.Disconnected())
     val state: StateFlow<UiState> = _state.asStateFlow()
+
+    /**
+     * The parsed [PairingUrl] for the active connection, or `null` when no
+     * connection has been attempted in this VM instance. Surfaced to the
+     * Settings screen so it can render server host / fingerprint / client
+     * name without re-parsing the raw string.
+     */
+    private val _pairing = MutableStateFlow<PairingUrl?>(null)
+    val pairing: StateFlow<PairingUrl?> = _pairing.asStateFlow()
 
     private val _solutions = MutableStateFlow<UiData<List<SolutionSummary>>>(UiData.Loading)
     val solutions: StateFlow<UiData<List<SolutionSummary>>> = _solutions.asStateFlow()
@@ -143,6 +162,7 @@ class MainViewModel : ViewModel() {
             _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
             return
         }
+        _pairing.value = parsed
         _state.value = UiState.Connecting
         viewModelScope.launch {
             val newClient = RemoteClient(parsed)
@@ -163,6 +183,12 @@ class MainViewModel : ViewModel() {
                         ?.content
                         ?: "unknown"
                     _state.value = UiState.Connected(version)
+                    // Persist only after the handshake + capabilities round-trip
+                    // succeeded. A poisoned QR (wrong fingerprint, expired
+                    // secret) never reaches disk this way — the user always
+                    // lands on the QR screen on the next cold start if the
+                    // first attempt didn't authenticate.
+                    pairingRepository.save(rawUrl)
                 }
                 .onFailure {
                     _state.value = UiState.Disconnected(lastUrl = rawUrl, error = it.message)
@@ -172,6 +198,58 @@ class MainViewModel : ViewModel() {
             startObservingConnectionState(newClient)
         }
     }
+
+    /**
+     * Returns the previously-persisted pairing URL, if any, suitable for
+     * passing to [connect] directly. Called from `MainActivity.onCreate`
+     * on cold start to skip the QR scan flow when we already know a server.
+     *
+     * No parsing happens here — the caller (`connect`) re-parses and surfaces
+     * the failure path identically to a fresh manual entry. If the persisted
+     * blob is corrupted, the user lands on the QR screen with an inline
+     * error, identical to a typo.
+     */
+    fun loadPersistedPairingUrl(): String? = pairingRepository.load()
+
+    /**
+     * Forget the persisted pairing and tear down the active connection.
+     *
+     * Called from the Settings screen (Forget Server / Re-pair). Resets
+     * every cached piece of UI state so the next `connect` doesn't see
+     * stale solutions / sessions / agents from the previous server.
+     */
+    fun forgetPairing() {
+        pairingRepository.clear()
+        connectionObserverJob?.cancel()
+        sessionObserverJob?.cancel()
+        sessionDetailObserverJob?.cancel()
+        client?.close()
+        client = null
+        sessionStateSubscribed = false
+        sessionDetailSubscribed = false
+        openSessionId = null
+        lastSeenEntryIndex.clear()
+        _pairing.value = null
+        _solutions.value = UiData.Loading
+        _sessions.value = UiData.Loading
+        _session.value = UiData.Loading
+        _agents.value = UiData.Loading
+        _optimisticEntries.value = emptyList()
+        _connectionBanner.value = ConnectionBanner.Hidden
+        _rawConnectionState.value = ConnectionState.Disconnected
+        _state.value = UiState.Disconnected()
+    }
+
+    /**
+     * The raw [ConnectionState] of the active client, suitable for direct
+     * surfacing on the Settings screen (the [connectionBanner] flow elides
+     * Connected/Disconnected because the nav-level banner is "transient
+     * trouble" only). Emits [ConnectionState.Disconnected] when there is
+     * no active client. Updated from [startObservingConnectionState] on
+     * every wire-level state transition.
+     */
+    private val _rawConnectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    val rawConnectionState: StateFlow<ConnectionState> = _rawConnectionState.asStateFlow()
 
     /**
      * Translate [RemoteClient.connectionState] into the UI banner and
@@ -185,6 +263,7 @@ class MainViewModel : ViewModel() {
         connectionObserverJob = viewModelScope.launch {
             var previousConnected = false
             client.connectionState.collect { state ->
+                _rawConnectionState.value = state
                 _connectionBanner.value = when (state) {
                     is ConnectionState.Reconnecting -> ConnectionBanner.Reconnecting(
                         attempt = state.attempt,

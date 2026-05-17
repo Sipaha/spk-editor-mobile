@@ -22,6 +22,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import ru.sipaha.spkremote.app.ui.qr.QrPairingScreen
+import ru.sipaha.spkremote.app.ui.settings.SettingsScreen
 import ru.sipaha.spkremote.app.ui.solutions.SessionDetailScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionDetailScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionsListScreen
@@ -102,6 +103,26 @@ fun AppNav(viewModel: MainViewModel) {
                     viewModel = viewModel,
                     onOpenSolution = { sol ->
                         navController.navigate("solutions/${sol.id}")
+                    },
+                    onOpenSettings = { navController.navigate("settings") },
+                )
+            }
+            composable("settings") {
+                SettingsScreen(
+                    viewModel = viewModel,
+                    onBack = { navController.popBackStack() },
+                    // Forget Server: clear persistence + connection, then
+                    // pop everything back to `pairing`. We don't rely on
+                    // the UiState-watching LaunchedEffect because the user
+                    // may have arrived at Settings via a freshly persisted
+                    // connection that already pushed `solutions` onto the
+                    // back stack.
+                    onForget = {
+                        viewModel.forgetPairing()
+                        navController.navigate("pairing") {
+                            popUpTo("pairing") { inclusive = true }
+                            launchSingleTop = true
+                        }
                     },
                 )
             }

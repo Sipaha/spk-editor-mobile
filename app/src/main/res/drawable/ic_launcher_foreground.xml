@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Placeholder adaptive-icon foreground for the SPK Remote app. A stylised
+    "S" glyph centred on the 108dp canvas, comfortably inside the 72dp safe
+    zone the launcher mask enforces. The shape is intentionally geometric
+    (no embedded fonts) so AAPT renders it deterministically across SDK
+    versions; replace with the final brand mark when one exists.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M70,40
+            C70,30 60,28 54,28
+            C46,28 38,32 38,42
+            C38,52 48,54 54,55
+            C62,56 70,58 70,68
+            C70,78 60,80 54,80
+            C46,80 38,76 38,68
+            L46,68
+            C46,72 50,73 54,73
+            C58,73 62,72 62,68
+            C62,64 56,63 50,62
+            C42,60 30,58 30,42
+            C30,28 42,21 54,21
+            C66,21 78,28 78,40
+            Z" />
+</vector>

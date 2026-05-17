@@ -23,11 +23,53 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     sourceSets {
         named("main") {
             java.srcDirs("src/main/kotlin")
+        }
+    }
+
+    // Release keystore is wired via Gradle properties (or env vars) so dev
+    // machines without a keystore can still produce an unsigned release APK
+    // for R8 verification. See README.md § "Release APK".
+    val storeFilePath: String? = providers.gradleProperty("SPK_RELEASE_STORE_FILE").orNull
+        ?: System.getenv("SPK_RELEASE_STORE_FILE")
+
+    signingConfigs {
+        create("release") {
+            if (storeFilePath != null) {
+                storeFile = file(storeFilePath)
+                storePassword = providers.gradleProperty("SPK_RELEASE_STORE_PASSWORD").orNull
+                    ?: System.getenv("SPK_RELEASE_STORE_PASSWORD")
+                keyAlias = providers.gradleProperty("SPK_RELEASE_KEY_ALIAS").orNull
+                    ?: System.getenv("SPK_RELEASE_KEY_ALIAS")
+                keyPassword = providers.gradleProperty("SPK_RELEASE_KEY_PASSWORD").orNull
+                    ?: System.getenv("SPK_RELEASE_KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            // Only attach the signing config if a keystore was configured.
+            // Without this guard, AGP would attempt to sign with an empty
+            // keystore and fail; with the guard, `assembleRelease` produces
+            // `app-release-unsigned.apk` and R8 still runs end-to-end.
+            if (storeFilePath != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+        getByName("debug") {
+            isMinifyEnabled = false
         }
     }
 }
@@ -48,6 +90,11 @@ dependencies {
     implementation("androidx.navigation:navigation-compose:2.8.4")
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    // Encrypted SharedPreferences for persisting the pairing URL. The
+    // 1.1.0-alpha06 release is the latest published artifact on Google's
+    // Maven (security-crypto has been in alpha for ages; the stable
+    // 1.0.0 branch depends on a deprecated Tink and breaks on AGP 8+).
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     // Markdown rendering for assistant bubbles. The library pins a Compose
     // runtime version under the hood; keep this in step with the Compose
