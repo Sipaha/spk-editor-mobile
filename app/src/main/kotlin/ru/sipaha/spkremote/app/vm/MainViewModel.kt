@@ -13,9 +13,12 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import ru.sipaha.spkremote.core.AgentSummary
+import ru.sipaha.spkremote.core.CreateSessionResult
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.GetSessionResult
 import ru.sipaha.spkremote.core.JsonRpc
+import ru.sipaha.spkremote.core.ListAgentsResult
 import ru.sipaha.spkremote.core.ListSessionsResult
 import ru.sipaha.spkremote.core.ListSolutionsResult
 import ru.sipaha.spkremote.core.MessageAppendedPayload
@@ -63,6 +66,28 @@ class MainViewModel : ViewModel() {
     /** True while a `cancel_turn` request is in flight (button is debounced). */
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
+
+    /**
+     * Agent adapters available on the paired editor. Populated lazily by
+     * [loadAgents] when a screen opens the "New session" dialog. Empty list
+     * is a legitimate Loaded state — the dialog disables the Create button
+     * and shows "no adapters available" rather than treating it as an error.
+     */
+    private val _agents = MutableStateFlow<UiData<List<AgentSummary>>>(UiData.Loading)
+    val agents: StateFlow<UiData<List<AgentSummary>>> = _agents.asStateFlow()
+
+    /** True while a `create_session` (possibly with auto-open retry) is in flight. */
+    private val _createSessionInFlight = MutableStateFlow(false)
+    val createSessionInFlight: StateFlow<Boolean> = _createSessionInFlight.asStateFlow()
+
+    /**
+     * Signalled when the auto-open-and-retry path was exercised during the
+     * last successful create_session — the dialog surfaces a small info
+     * line so the user understands why their solution window jumped into
+     * the foreground on the desktop. Reset by [loadAgents].
+     */
+    private val _lastCreateAutoOpened = MutableStateFlow(false)
+    val lastCreateAutoOpened: StateFlow<Boolean> = _lastCreateAutoOpened.asStateFlow()
 
     private var client: RemoteClient? = null
 
@@ -507,6 +532,156 @@ class MainViewModel : ViewModel() {
                 }
                 .onFailure { _sendError.tryEmit("cancel failed: ${it.message ?: "?"}") }
             _cancelInFlight.value = false
+        }
+    }
+
+    /**
+     * Fetch the list of agent adapters registered on the paired editor.
+     *
+     * Calls `remote.solution_agent.list_agents` and populates [agents]. Also
+     * resets [lastCreateAutoOpened] — the flag belongs to a single dialog
+     * lifecycle, and re-opening the dialog re-loads agents anyway.
+     */
+    fun loadAgents() {
+        val active = client
+        _lastCreateAutoOpened.value = false
+        if (active == null) {
+            _agents.value = UiData.Error("not connected")
+            return
+        }
+        _agents.value = UiData.Loading
+        viewModelScope.launch {
+            runCatching {
+                active.call("remote.solution_agent.list_agents", buildJsonObject {})
+            }
+                .mapCatching { resp ->
+                    val err = resp.error
+                    if (err != null) error(err.message)
+                    val result = resp.result ?: error("missing result")
+                    JsonRpc.json
+                        .decodeFromJsonElement(ListAgentsResult.serializer(), result)
+                        .agents
+                }
+                .onSuccess { _agents.value = UiData.Loaded(it) }
+                .onFailure { _agents.value = UiData.Error(it.message ?: "unknown error") }
+        }
+    }
+
+    /**
+     * Create a new session for [solutionId] backed by [agentId].
+     *
+     * Production behaviour: if the desktop reports
+     * `no_active_workspace_for_solution`, we transparently call
+     * `remote.solutions.open` for the same solution and retry
+     * `create_session` exactly once. This makes the cold-start path —
+     * user pairs from QR, immediately wants a new session — work without
+     * making them go back to the desktop to manually open the solution
+     * first. We only retry once: a second failure surfaces the original
+     * error message via [sendError] so the user can adjust and retry.
+     *
+     * [initialMessage] is optional. When provided we pass it through as
+     * `initial_message`; the server interprets that as the first user
+     * turn for the freshly-created session.
+     *
+     * [onCreated] is invoked from the main thread with the new session
+     * id once the server confirms creation — the dialog uses this to
+     * navigate the user into the chat surface.
+     */
+    fun createSession(
+        solutionId: String,
+        agentId: String,
+        initialMessage: String?,
+        onCreated: (sessionId: String) -> Unit,
+    ) {
+        val active = client
+        if (active == null) {
+            _sendError.tryEmit("not connected")
+            return
+        }
+        if (_createSessionInFlight.value) return
+        _createSessionInFlight.value = true
+        _lastCreateAutoOpened.value = false
+        viewModelScope.launch {
+            val firstAttempt = attemptCreateSession(active, solutionId, agentId, initialMessage)
+            firstAttempt
+                .onSuccess { sessionId ->
+                    _createSessionInFlight.value = false
+                    onCreated(sessionId)
+                }
+                .onFailure { firstError ->
+                    val message = firstError.message.orEmpty()
+                    if (message.contains("no_active_workspace_for_solution", ignoreCase = true)) {
+                        val opened = attemptOpenSolution(active, solutionId)
+                        if (opened.isFailure) {
+                            _createSessionInFlight.value = false
+                            val openErr = opened.exceptionOrNull()?.message ?: "open failed"
+                            _sendError.tryEmit("Couldn't open solution: $openErr")
+                            return@launch
+                        }
+                        val retry = attemptCreateSession(active, solutionId, agentId, initialMessage)
+                        retry
+                            .onSuccess { sessionId ->
+                                _lastCreateAutoOpened.value = true
+                                _createSessionInFlight.value = false
+                                onCreated(sessionId)
+                            }
+                            .onFailure { retryErr ->
+                                _createSessionInFlight.value = false
+                                _sendError.tryEmit(
+                                    "Create session failed after opening: ${retryErr.message ?: "?"}",
+                                )
+                            }
+                    } else {
+                        _createSessionInFlight.value = false
+                        _sendError.tryEmit("Create session failed: ${message.ifBlank { "?" }}")
+                    }
+                }
+        }
+    }
+
+    /**
+     * Single attempt at `remote.solution_agent.create_session`. Returns a
+     * `Result` so the caller (with its own retry policy) can branch on the
+     * error message without swallowing the failure.
+     */
+    private suspend fun attemptCreateSession(
+        active: RemoteClient,
+        solutionId: String,
+        agentId: String,
+        initialMessage: String?,
+    ): Result<String> {
+        val params = buildJsonObject {
+            put("solution_id", solutionId)
+            put("agent_id", agentId)
+            if (!initialMessage.isNullOrBlank()) {
+                put("initial_message", initialMessage)
+            }
+        }
+        return runCatching {
+            val resp = active.call("remote.solution_agent.create_session", params)
+            val err = resp.error
+            if (err != null) error(err.message)
+            val result = resp.result ?: error("missing result")
+            JsonRpc.json
+                .decodeFromJsonElement(CreateSessionResult.serializer(), result)
+                .sessionId
+        }
+    }
+
+    /**
+     * Single attempt at `remote.solutions.open`. Returns `Result<Unit>`
+     * because the server response is `{}`; we only care whether the RPC
+     * succeeded for use in the auto-open-retry path of [createSession].
+     */
+    private suspend fun attemptOpenSolution(
+        active: RemoteClient,
+        solutionId: String,
+    ): Result<Unit> {
+        val params = buildJsonObject { put("solution_id", solutionId) }
+        return runCatching {
+            val resp = active.call("remote.solutions.open", params)
+            val err = resp.error
+            if (err != null) error(err.message)
         }
     }
 

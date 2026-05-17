@@ -102,6 +102,9 @@ fun AppNav(viewModel: MainViewModel) {
                 onOpenSession = { session ->
                     navController.navigate("solutions/$solutionId/sessions/${session.id}")
                 },
+                onOpenSessionById = { sessionId ->
+                    navController.navigate("solutions/$solutionId/sessions/$sessionId")
+                },
                 onBack = { navController.popBackStack() },
             )
         }

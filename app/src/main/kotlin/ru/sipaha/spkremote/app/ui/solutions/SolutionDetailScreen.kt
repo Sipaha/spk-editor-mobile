@@ -32,13 +32,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.launch
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.app.vm.UiData
 import ru.sipaha.spkremote.core.DisplayState
@@ -52,12 +53,13 @@ fun SolutionDetailScreen(
     viewModel: MainViewModel,
     solutionId: String,
     onOpenSession: (SessionSummary) -> Unit,
+    onOpenSessionById: (sessionId: String) -> Unit,
     onBack: () -> Unit,
 ) {
     val solutionsState by viewModel.solutions.collectAsState()
     val sessionsState by viewModel.sessions.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
-    val scope = rememberCoroutineScope()
+    var showNewSessionDialog by rememberSaveable { mutableStateOf(false) }
 
     val solution: SolutionSummary? = (solutionsState as? UiData.Loaded)
         ?.value
@@ -77,6 +79,15 @@ fun SolutionDetailScreen(
         }
     }
 
+    // Surface create_session failures (also fed sendMessage / cancelTurn —
+    // the existing chat surface owns the channel, but on this screen the
+    // dialog needs the same visibility for its own RPCs).
+    LaunchedEffect(Unit) {
+        viewModel.sendError.collect { message ->
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -91,11 +102,7 @@ fun SolutionDetailScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = {
-                    scope.launch {
-                        snackbarHostState.showSnackbar("New session: coming in R-5d")
-                    }
-                },
+                onClick = { showNewSessionDialog = true },
                 icon = { Icon(Icons.Filled.Add, contentDescription = null) },
                 text = { Text("New session") },
             )
@@ -154,6 +161,18 @@ fun SolutionDetailScreen(
                     }
                 }
             }
+        }
+
+        if (showNewSessionDialog) {
+            NewSessionDialog(
+                viewModel = viewModel,
+                solutionId = solutionId,
+                onDismiss = { showNewSessionDialog = false },
+                onCreated = { sessionId ->
+                    showNewSessionDialog = false
+                    onOpenSessionById(sessionId)
+                },
+            )
         }
     }
 }

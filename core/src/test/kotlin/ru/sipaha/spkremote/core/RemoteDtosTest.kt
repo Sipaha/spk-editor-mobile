@@ -455,6 +455,60 @@ class RemoteDtosTest {
     }
 
     @Test
+    fun `AgentSummary round-trips with snake_case display_name`() {
+        val text = """
+            {"id": "claude", "display_name": "Claude Code"}
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(AgentSummary.serializer(), text)
+        assertEquals("claude", parsed.id)
+        assertEquals("Claude Code", parsed.displayName)
+
+        val reencoded = JsonRpc.json.encodeToString(AgentSummary.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(AgentSummary.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `ListAgentsResult round-trips empty and populated agent lists`() {
+        // Empty list is a valid server response — no adapters registered.
+        val empty = JsonRpc.json.decodeFromString(
+            ListAgentsResult.serializer(),
+            """{"agents": []}""",
+        )
+        assertTrue(empty.agents.isEmpty())
+
+        val text = """
+            {
+              "agents": [
+                {"id": "claude", "display_name": "Claude Code"},
+                {"id": "gemini", "display_name": "Gemini CLI"}
+              ]
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(ListAgentsResult.serializer(), text)
+        assertEquals(2, parsed.agents.size)
+        assertEquals("claude", parsed.agents[0].id)
+        assertEquals("Gemini CLI", parsed.agents[1].displayName)
+
+        val reencoded = JsonRpc.json.encodeToString(ListAgentsResult.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(ListAgentsResult.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `CreateSessionResult round-trips snake_case session_id`() {
+        // Server emits `session_id` (not `id`) on the structured result of
+        // `remote.solution_agent.create_session` — the SerialName must hold.
+        val text = """{"session_id": "ses-new-1"}"""
+        val parsed = JsonRpc.json.decodeFromString(CreateSessionResult.serializer(), text)
+        assertEquals("ses-new-1", parsed.sessionId)
+
+        val reencoded = JsonRpc.json.encodeToString(CreateSessionResult.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(CreateSessionResult.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
     fun `EntrySummary with plan payload round-trips`() {
         val text = """
             {

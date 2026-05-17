@@ -153,6 +153,41 @@ data class MessageAppendedPayload(
     val preview: String,
 )
 
+/**
+ * One adapter entry returned by `remote.solution_agent.list_agents`.
+ *
+ * [id] is the stable identifier passed to `create_session.agent_id`;
+ * [displayName] is the human-readable label surfaced in the picker.
+ */
+@Serializable
+data class AgentSummary(
+    val id: String,
+    @SerialName("display_name") val displayName: String,
+)
+
+/**
+ * Result envelope for `remote.solution_agent.list_agents`.
+ *
+ * An empty [agents] list is a valid response when no adapters are
+ * registered server-side — the UI must disable the create button and
+ * surface a "no adapters available" hint rather than treat this as an
+ * error condition.
+ */
+@Serializable
+data class ListAgentsResult(val agents: List<AgentSummary>)
+
+/**
+ * Result envelope for `remote.solution_agent.create_session`.
+ *
+ * The wire-side structured-result key is `session_id` (not `id`), so we
+ * map it explicitly via [SerialName]. The new session is empty (no
+ * entries) until the caller fires `send_message` against it.
+ */
+@Serializable
+data class CreateSessionResult(
+    @SerialName("session_id") val sessionId: String,
+)
+
 @Serializable
 data class GetSessionResult(
     val id: String,
