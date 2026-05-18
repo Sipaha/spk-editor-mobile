@@ -75,4 +75,28 @@ class JsonRpcEnvelopeTest {
         assertEquals(3L, resp.id)
         assertNotNull(resp.result)
     }
+
+    @Test
+    fun `toolError surfaces text from isError true responses`() {
+        // The exact shape `handle_call_tool` emits when a tool's run()
+        // returns Err — `content[0].text` carries the formatted error,
+        // and `structuredContent` is omitted entirely (see types.rs
+        // `skip_serializing_if = "Option::is_none"`).
+        val text =
+            """{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"no_active_workspace_for_solution: open Solution lena-bug-0606"}],"isError":true}}"""
+        val resp = JsonRpc.decodeResponse(text)
+        assertEquals(null, resp.error)
+        val toolErr = assertNotNull(resp.toolError())
+        assertTrue(toolErr.contains("no_active_workspace_for_solution"))
+        assertEquals(null, resp.structuredContent())
+    }
+
+    @Test
+    fun `toolError returns null on success responses`() {
+        val text =
+            """{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"ok"}],"isError":false,"structuredContent":{"session_id":"sess-1"}}}"""
+        val resp = JsonRpc.decodeResponse(text)
+        assertEquals(null, resp.toolError())
+        assertNotNull(resp.structuredContent())
+    }
 }

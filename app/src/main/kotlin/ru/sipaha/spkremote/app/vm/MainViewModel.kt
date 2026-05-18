@@ -264,6 +264,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Job that observes [RemoteClient.connectionState]. */
     private var connectionObserverJob: Job? = null
 
+    // Single-flight guards for the two list-refresh entry points. A user
+    // tapping refresh twice (or the auto-refresh on reconnect firing at the
+    // same time) would otherwise stack two concurrent calls — and if the
+    // older one times out *after* the newer one already succeeded, the
+    // timeout-failed coroutine writes its UiData.Error over the loaded
+    // state. We cancel any in-flight job before launching a new one so the
+    // most recent intent always wins.
+    private var refreshSolutionsJob: Job? = null
+    private var refreshSessionsJob: Job? = null
+
     /**
      * Pair a NEW server from a freshly-scanned QR code.
      *
@@ -689,18 +699,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         _solutions.value = UiData.Loading
-        viewModelScope.launch {
+        refreshSolutionsJob?.cancel()
+        refreshSolutionsJob = viewModelScope.launch {
             runCatching { active.call("remote.solutions.list") }
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json
                         .decodeFromJsonElement(ListSolutionsResult.serializer(), result)
                         .solutions
                 }
                 .onSuccess { _solutions.value = UiData.Loaded(it) }
-                .onFailure { _solutions.value = UiData.Error(it.message ?: "unknown error") }
+                .onFailure { err ->
+                    // A CancellationException means a fresher refresh
+                    // superseded us — don't overwrite the newer state.
+                    if (err is kotlinx.coroutines.CancellationException) throw err
+                    _solutions.value = UiData.Error(err.message ?: "unknown error")
+                }
         }
     }
 
@@ -717,18 +735,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _sessions.value = UiData.Loading
         }
         val params = buildJsonObject { put("solution_id", solutionId) }
-        viewModelScope.launch {
+        refreshSessionsJob?.cancel()
+        refreshSessionsJob = viewModelScope.launch {
             runCatching { active.call("remote.solution_agent.list_sessions", params) }
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json
                         .decodeFromJsonElement(ListSessionsResult.serializer(), result)
                         .sessions
                 }
                 .onSuccess { _sessions.value = UiData.Loaded(it) }
-                .onFailure { _sessions.value = UiData.Error(it.message ?: "unknown error") }
+                .onFailure { err ->
+                    if (err is kotlinx.coroutines.CancellationException) throw err
+                    _sessions.value = UiData.Error(err.message ?: "unknown error")
+                }
         }
     }
 
@@ -941,6 +965,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json.decodeFromJsonElement(
                         GetSessionChildrenResult.serializer(),
@@ -1037,6 +1063,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .mapCatching { resp ->
                 val err = resp.error
                 if (err != null) error(err.message)
+                val toolErr = resp.toolError()
+                if (toolErr != null) error(toolErr)
                 val result = resp.structuredContent() ?: error("missing structuredContent")
                 JsonRpc.json.decodeFromJsonElement(GetSessionResult.serializer(), result)
             }
@@ -1079,6 +1107,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             .mapCatching { resp ->
                 val err = resp.error
                 if (err != null) error(err.message)
+                val toolErr = resp.toolError()
+                if (toolErr != null) error(toolErr)
                 val result = resp.structuredContent() ?: error("missing structuredContent")
                 JsonRpc.json.decodeFromJsonElement(GetSessionResult.serializer(), result)
             }
@@ -1142,6 +1172,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json.decodeFromJsonElement(GetSessionResult.serializer(), result)
                 }
@@ -1226,6 +1258,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json.decodeFromJsonElement(GetSessionResult.serializer(), result)
                 }
@@ -1310,6 +1344,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json.decodeFromJsonElement(GetSessionResult.serializer(), result)
                 }
@@ -1439,6 +1475,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                     val result = resp.structuredContent() ?: error("missing structuredContent")
                     JsonRpc.json
                         .decodeFromJsonElement(ListAgentsResult.serializer(), result)
@@ -1543,6 +1581,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val resp = active.call("remote.solution_agent.create_session", params)
             val err = resp.error
             if (err != null) error(err.message)
+            val toolErr = resp.toolError()
+            if (toolErr != null) error(toolErr)
             val result = resp.structuredContent() ?: error("missing structuredContent")
             JsonRpc.json
                 .decodeFromJsonElement(CreateSessionResult.serializer(), result)

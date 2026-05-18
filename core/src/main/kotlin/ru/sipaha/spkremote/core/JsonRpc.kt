@@ -3,8 +3,12 @@ package ru.sipaha.spkremote.core
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * JSON-RPC 2.0 envelopes spoken between the Android client and the editor's
@@ -70,6 +74,29 @@ data class JsonRpcResponse(
     fun structuredContent(): JsonElement? {
         val obj = result as? JsonObject ?: return null
         return obj["structuredContent"]
+    }
+
+    /**
+     * Extract the human-readable error text from a `tools/call` response that
+     * the MCP server reported as `{"isError": true}`. When a tool's `run()`
+     * returns `Err(...)` the server elides `structuredContent` entirely and
+     * stuffs the formatted error string into `content[0].text` (see
+     * `context_server::listener::handle_call_tool`). The default
+     * [structuredContent] check would then mis-attribute the failure to
+     * "missing structuredContent" instead of surfacing the real reason —
+     * which breaks call sites that substring-match on the error (e.g. the
+     * `no_active_workspace_for_solution` auto-open-retry in create_session).
+     *
+     * Returns null when the response was successful (i.e. `isError != true`).
+     */
+    fun toolError(): String? {
+        val obj = result as? JsonObject ?: return null
+        val isError = (obj["isError"] as? JsonPrimitive)?.booleanOrNull ?: false
+        if (!isError) return null
+        val content = obj["content"] as? JsonArray ?: return null
+        val first = content.firstOrNull() as? JsonObject ?: return null
+        return (first["text"] as? JsonPrimitive)?.contentOrNull
+            ?: "tool call failed"
     }
 }
 
