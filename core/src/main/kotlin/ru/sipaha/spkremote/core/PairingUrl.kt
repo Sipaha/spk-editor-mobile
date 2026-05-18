@@ -4,11 +4,11 @@ import java.net.URI
 import java.util.Base64
 
 /**
- * A parsed `spk-remote://` pairing URL handed out by the editor.
+ * A parsed `spk-editor-remote://` pairing URL handed out by the editor.
  *
  * Wire form (matches `crates/remote_control_ui/src/qr_popover.rs::build_pairing_url`):
  * ```
- * spk-remote://<host>:<port>?secret=<url-safe-base64>&client=<name>&server_fp=<url-safe-base64>
+ * spk-editor-remote://<host>:<port>?secret=<url-safe-base64>&client=<name>&server_fp=<url-safe-base64>
  * ```
  *
  * Both `secret` and `server_fp` are **URL-safe base64 without padding**
@@ -62,7 +62,7 @@ data class PairingUrl(
             "secret=<${secret.size}B>, fingerprint=<${fingerprint.size}B>)"
 
     companion object {
-        const val SCHEME = "spk-remote"
+        const val SCHEME = "spk-editor-remote"
         const val SECRET_LEN = 32
         const val FP_LEN = 32
 

@@ -21,7 +21,7 @@ class PairingUrlTest {
 
     @Test
     fun `parses a valid URL`() {
-        val uri = "spk-remote://192.168.1.10:8443?secret=$secretB64&client=phone&server_fp=$fpB64"
+        val uri = "spk-editor-remote://192.168.1.10:8443?secret=$secretB64&client=phone&server_fp=$fpB64"
         val parsed = PairingUrl.parse(uri).getOrThrow()
         assertEquals("192.168.1.10", parsed.host)
         assertEquals(8443, parsed.port)
@@ -39,7 +39,7 @@ class PairingUrlTest {
         // either flavour so a third-party generator that adds padding still
         // parses.
         val padded = Base64.getUrlEncoder().encodeToString(ByteArray(32) { 0x42.toByte() })
-        val uri = "spk-remote://h:1?secret=$padded&client=c&server_fp=$fpB64"
+        val uri = "spk-editor-remote://h:1?secret=$padded&client=c&server_fp=$fpB64"
         assertNotNull(PairingUrl.parse(uri).getOrThrow())
     }
 
@@ -49,7 +49,7 @@ class PairingUrlTest {
         // fingerprint are real-shape URL-safe base64 (no pad) including the
         // distinctive `_` and `-` characters that ruled out the original
         // standard-base64 decoder.
-        val uri = "spk-remote://37.1.199.69:27772" +
+        val uri = "spk-editor-remote://37.1.199.69:27772" +
             "?secret=w7GiCb0dpOcWmzPtfbUtI2v72SwccpbgRx_1mrStbqo" +
             "&client=my-phone" +
             "&server_fp=f1VXB_EPxPR7Vm6a-IqvLgo8YCD07IdFRoCtt7FFgn8"
@@ -71,7 +71,7 @@ class PairingUrlTest {
 
     @Test
     fun `rejects missing secret`() {
-        val uri = "spk-remote://h:1?client=c&server_fp=$fpB64"
+        val uri = "spk-editor-remote://h:1?client=c&server_fp=$fpB64"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
         assertContains(err.message ?: "", "secret")
@@ -79,7 +79,7 @@ class PairingUrlTest {
 
     @Test
     fun `rejects missing client`() {
-        val uri = "spk-remote://h:1?secret=$secretB64&server_fp=$fpB64"
+        val uri = "spk-editor-remote://h:1?secret=$secretB64&server_fp=$fpB64"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
         assertContains(err.message ?: "", "client")
@@ -87,7 +87,7 @@ class PairingUrlTest {
 
     @Test
     fun `rejects missing server_fp`() {
-        val uri = "spk-remote://h:1?secret=$secretB64&client=c"
+        val uri = "spk-editor-remote://h:1?secret=$secretB64&client=c"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
         assertContains(err.message ?: "", "server_fp")
@@ -99,7 +99,7 @@ class PairingUrlTest {
         // The current decoder rejects them — those characters are reserved
         // inside URL queries and the server NEVER emits them in `secret=`.
         val standardWithPlus = "Pk+/" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-        val uri = "spk-remote://h:1?secret=$standardWithPlus&client=c&server_fp=$fpB64"
+        val uri = "spk-editor-remote://h:1?secret=$standardWithPlus&client=c&server_fp=$fpB64"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
     }
@@ -107,7 +107,7 @@ class PairingUrlTest {
     @Test
     fun `rejects wrong-length secret`() {
         val shortB64 = encodeUrlSafe(ByteArray(16))
-        val uri = "spk-remote://h:1?secret=$shortB64&client=c&server_fp=$fpB64"
+        val uri = "spk-editor-remote://h:1?secret=$shortB64&client=c&server_fp=$fpB64"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
         assertContains(err.message ?: "", "32")
@@ -116,14 +116,14 @@ class PairingUrlTest {
     @Test
     fun `rejects wrong-length fingerprint`() {
         val shortFp = encodeUrlSafe(ByteArray(8))
-        val uri = "spk-remote://h:1?secret=$secretB64&client=c&server_fp=$shortFp"
+        val uri = "spk-editor-remote://h:1?secret=$secretB64&client=c&server_fp=$shortFp"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
     }
 
     @Test
     fun `rejects missing port`() {
-        val uri = "spk-remote://h?secret=$secretB64&client=c&server_fp=$fpB64"
+        val uri = "spk-editor-remote://h?secret=$secretB64&client=c&server_fp=$fpB64"
         val err = PairingUrl.parse(uri).exceptionOrNull()
         assertNotNull(err)
     }

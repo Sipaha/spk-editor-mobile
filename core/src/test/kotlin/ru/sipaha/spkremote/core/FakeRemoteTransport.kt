@@ -101,9 +101,17 @@ internal class FakeRemoteTransport(
     }
 
     private fun expectedHmac(secret: ByteArray, nonce: ByteArray): ByteArray {
+        // Mirror HmacChallengeAuth.respond: prepend the domain-separation
+        // tag before HMAC-ing the nonce. The real server side
+        // (`crates/remote_control/src/auth.rs::HMAC_DOMAIN_TAG`) does the
+        // same; if the fake transport doesn't, every RemoteClientLifecycle
+        // handshake hangs because the simulated verdict doesn't match the
+        // client's response.
         val mac = Mac.getInstance(HmacChallengeAuth.ALGORITHM)
         mac.init(SecretKeySpec(secret, HmacChallengeAuth.ALGORITHM))
-        return mac.doFinal(nonce)
+        mac.update(HmacChallengeAuth.HMAC_DOMAIN_TAG)
+        mac.update(nonce)
+        return mac.doFinal()
     }
 }
 
