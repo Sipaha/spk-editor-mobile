@@ -11,12 +11,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
@@ -206,21 +209,12 @@ fun SessionDetailScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(text = displayTitle, style = MaterialTheme.typography.titleMedium)
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                actions = {
+            SlimTopBar(
+                title = displayTitle,
+                onBack = onBack,
+                trailing = {
                     if (sessionState is UiData.Loaded) {
                         StatePill(state = displayState, raw = rawState)
-                        Spacer(Modifier.padding(end = 8.dp))
                     }
                 },
             )
@@ -426,7 +420,15 @@ private fun ChatBubble(entry: EntrySummary) {
     val role = parseEntryRole(entry.role)
     when (role) {
         EntryRole.User -> UserBubble(entry = entry)
-        EntryRole.Assistant -> AssistantBubble(entry = entry)
+        EntryRole.Assistant -> {
+            // Skip empty assistant turns — when the model only produces
+            // tool calls in a turn, the per-entry markdown is just the
+            // `## Assistant\n\n` banner with no body. After stripRoleHeading
+            // there's nothing to show, but a padded Surface still draws an
+            // empty gray rectangle. Drop the bubble entirely instead.
+            val body = stripRoleHeading(entry.markdown ?: entry.preview)
+            if (body.isNotBlank()) AssistantBubble(entry = entry)
+        }
         EntryRole.ToolCall -> {
             val tc = entry.toolCall
             if (tc != null) {
@@ -468,7 +470,12 @@ private fun ChatBubble(entry: EntrySummary) {
 @Composable
 private fun UserBubble(entry: EntrySummary) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        // start = 48 dp gives the right-aligned user bubble a clear left
+        // gutter so even when it grows to its widthIn max the gradient of
+        // "this is the user side" remains visible at a glance.
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 48.dp),
         horizontalArrangement = Arrangement.End,
     ) {
         Surface(
@@ -829,6 +836,48 @@ private fun CenteredAnnotatedBubble(
 // bubble dedupe in MainViewModel.reconcileOptimistic can share the same
 // normalisation that this file applies to rendering.
 
+/**
+ * 44 dp content-height app bar — replaces M3's stock `TopAppBar`, which
+ * forces a 64 dp container that swallows screen real estate on a phone
+ * chat surface. Layout: back arrow, title, optional trailing slot
+ * (state pill in this screen).
+ */
+@Composable
+private fun SlimTopBar(
+    title: String,
+    onBack: () -> Unit,
+    trailing: @Composable RowScope.() -> Unit = {},
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        tonalElevation = 2.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .height(44.dp)
+                .padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 4.dp),
+            )
+            trailing()
+            Spacer(Modifier.padding(end = 8.dp))
+        }
+    }
+}
+
 @Composable
 private fun StatePill(state: DisplayState, raw: String) {
     val (label, fg, bg) = when (state) {
@@ -945,24 +994,50 @@ private fun ComposeBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.Bottom,
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = { draft = it },
-                    placeholder = { Text("Send a message") },
-                    // `weight(1f)` here is the RowScope extension — it
-                    // grows the text field to fill the remaining width
-                    // alongside the trailing send/cancel icon button.
+                // Custom pill-shaped input — M3 OutlinedTextField has a
+                // hard-coded 56 dp minimum that's too tall for a chat row.
+                // A BasicTextField wrapped in a Surface lets us shrink to
+                // ~40 dp while keeping focus-ring, placeholder, and IME
+                // behaviour. weight(1f) is the RowScope extension that
+                // grows the input to fill width alongside the trailing
+                // send/cancel icon.
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     modifier = Modifier
                         .weight(1f)
                         .padding(end = 8.dp)
-                        .heightIn(max = 200.dp),
-                    enabled = enabled,
-                    maxLines = 6,
-                    colors = TextFieldDefaults.colors(),
-                )
+                        .heightIn(min = 40.dp, max = 160.dp),
+                ) {
+                    Box(
+                        contentAlignment = Alignment.CenterStart,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    ) {
+                        androidx.compose.foundation.text.BasicTextField(
+                            value = draft,
+                            onValueChange = { if (enabled) draft = it },
+                            enabled = enabled,
+                            maxLines = 6,
+                            cursorBrush = androidx.compose.ui.graphics.SolidColor(
+                                MaterialTheme.colorScheme.primary,
+                            ),
+                            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                                color = MaterialTheme.colorScheme.onSurface,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        if (draft.isEmpty()) {
+                            Text(
+                                text = "Send a message",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
                 // Right-hand action — Cancel when running, Send otherwise.
                 if (showCancel) {
                     FilledIconButton(
