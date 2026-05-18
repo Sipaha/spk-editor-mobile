@@ -1,5 +1,6 @@
 package ru.sipaha.spkremote.app.ui.solutions
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -312,6 +313,19 @@ private fun AgentPicker(
  * chevron; tapping opens the DropdownMenu with one item per member,
  * showing the catalog name + a truncated path under it.
  */
+/**
+ * Dropdown for selecting which solution member's local path the new
+ * session should run inside. Only rendered when the solution has 2+
+ * members.
+ *
+ * Implementation note: I tried OutlinedTextField(readOnly=true) with
+ * a .selectable overlay first — but the TextField consumes touch
+ * events internally even when read-only, so the overlay never sees
+ * the tap. Using a clickable Surface styled like a field surface is
+ * the simplest robust approach (and matches what M3
+ * ExposedDropdownMenuBox builds under the hood, without dragging in
+ * its trigger-anchor machinery for a single-screen dialog).
+ */
 @Composable
 private fun CwdPicker(
     members: List<SolutionMember>,
@@ -326,28 +340,47 @@ private fun CwdPicker(
         }
     }
     Box(modifier = Modifier.fillMaxWidth()) {
-        OutlinedTextField(
-            value = selectedMember?.catalogId.orEmpty(),
-            onValueChange = {},
-            readOnly = true,
-            enabled = enabled,
-            singleLine = true,
-            label = { Text("Member") },
-            trailingIcon = {
+        androidx.compose.material3.Surface(
+            shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp),
+            border = androidx.compose.foundation.BorderStroke(
+                width = 1.dp,
+                color = MaterialTheme.colorScheme.outline,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled) { expanded = true },
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Member",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = selectedMember?.catalogId
+                            ?: "(no members)",
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                    val path = selectedMember?.localPath
+                    if (path != null) {
+                        Text(
+                            text = path,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                        )
+                    }
+                }
                 Icon(
                     imageVector = Icons.Filled.KeyboardArrowDown,
                     contentDescription = "Open member picker",
                 )
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .selectable(
-                    selected = true,
-                    enabled = enabled,
-                    role = Role.RadioButton,
-                    onClick = { expanded = true },
-                ),
-        )
+            }
+        }
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
