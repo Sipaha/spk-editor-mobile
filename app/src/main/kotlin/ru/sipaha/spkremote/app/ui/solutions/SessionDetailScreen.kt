@@ -474,17 +474,19 @@ private fun UserBubble(entry: EntrySummary) {
             color = MaterialTheme.colorScheme.primary,
             contentColor = MaterialTheme.colorScheme.onPrimary,
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 4.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
+            modifier = Modifier.widthIn(max = 360.dp),
         ) {
             // Users overwhelmingly send plain text — but accept markdown when
             // the server returns it (e.g. a paste from a markdown source).
             // The pinned light-on-primary palette would clobber inline-code
             // colours, so for user bubbles we never run the markdown
-            // renderer (stays as legible plain Text).
+            // renderer (stays as legible plain Text). Strip the upstream
+            // `## User` header so bubbles don't echo what alignment+color
+            // already encode.
             Text(
-                text = entry.markdown ?: entry.preview,
+                text = stripRoleHeading(entry.markdown ?: entry.preview),
                 style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
             )
         }
     }
@@ -500,18 +502,18 @@ private fun AssistantBubble(entry: EntrySummary) {
             color = MaterialTheme.colorScheme.surfaceVariant,
             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
+            modifier = Modifier.widthIn(max = 360.dp),
         ) {
-            Box(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 val md = entry.markdown
                 if (md != null) {
-                    AssistantMarkdownBody(markdown = md, images = entry.images.orEmpty())
+                    AssistantMarkdownBody(markdown = stripRoleHeading(md), images = entry.images.orEmpty())
                 } else {
                     // No full markdown yet (placeholder during streaming, or
                     // pre-R-5e server). Falls back to preview to keep the
                     // bubble informative until the per-entry RPC settles.
                     Text(
-                        text = entry.preview,
+                        text = stripRoleHeading(entry.preview),
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 }
@@ -542,6 +544,12 @@ private fun AssistantMarkdownBody(markdown: String, images: List<EntryImage>) {
     }
     val transformer = remember(images) { SpkImageTransformer(decoded, images) { fullscreen = it } }
 
+    // Clamp markdown heading sizes. Library defaults map h1..h3 to
+    // M3 `displayLarge` / `displayMedium` / `displaySmall` (≥36 sp), which
+    // looks absurd inside a 360 dp chat bubble — and absolutely catastrophic
+    // when the server-side `acp_thread` emits a `## Assistant` heading at the
+    // top of every entry. Pin headings to the title/label scale so even
+    // model-generated headings stay readable in the bubble.
     Markdown(
         content = markdown,
         colors = markdownColor(
@@ -554,6 +562,12 @@ private fun AssistantMarkdownBody(markdown: String, images: List<EntryImage>) {
             paragraph = MaterialTheme.typography.bodyMedium,
             code = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
             inlineCode = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            h1 = MaterialTheme.typography.titleLarge,
+            h2 = MaterialTheme.typography.titleMedium,
+            h3 = MaterialTheme.typography.titleSmall,
+            h4 = MaterialTheme.typography.labelLarge,
+            h5 = MaterialTheme.typography.labelMedium,
+            h6 = MaterialTheme.typography.labelSmall,
         ),
         imageTransformer = transformer,
     )
@@ -783,7 +797,7 @@ private fun CenteredAnnotatedBubble(
             color = bg,
             contentColor = fg,
             shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
+            modifier = Modifier.widthIn(max = 360.dp),
         ) {
             Row(
                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -801,7 +815,7 @@ private fun CenteredAnnotatedBubble(
                         style = MaterialTheme.typography.labelSmall,
                     )
                     Text(
-                        text = text,
+                        text = stripRoleHeading(text),
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -809,6 +823,28 @@ private fun CenteredAnnotatedBubble(
         }
     }
 }
+
+/**
+ * Drop the upstream `acp_thread` role banner that gets prepended to every
+ * entry's markdown (`## User`, `## User (checkpoint)`, `## Assistant`,
+ * `## Plan`, `## Tool`, `## System`). The role is already encoded in the
+ * bubble's alignment and color — repeating it in the body is noise; rendering
+ * it through a markdown widget turns it into a screen-wide `displayLarge`
+ * banner which is what triggered this redesign.
+ *
+ * Conservative on purpose: only strips when the heading is the very first
+ * non-empty line, and only when it matches the upstream-emitted set of
+ * role labels. Anything else (a `## Step 1` the model actually wrote) is
+ * preserved.
+ */
+internal fun stripRoleHeading(md: String): String {
+    return ROLE_HEADING.replaceFirst(md, "").trimStart()
+}
+
+private val ROLE_HEADING = Regex(
+    pattern = """^\s*##\s+(?:User(?:\s+\(checkpoint\))?|Assistant|Plan|Tool|System)\s*\n+""",
+    options = setOf(RegexOption.IGNORE_CASE),
+)
 
 @Composable
 private fun StatePill(state: DisplayState, raw: String) {
