@@ -15,6 +15,7 @@ import kotlinx.serialization.json.put
 import ru.sipaha.spkremote.app.data.DraftRepository
 import ru.sipaha.spkremote.app.data.EncryptedQueueStore
 import ru.sipaha.spkremote.app.data.LastSeenRepository
+import ru.sipaha.spkremote.app.data.ListCacheRepository
 import ru.sipaha.spkremote.app.data.NavStateRepository
 import ru.sipaha.spkremote.app.data.PairedServer
 import ru.sipaha.spkremote.app.data.PairingRepository
@@ -142,6 +143,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     val navStateRepository: NavStateRepository =
         NavStateRepository.get(application) { _activeServerId.value }
+
+    /**
+     * Disk cache for the solutions + sessions lists, scoped per-server.
+     * Hydrated on every [switchToServer] so the navigation surface stays
+     * interactable when the live `solutions.list` / `list_sessions` calls
+     * can't reach the desktop (e.g. metro / weak Wi-Fi / desktop asleep).
+     * A successful refresh overwrites the cached blob; a failed refresh
+     * leaves it in place and surfaces a transient banner via [sendError]
+     * so the user knows what they're looking at is the last-known list.
+     */
+    private val listCacheRepository: ListCacheRepository =
+        ListCacheRepository.get(application) { _activeServerId.value }
 
     private val _state = MutableStateFlow<UiState>(UiState.Disconnected())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -398,6 +411,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _pairedServers.value = pairingRepository.loadAll()
         _pairing.value = parsed
         _state.value = UiState.Connecting
+        // Hydrate the solutions list from cache so the user can navigate
+        // immediately even if the WS handshake never lands. A successful
+        // refresh below will overwrite this; a failed refresh leaves the
+        // cached entries on screen.
+        val cached = listCacheRepository.loadSolutions()
+        if (cached != null) {
+            _solutions.value = UiData.Loaded(cached)
+        }
         viewModelScope.launch {
             drainExpiredQueueEntries()
             val newClient = RemoteClient(
@@ -444,6 +465,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             draftRepository.clearAll()
             lastSeenRepository.clearAll()
             navStateRepository.clear()
+            listCacheRepository.clearAll()
         } else {
             // Briefly point repositories at [serverId] so we wipe the
             // *right* server's keys, then restore.
@@ -453,6 +475,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             draftRepository.clearAll()
             lastSeenRepository.clearAll()
             navStateRepository.clear()
+            listCacheRepository.clearAll()
             _activeServerId.value = previous
         }
         pairingRepository.remove(serverId)
@@ -489,6 +512,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         draftRepository.clearAll()
         lastSeenRepository.clearAll()
         navStateRepository.clear()
+        listCacheRepository.clearAllServers()
         _state.value = UiState.Disconnected()
     }
 
@@ -696,10 +720,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshSolutions() {
         val active = client
         if (active == null) {
-            _solutions.value = UiData.Error(notConnectedMessage())
+            // No client to call. Prefer the cached list — that's the whole
+            // point of the cache — and only show "not connected" when
+            // nothing has ever been cached for this server.
+            val cached = listCacheRepository.loadSolutions()
+            if (cached != null) {
+                _solutions.value = UiData.Loaded(cached)
+                _sendError.tryEmit(notConnectedMessage())
+            } else {
+                _solutions.value = UiData.Error(notConnectedMessage())
+            }
             return
         }
-        _solutions.value = UiData.Loading
+        // Don't clobber a Loaded list with Loading — the user can keep
+        // tapping through cached entries while we re-fetch. Only show
+        // Loading when there's nothing on screen yet.
+        if (_solutions.value !is UiData.Loaded) {
+            _solutions.value = UiData.Loading
+        }
         refreshSolutionsJob?.cancel()
         refreshSolutionsJob = viewModelScope.launch {
             runCatching { active.call("remote.solutions.list") }
@@ -713,12 +751,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         .decodeFromJsonElement(ListSolutionsResult.serializer(), result)
                         .solutions
                 }
-                .onSuccess { _solutions.value = UiData.Loaded(it) }
+                .onSuccess {
+                    _solutions.value = UiData.Loaded(it)
+                    listCacheRepository.saveSolutions(it)
+                }
                 .onFailure { err ->
-                    // A CancellationException means a fresher refresh
-                    // superseded us — don't overwrite the newer state.
                     if (err is kotlinx.coroutines.CancellationException) throw err
-                    _solutions.value = UiData.Error(err.message ?: "unknown error")
+                    // Refresh failed. If a cached / previously-loaded list
+                    // is on screen, KEEP it visible so the user can keep
+                    // working; otherwise surface the error full-screen.
+                    val message = err.message ?: "unknown error"
+                    if (_solutions.value is UiData.Loaded) {
+                        _sendError.tryEmit("Couldn't refresh solutions: $message")
+                    } else {
+                        _solutions.value = UiData.Error(message)
+                    }
                 }
         }
     }
@@ -726,14 +773,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshSessions(solutionId: String) {
         val active = client
         if (active == null) {
-            _sessions.value = UiData.Error(notConnectedMessage())
+            // Same offline-cache treatment as refreshSolutions: keep the
+            // last-known list visible so the user can tap into a session
+            // and queue a message (`queueCall` has 24 h TTL) even when
+            // the desktop is unreachable.
+            val cached = listCacheRepository.loadSessions(solutionId)
+            if (cached != null) {
+                _sessions.value = UiData.Loaded(cached)
+                _sendError.tryEmit(notConnectedMessage())
+            } else {
+                _sessions.value = UiData.Error(notConnectedMessage())
+            }
             return
         }
-        // Don't clobber the existing list with Loading on refetch — the UI
-        // would flash empty during the live-subscribe-driven re-poll. Only
-        // show Loading if we have nothing to display yet.
+        // Cache-first hydrate when nothing is on screen yet. The live
+        // refresh below will overwrite; until then the user sees whatever
+        // we saw last time. Existing Loaded state is preserved.
         if (_sessions.value !is UiData.Loaded) {
-            _sessions.value = UiData.Loading
+            val cached = listCacheRepository.loadSessions(solutionId)
+            if (cached != null) {
+                _sessions.value = UiData.Loaded(cached)
+            } else {
+                _sessions.value = UiData.Loading
+            }
         }
         val params = buildJsonObject { put("solution_id", solutionId) }
         refreshSessionsJob?.cancel()
@@ -749,10 +811,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         .decodeFromJsonElement(ListSessionsResult.serializer(), result)
                         .sessions
                 }
-                .onSuccess { _sessions.value = UiData.Loaded(it) }
+                .onSuccess {
+                    _sessions.value = UiData.Loaded(it)
+                    listCacheRepository.saveSessions(solutionId, it)
+                }
                 .onFailure { err ->
                     if (err is kotlinx.coroutines.CancellationException) throw err
-                    _sessions.value = UiData.Error(err.message ?: "unknown error")
+                    val message = err.message ?: "unknown error"
+                    if (_sessions.value is UiData.Loaded) {
+                        _sendError.tryEmit("Couldn't refresh sessions: $message")
+                    } else {
+                        _sessions.value = UiData.Error(message)
+                    }
                 }
         }
     }
