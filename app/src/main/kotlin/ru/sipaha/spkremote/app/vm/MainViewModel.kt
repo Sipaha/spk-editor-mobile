@@ -861,8 +861,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (!sessionStateSubscribed) {
                 // Routed through RemoteClient.subscribe so the active
                 // subscription set is tracked and replayed on every
-                // successful reconnect handshake (R-6a).
-                runCatching { active.subscribe(listOf("agent_session_state_changed")) }
+                // successful reconnect handshake (R-6a). The four event
+                // kinds together cover every way the desktop can mutate
+                // the sessions list shape:
+                //  - state_changed: Idle ↔ Running ↔ Errored
+                //  - created: new session appears on the desktop
+                //  - closed: tab closed on the desktop → vanishes here
+                //  - title_changed: rename propagates immediately
+                runCatching {
+                    active.subscribe(
+                        listOf(
+                            "agent_session_state_changed",
+                            "agent_session_created",
+                            "agent_session_closed",
+                            "agent_session_title_changed",
+                        ),
+                    )
+                }
                     .onSuccess { sessionStateSubscribed = true }
                 // failure is non-fatal — we still display the list, just no
                 // live updates. The screen surfaces a one-shot Refresh button.
@@ -870,11 +885,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             active.notifications.collect { frame ->
                 val params = (frame as? JsonObject)?.get("params") as? JsonObject ?: return@collect
                 val kind = params["kind"]?.jsonPrimitive?.content ?: return@collect
-                if (kind != "agent_session_state_changed") return@collect
-                // We could narrow further by inspecting data.session_id /
-                // data.solution_id, but list_sessions is a single round-trip
-                // and the event carries no other useful info — keep it simple.
-                refreshSessions(solutionId)
+                when (kind) {
+                    "agent_session_state_changed",
+                    "agent_session_created",
+                    "agent_session_closed",
+                    "agent_session_title_changed" -> {
+                        // We could narrow further by inspecting
+                        // data.session_id / data.solution_id, but
+                        // list_sessions is a single round-trip and the
+                        // event carries no other useful info — keep it
+                        // simple.
+                        refreshSessions(solutionId)
+                    }
+                    else -> return@collect
+                }
             }
         }
     }
