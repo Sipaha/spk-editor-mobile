@@ -35,6 +35,7 @@ import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.SessionCreatedPayload
 import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.SolutionSummary
+import ru.sipaha.spkremote.core.stripRoleHeading
 import java.util.UUID
 
 sealed interface UiState {
@@ -1370,19 +1371,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Drop optimistic entries that the server has now echoed back.
      *
-     * Match is best-effort: same `role == "user"` plus exact `preview`
-     * equality. The server preview is ≤200 chars truncated, so for short
-     * messages (the common case) match is exact; for long messages the
-     * optimistic bubble survives until the user navigates away. Acceptable
-     * — duplicates resolve on the next poll once the assistant adds turns
-     * beyond the truncation horizon, and the only cost is a brief stutter.
+     * Match is best-effort: same `role == "user"` plus `preview` equality
+     * after stripping the upstream `## User` banner that `acp_thread`'s
+     * `to_markdown` always prepends. Without the strip, the server's
+     * `"## User\n\nhello"` never matches the optimistic bubble's `"hello"`
+     * and the user sees their message twice. The server preview is
+     * ≤200 chars truncated, so for short messages (the common case) match
+     * is exact; for long messages the optimistic bubble survives until
+     * the user navigates away.
      */
     private fun reconcileOptimistic(serverEntries: List<EntrySummary>) {
         if (_optimisticEntries.value.isEmpty()) return
-        val serverUsers = serverEntries.filter { it.role == "user" }.map { it.preview }.toMutableList()
+        val serverUsers = serverEntries
+            .filter { it.role == "user" }
+            .map { stripRoleHeading(it.preview) }
+            .toMutableList()
         val remaining = mutableListOf<EntrySummary>()
         for (optimistic in _optimisticEntries.value) {
-            val idx = serverUsers.indexOf(optimistic.preview)
+            val key = stripRoleHeading(optimistic.preview)
+            val idx = serverUsers.indexOf(key)
             if (idx >= 0) {
                 serverUsers.removeAt(idx)
             } else {

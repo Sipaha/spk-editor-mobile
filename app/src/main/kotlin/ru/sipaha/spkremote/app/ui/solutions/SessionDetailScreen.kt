@@ -98,6 +98,7 @@ import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.ToolCallSummary
 import ru.sipaha.spkremote.core.parseDisplayState
 import ru.sipaha.spkremote.core.parseEntryRole
+import ru.sipaha.spkremote.core.stripRoleHeading
 
 /**
  * Chat surface for one solution-agent session (R-5d).
@@ -824,27 +825,9 @@ private fun CenteredAnnotatedBubble(
     }
 }
 
-/**
- * Drop the upstream `acp_thread` role banner that gets prepended to every
- * entry's markdown (`## User`, `## User (checkpoint)`, `## Assistant`,
- * `## Plan`, `## Tool`, `## System`). The role is already encoded in the
- * bubble's alignment and color — repeating it in the body is noise; rendering
- * it through a markdown widget turns it into a screen-wide `displayLarge`
- * banner which is what triggered this redesign.
- *
- * Conservative on purpose: only strips when the heading is the very first
- * non-empty line, and only when it matches the upstream-emitted set of
- * role labels. Anything else (a `## Step 1` the model actually wrote) is
- * preserved.
- */
-internal fun stripRoleHeading(md: String): String {
-    return ROLE_HEADING.replaceFirst(md, "").trimStart()
-}
-
-private val ROLE_HEADING = Regex(
-    pattern = """^\s*##\s+(?:User(?:\s+\(checkpoint\))?|Assistant|Plan|Tool|System)\s*\n+""",
-    options = setOf(RegexOption.IGNORE_CASE),
-)
+// stripRoleHeading is defined in :core (RemoteDtos.kt) so the optimistic-
+// bubble dedupe in MainViewModel.reconcileOptimistic can share the same
+// normalisation that this file applies to rendering.
 
 @Composable
 private fun StatePill(state: DisplayState, raw: String) {

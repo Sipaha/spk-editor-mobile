@@ -320,3 +320,33 @@ fun parseDisplayState(raw: String): DisplayState = when {
     raw.startsWith("Errored") -> DisplayState.Errored
     else -> DisplayState.Unknown
 }
+
+/**
+ * Drop the upstream `acp_thread` role banner — `## User`, `## User
+ * (checkpoint)`, `## Assistant`, `## Plan`, `## Tool`, `## System` —
+ * from the start of a markdown/preview string.
+ *
+ * The Zed core's `AgentThreadEntry::to_markdown` prepends one of these
+ * headers to every entry. The Android client needs to strip them for
+ * two reasons:
+ *
+ *  1. **Rendering**: the role is already encoded in bubble alignment +
+ *     color, so the heading is visual noise; worse, the markdown
+ *     renderer maps H2 to M3 `displayMedium` (~45 sp), turning a one-
+ *     word "Assistant" banner into a screen-wide title.
+ *  2. **Optimistic-bubble dedupe**: the server-echoed user `preview`
+ *     contains `"## User\n\n…"` while the locally-appended optimistic
+ *     bubble has just the raw user text. Without normalisation here,
+ *     the dedupe by-string-equality never fires and the sent message
+ *     appears twice in the chat.
+ *
+ * Conservative: only the prefix-line is stripped, and only when it
+ * matches the upstream-emitted set. Anything else (a model-written
+ * `## Step 1`) is preserved verbatim.
+ */
+fun stripRoleHeading(md: String): String = ROLE_HEADING_REGEX.replaceFirst(md, "").trimStart()
+
+private val ROLE_HEADING_REGEX = Regex(
+    pattern = """^\s*##\s+(?:User(?:\s+\(checkpoint\))?|Assistant|Plan|Tool|System)\s*\n+""",
+    options = setOf(RegexOption.IGNORE_CASE),
+)
