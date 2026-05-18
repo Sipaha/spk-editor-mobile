@@ -191,3 +191,21 @@ sealed interface ConnectFailure {
  */
 class ConnectException(val failure: ConnectFailure) :
     RuntimeException(failure.userMessage, failure.cause)
+
+/**
+ * Thrown when [RemoteClient.call] is invoked while the transport isn't
+ * live — either pre-first-connect, mid-reconnect, or after a terminal
+ * failure. [lastFailure] carries the most recent [ConnectFailure] the
+ * lifecycle saw, so the UI can render a specific reason ("Connection
+ * refused…") instead of just "not connected".
+ *
+ * [lastFailure] is null only when no attempt has actually failed yet
+ * (e.g. the very first call() arrives before the initial handshake
+ * completes); in that case the message says we're still connecting.
+ */
+class NotConnectedException(val lastFailure: ConnectFailure? = null) :
+    RuntimeException(
+        lastFailure?.userMessage
+            ?: "Not connected to the server (initial handshake still in progress).",
+        lastFailure?.cause,
+    )

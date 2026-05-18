@@ -423,7 +423,7 @@ class RemoteClientLifecycleTest {
     @Test
     fun `call without connect fails`() = runTest(StandardTestDispatcher()) {
         val (client, _) = newClient()
-        assertFailsWith<IllegalStateException> {
+        assertFailsWith<NotConnectedException> {
             withTimeout(1_000L) { client.call("remote.editor.capabilities") }
         }
     }

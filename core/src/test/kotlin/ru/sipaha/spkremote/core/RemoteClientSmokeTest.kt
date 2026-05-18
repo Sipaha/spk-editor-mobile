@@ -38,7 +38,7 @@ class RemoteClientSmokeTest {
             fingerprint = ByteArray(32) { 0x33 },
         )
         val client = RemoteClient(url)
-        assertFailsWith<IllegalStateException> {
+        assertFailsWith<NotConnectedException> {
             client.call("remote.editor.capabilities")
         }
         client.close()

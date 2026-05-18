@@ -556,6 +556,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val rawConnectionState: StateFlow<ConnectionState> = _rawConnectionState.asStateFlow()
 
     /**
+     * Human-readable reason why a load-from-server attempt can't be made
+     * right now. Used to populate `UiData.Error` messages on the
+     * solutions/sessions/session/agents screens when [client] is null
+     * (pre-first-connect) or its underlying transport is between
+     * lifecycle states. Surfaces the SAME classified text the
+     * [ConnectionStateBanner] uses, so the user doesn't see one screen
+     * saying "not connected" while the banner says "Server unreachable
+     * — Reconnecting in 4s".
+     */
+    private fun notConnectedMessage(): String = when (val s = _rawConnectionState.value) {
+        is ConnectionState.FailedTerminal -> s.failure.userMessage
+        is ConnectionState.Reconnecting ->
+            s.lastFailure?.userMessage ?: "Reconnecting to the server…"
+        ConnectionState.Connecting ->
+            "Still connecting to the server — try again in a moment."
+        ConnectionState.Connected ->
+            "Connection just dropped. Retrying in the background."
+        ConnectionState.Disconnected ->
+            "No active server connection. Pick or pair a server first."
+    }
+
+    /**
      * Translate [RemoteClient.connectionState] into the UI banner and
      * trigger a session re-fetch whenever we transition into Connected
      * from a non-Connected state — that's the "I just came back, my
@@ -608,7 +630,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshSolutions() {
         val active = client
         if (active == null) {
-            _solutions.value = UiData.Error("not connected")
+            _solutions.value = UiData.Error(notConnectedMessage())
             return
         }
         _solutions.value = UiData.Loading
@@ -630,7 +652,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshSessions(solutionId: String) {
         val active = client
         if (active == null) {
-            _sessions.value = UiData.Error("not connected")
+            _sessions.value = UiData.Error(notConnectedMessage())
             return
         }
         // Don't clobber the existing list with Loading on refetch — the UI
@@ -731,7 +753,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun openSession(sessionId: String) {
         val active = client
         if (active == null) {
-            _session.value = UiData.Error("not connected")
+            _session.value = UiData.Error(notConnectedMessage())
             return
         }
         openSessionId = sessionId
@@ -1351,7 +1373,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val active = client
         _lastCreateAutoOpened.value = false
         if (active == null) {
-            _agents.value = UiData.Error("not connected")
+            _agents.value = UiData.Error(notConnectedMessage())
             return
         }
         _agents.value = UiData.Loading
@@ -1400,7 +1422,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         val active = client
         if (active == null) {
-            _sendError.tryEmit("not connected")
+            _sendError.tryEmit(notConnectedMessage())
             return
         }
         if (_createSessionInFlight.value) return

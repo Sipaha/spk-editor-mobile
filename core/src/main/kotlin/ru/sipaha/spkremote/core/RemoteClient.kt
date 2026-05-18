@@ -142,6 +142,14 @@ class RemoteClient internal constructor(
     @Volatile private var scope: CoroutineScope? = null
     @Volatile private var lifecycleJob: Job? = null
     @Volatile private var firstConnect: CompletableDeferred<Unit>? = null
+    /**
+     * The most recent [ConnectFailure] observed by the lifecycle loop.
+     * Read by [call] when [transport] is null so the resulting
+     * [NotConnectedException] carries a specific reason instead of just
+     * "not connected". Cleared back to null on every successful Connected
+     * transition.
+     */
+    @Volatile private var lastConnectFailure: ConnectFailure? = null
 
     /** Current transport (or null while reconnecting). Mutated only from the lifecycle coroutine. */
     private var transport: RemoteTransport? = null
@@ -236,7 +244,7 @@ class RemoteClient internal constructor(
      * [IllegalStateException]. Most call sites should prefer [queueCall].
      */
     suspend fun call(method: String, params: JsonElement? = null): JsonRpcResponse {
-        val active = transport ?: throw IllegalStateException("not connected")
+        val active = transport ?: throw NotConnectedException(lastConnectFailure)
         val id = nextId.getAndIncrement()
         val deferred = CompletableDeferred<JsonRpcResponse>()
         pending[id] = deferred
@@ -387,13 +395,13 @@ class RemoteClient internal constructor(
 
     private suspend fun lifecycleLoop() {
         var attempt = 0
-        var lastFailure: ConnectFailure? = null
         while (!closing && (scope?.isActive == true)) {
             if (attempt == 0) {
                 _connectionState.value = ConnectionState.Connecting
             } else {
                 val delayMs = backoff.nextDelayMs(attempt)
-                _connectionState.value = ConnectionState.Reconnecting(attempt, delayMs, lastFailure)
+                _connectionState.value =
+                    ConnectionState.Reconnecting(attempt, delayMs, lastConnectFailure)
                 delay(delayMs)
                 if (closing) break
                 _connectionState.value = ConnectionState.Connecting
@@ -402,28 +410,30 @@ class RemoteClient internal constructor(
             when (outcome) {
                 AttemptOutcome.Connected -> {
                     attempt = 0
-                    lastFailure = null
+                    lastConnectFailure = null
                     // Wait for a close/failure event before looping.
                     val end = awaitDisconnect()
                     if (closing || end is DisconnectReason.UserClose) break
                     if (end is DisconnectReason.Terminal) {
+                        lastConnectFailure = end.failure
                         _connectionState.value = ConnectionState.FailedTerminal(end.failure)
                         firstConnect?.takeIf { !it.isCompleted }
                             ?.completeExceptionally(ConnectException(end.failure))
                         return
                     }
                     // Transient — loop with attempt=1 carrying the cause.
-                    lastFailure = (end as DisconnectReason.Transient).failure
+                    lastConnectFailure = (end as DisconnectReason.Transient).failure
                     attempt = 1
                 }
                 is AttemptOutcome.TerminalFailure -> {
+                    lastConnectFailure = outcome.failure
                     _connectionState.value = ConnectionState.FailedTerminal(outcome.failure)
                     firstConnect?.takeIf { !it.isCompleted }
                         ?.completeExceptionally(ConnectException(outcome.failure))
                     return
                 }
                 is AttemptOutcome.TransientFailure -> {
-                    lastFailure = outcome.failure
+                    lastConnectFailure = outcome.failure
                     // First-attempt failure: surface to the caller of
                     // connect() so the UI doesn't pin "Connecting…" while
                     // we churn through reconnect attempts in the
