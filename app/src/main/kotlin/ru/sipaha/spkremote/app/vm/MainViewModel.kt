@@ -53,7 +53,20 @@ sealed interface UiState {
  */
 sealed interface ConnectionBanner {
     data object Hidden : ConnectionBanner
-    data class Reconnecting(val attempt: Int, val nextRetryMs: Long) : ConnectionBanner
+
+    /**
+     * @param reason short user-facing summary of the failure that triggered
+     *   the current Reconnecting cycle. Null only on the very first
+     *   transition before any attempt has failed. Drives the banner's
+     *   contextual text ("Reconnecting (host unreachable, attempt 3, next
+     *   try in 4s)…") instead of a generic "Reconnecting…".
+     */
+    data class Reconnecting(
+        val attempt: Int,
+        val nextRetryMs: Long,
+        val reason: String? = null,
+    ) : ConnectionBanner
+
     data class FailedTerminal(val reason: String) : ConnectionBanner
 }
 
@@ -559,8 +572,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     is ConnectionState.Reconnecting -> ConnectionBanner.Reconnecting(
                         attempt = state.attempt,
                         nextRetryMs = state.nextRetryMs,
+                        reason = state.lastFailure?.userMessage,
                     )
-                    is ConnectionState.FailedTerminal -> ConnectionBanner.FailedTerminal(state.reason)
+                    is ConnectionState.FailedTerminal ->
+                        ConnectionBanner.FailedTerminal(state.failure.userMessage)
                     ConnectionState.Connected,
                     ConnectionState.Connecting,
                     ConnectionState.Disconnected -> ConnectionBanner.Hidden

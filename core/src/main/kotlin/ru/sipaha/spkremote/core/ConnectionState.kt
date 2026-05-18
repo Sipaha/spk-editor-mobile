@@ -41,12 +41,24 @@ sealed interface ConnectionState {
      *
      * @param attempt 1-indexed; resets to 1 on every successful reconnect.
      * @param nextRetryMs delay until the next [Connecting] transition.
+     * @param lastFailure the [ConnectFailure] that triggered this retry,
+     *   surfaced to the UI banner so the user sees WHY we're retrying.
+     *   Null only on the very first transition (e.g. initial connect not
+     *   yet attempted).
      */
-    data class Reconnecting(val attempt: Int, val nextRetryMs: Long) : ConnectionState
+    data class Reconnecting(
+        val attempt: Int,
+        val nextRetryMs: Long,
+        val lastFailure: ConnectFailure? = null,
+    ) : ConnectionState
 
     /**
      * Non-retryable failure. The caller must re-pair (fresh QR scan) to
-     * recover. [reason] is shown in the UI banner.
+     * recover. [failure] carries a classified reason; the UI banner reads
+     * [ConnectFailure.userMessage].
      */
-    data class FailedTerminal(val reason: String) : ConnectionState
+    data class FailedTerminal(val failure: ConnectFailure) : ConnectionState {
+        /** Legacy convenience for code that just wants the human-readable string. */
+        val reason: String get() = failure.userMessage
+    }
 }

@@ -292,12 +292,17 @@ private fun ConnectionStateBanner(banner: ConnectionBanner) {
         ConnectionBanner.Hidden -> return
         is ConnectionBanner.Reconnecting -> {
             val seconds = (banner.nextRetryMs / 1000).coerceAtLeast(1)
-            MaterialTheme.colorScheme.tertiaryContainer to
+            val reason = banner.reason
+            val text = if (reason != null) {
+                "$reason · Reconnecting (attempt ${banner.attempt}, next try in ${seconds}s)…"
+            } else {
                 "Reconnecting (attempt ${banner.attempt}, next try in ${seconds}s)…"
+            }
+            MaterialTheme.colorScheme.tertiaryContainer to text
         }
         is ConnectionBanner.FailedTerminal -> {
             MaterialTheme.colorScheme.errorContainer to
-                "Connection failed (${banner.reason}). Re-pair required."
+                "${banner.reason} · Re-pair required."
         }
     }
     Surface(

@@ -23,6 +23,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
@@ -386,12 +387,13 @@ class RemoteClient internal constructor(
 
     private suspend fun lifecycleLoop() {
         var attempt = 0
+        var lastFailure: ConnectFailure? = null
         while (!closing && (scope?.isActive == true)) {
             if (attempt == 0) {
                 _connectionState.value = ConnectionState.Connecting
             } else {
                 val delayMs = backoff.nextDelayMs(attempt)
-                _connectionState.value = ConnectionState.Reconnecting(attempt, delayMs)
+                _connectionState.value = ConnectionState.Reconnecting(attempt, delayMs, lastFailure)
                 delay(delayMs)
                 if (closing) break
                 _connectionState.value = ConnectionState.Connecting
@@ -400,25 +402,36 @@ class RemoteClient internal constructor(
             when (outcome) {
                 AttemptOutcome.Connected -> {
                     attempt = 0
+                    lastFailure = null
                     // Wait for a close/failure event before looping.
                     val end = awaitDisconnect()
                     if (closing || end is DisconnectReason.UserClose) break
                     if (end is DisconnectReason.Terminal) {
-                        _connectionState.value = ConnectionState.FailedTerminal(end.reason)
+                        _connectionState.value = ConnectionState.FailedTerminal(end.failure)
                         firstConnect?.takeIf { !it.isCompleted }
-                            ?.completeExceptionally(IllegalStateException(end.reason))
+                            ?.completeExceptionally(ConnectException(end.failure))
                         return
                     }
-                    // Transient — loop with attempt=1.
+                    // Transient — loop with attempt=1 carrying the cause.
+                    lastFailure = (end as DisconnectReason.Transient).failure
                     attempt = 1
                 }
                 is AttemptOutcome.TerminalFailure -> {
-                    _connectionState.value = ConnectionState.FailedTerminal(outcome.reason)
+                    _connectionState.value = ConnectionState.FailedTerminal(outcome.failure)
                     firstConnect?.takeIf { !it.isCompleted }
-                        ?.completeExceptionally(IllegalStateException(outcome.reason))
+                        ?.completeExceptionally(ConnectException(outcome.failure))
                     return
                 }
                 is AttemptOutcome.TransientFailure -> {
+                    lastFailure = outcome.failure
+                    // First-attempt failure: surface to the caller of
+                    // connect() so the UI doesn't pin "Connecting…" while
+                    // we churn through reconnect attempts in the
+                    // background. The lifecycle loop keeps running; the
+                    // banner (driven by [connectionState] observers) shows
+                    // ongoing Reconnecting progress.
+                    firstConnect?.takeIf { !it.isCompleted }
+                        ?.completeExceptionally(ConnectException(outcome.failure))
                     attempt = if (attempt == 0) 1 else attempt + 1
                 }
             }
@@ -438,20 +451,29 @@ class RemoteClient internal constructor(
         val tx = transportFactory.connect(url, listener)
         transport = tx
         return try {
-            handshake.await().also { outcome ->
-                if (outcome is AttemptOutcome.Connected) {
-                    _connectionState.value = ConnectionState.Connected
-                    onConnected()
-                    firstConnect?.takeIf { !it.isCompleted }?.complete(Unit)
-                } else {
-                    tx.close()
-                    transport = null
-                }
+            // Bound the full attempt by the handshake timeout — if the
+            // server never sends a nonce (peer isn't spk-editor, half-open
+            // connection survived TLS, etc.) the WS would otherwise hang
+            // forever. Once HandshakeStage.Established we're done with
+            // this timeout — the steady-state has its own pingInterval.
+            val outcome = withTimeoutOrNull(ConnectFailure.HANDSHAKE_TIMEOUT_MS) {
+                handshake.await()
+            } ?: AttemptOutcome.TransientFailure(
+                ConnectFailure.HandshakeTimeout(ConnectFailure.HANDSHAKE_TIMEOUT_MS)
+            )
+            if (outcome is AttemptOutcome.Connected) {
+                _connectionState.value = ConnectionState.Connected
+                onConnected()
+                firstConnect?.takeIf { !it.isCompleted }?.complete(Unit)
+            } else {
+                tx.close()
+                transport = null
             }
+            outcome
         } catch (t: Throwable) {
             tx.close()
             transport = null
-            AttemptOutcome.TransientFailure(t.message ?: "handshake error")
+            AttemptOutcome.TransientFailure(ConnectFailure.classify(t))
         }
     }
 
@@ -462,16 +484,16 @@ class RemoteClient internal constructor(
                 LifecycleEvent.UserClose -> return DisconnectReason.UserClose
                 is LifecycleEvent.TransportClosed -> {
                     transport = null
-                    failPendingOnDisconnect(event.reason)
-                    return DisconnectReason.Transient(event.reason)
+                    failPendingOnDisconnect(event.failure.userMessage)
+                    return DisconnectReason.Transient(event.failure)
                 }
                 is LifecycleEvent.TransportFailure -> {
                     transport = null
-                    failPendingOnDisconnect(event.reason)
+                    failPendingOnDisconnect(event.failure.userMessage)
                     return if (event.terminal) {
-                        DisconnectReason.Terminal(event.reason)
+                        DisconnectReason.Terminal(event.failure)
                     } else {
-                        DisconnectReason.Transient(event.reason)
+                        DisconnectReason.Transient(event.failure)
                     }
                 }
                 LifecycleEvent.QueueChanged -> {
@@ -639,7 +661,12 @@ class RemoteClient internal constructor(
             when (ref.stage) {
                 HandshakeStage.AwaitingNonce -> {
                     if (bytes.size != HmacChallengeAuth.NONCE_LEN) {
-                        completeTerminal("expected ${HmacChallengeAuth.NONCE_LEN}B nonce, got ${bytes.size}B")
+                        completeTerminal(
+                            ConnectFailure.ProtocolError(
+                                "expected ${HmacChallengeAuth.NONCE_LEN}-byte nonce, got ${bytes.size}B " +
+                                    "— peer isn't spk-editor"
+                            )
+                        )
                         return
                     }
                     val response = auth.respond(bytes)
@@ -651,7 +678,7 @@ class RemoteClient internal constructor(
                         ref.stage = HandshakeStage.Established
                         handshake.complete(AttemptOutcome.Connected)
                     } else {
-                        completeTerminal("server rejected HMAC")
+                        completeTerminal(ConnectFailure.AuthRejected())
                     }
                 }
                 HandshakeStage.Established -> {
@@ -667,61 +694,55 @@ class RemoteClient internal constructor(
                         ref.stage = HandshakeStage.Established
                         handshake.complete(AttemptOutcome.Connected)
                     } else {
-                        completeTerminal("server verdict: $text")
+                        completeTerminal(
+                            ConnectFailure.AuthRejected("Server verdict: $text")
+                        )
                     }
                 }
                 HandshakeStage.Established -> dispatchJsonRpc(text)
                 HandshakeStage.AwaitingNonce ->
-                    completeTransient("unexpected text frame before nonce")
+                    completeTransient(
+                        ConnectFailure.ProtocolError(
+                            "got text frame before the nonce — peer isn't spk-editor"
+                        )
+                    )
             }
         }
 
         override fun onFailure(t: Throwable) {
-            val msg = t.message ?: t.toString()
-            if (isTerminal(t, msg)) {
-                if (ref.stage == HandshakeStage.Established) {
-                    events.trySend(LifecycleEvent.TransportFailure(msg, terminal = true))
-                } else if (!handshake.isCompleted) {
-                    handshake.complete(AttemptOutcome.TerminalFailure(msg))
-                }
-            } else {
-                if (ref.stage == HandshakeStage.Established) {
-                    events.trySend(LifecycleEvent.TransportFailure(msg, terminal = false))
-                } else if (!handshake.isCompleted) {
-                    handshake.complete(AttemptOutcome.TransientFailure(msg))
-                }
+            val failure = ConnectFailure.classify(t)
+            // Pin = terminal even on Established (re-pair required).
+            val isTerminal = failure is ConnectFailure.TlsPinMismatch ||
+                failure is ConnectFailure.AuthRejected
+            if (ref.stage == HandshakeStage.Established) {
+                events.trySend(LifecycleEvent.TransportFailure(failure, terminal = isTerminal))
+            } else if (!handshake.isCompleted) {
+                handshake.complete(
+                    if (isTerminal) AttemptOutcome.TerminalFailure(failure)
+                    else AttemptOutcome.TransientFailure(failure)
+                )
             }
         }
 
         override fun onClosed(code: Int, reason: String) {
+            val failure = ConnectFailure.ServerClosed(code, reason)
+            val isTerminal = !failure.isRetryable
             if (ref.stage == HandshakeStage.Established) {
-                events.trySend(LifecycleEvent.TransportClosed(reason.ifBlank { "code=$code" }))
+                events.trySend(LifecycleEvent.TransportClosed(failure))
             } else if (!handshake.isCompleted) {
-                handshake.complete(AttemptOutcome.TransientFailure(reason.ifBlank { "code=$code" }))
+                handshake.complete(
+                    if (isTerminal) AttemptOutcome.TerminalFailure(failure)
+                    else AttemptOutcome.TransientFailure(failure)
+                )
             }
         }
 
-        private fun completeTerminal(reason: String) {
-            if (!handshake.isCompleted) handshake.complete(AttemptOutcome.TerminalFailure(reason))
+        private fun completeTerminal(failure: ConnectFailure) {
+            if (!handshake.isCompleted) handshake.complete(AttemptOutcome.TerminalFailure(failure))
         }
-        private fun completeTransient(reason: String) {
-            if (!handshake.isCompleted) handshake.complete(AttemptOutcome.TransientFailure(reason))
+        private fun completeTransient(failure: ConnectFailure) {
+            if (!handshake.isCompleted) handshake.complete(AttemptOutcome.TransientFailure(failure))
         }
-    }
-
-    private fun isTerminal(t: Throwable, msg: String): Boolean {
-        // Heuristic: TLS pinning failures and TLS handshake aborts surface
-        // as javax.net.ssl.SSLHandshakeException / SSLPeerUnverifiedException
-        // with messages mentioning "fingerprint" / "pinning" / "certificate".
-        // Anything network-shaped (Socket / connection reset / EOF) is
-        // transient.
-        val cls = t.javaClass.name
-        if (cls.startsWith("javax.net.ssl.") &&
-            (msg.contains("fingerprint", ignoreCase = true) ||
-                msg.contains("pinning", ignoreCase = true) ||
-                msg.contains("certificate", ignoreCase = true))
-        ) return true
-        return false
     }
 
     private fun dispatchJsonRpc(text: String) {
@@ -750,20 +771,20 @@ class RemoteClient internal constructor(
 
     private sealed interface AttemptOutcome {
         data object Connected : AttemptOutcome
-        data class TerminalFailure(val reason: String) : AttemptOutcome
-        data class TransientFailure(val reason: String) : AttemptOutcome
+        data class TerminalFailure(val failure: ConnectFailure) : AttemptOutcome
+        data class TransientFailure(val failure: ConnectFailure) : AttemptOutcome
     }
 
     private sealed interface DisconnectReason {
         data object UserClose : DisconnectReason
-        data class Transient(val reason: String) : DisconnectReason
-        data class Terminal(val reason: String) : DisconnectReason
+        data class Transient(val failure: ConnectFailure) : DisconnectReason
+        data class Terminal(val failure: ConnectFailure) : DisconnectReason
     }
 
     private sealed interface LifecycleEvent {
         data object UserClose : LifecycleEvent
-        data class TransportClosed(val reason: String) : LifecycleEvent
-        data class TransportFailure(val reason: String, val terminal: Boolean) : LifecycleEvent
+        data class TransportClosed(val failure: ConnectFailure) : LifecycleEvent
+        data class TransportFailure(val failure: ConnectFailure, val terminal: Boolean) : LifecycleEvent
         data object QueueChanged : LifecycleEvent
     }
 
