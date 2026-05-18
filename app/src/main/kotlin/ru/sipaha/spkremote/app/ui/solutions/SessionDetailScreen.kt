@@ -17,14 +17,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
-import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.union
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
@@ -213,6 +210,14 @@ fun SessionDetailScreen(
     val showChipRow = parentId != null || children.isNotEmpty()
 
     Scaffold(
+        // Override the default contentWindowInsets (systemBars) so the
+        // bottomBar slot also lifts above the IME when it's open. Single
+        // source of truth — without this, Scaffold positions the
+        // bottomBar systemBars-bottom above the screen edge AND we'd
+        // have to add a second windowInsetsPadding inside the bar to
+        // handle IME, which double-counts the nav-bar inset and pushes
+        // the bar off-screen high when the keyboard opens.
+        contentWindowInsets = WindowInsets.systemBars.union(WindowInsets.ime),
         topBar = {
             SlimTopBar(
                 title = displayTitle,
@@ -988,21 +993,11 @@ private fun ComposeBar(
         tonalElevation = 3.dp,
         color = MaterialTheme.colorScheme.surface,
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                // navigationBarsPadding + imePadding stacked additively
-                // double-counts the nav-bar inset when the keyboard is up
-                // (the IME inset already includes nav-bar height). Use a
-                // single windowInsetsPadding with `ime ∪ navigationBars`
-                // so we take the MAX of the two — covers nav bar when
-                // keyboard is closed, IME when it's open, never both.
-                .windowInsetsPadding(
-                    WindowInsets.ime
-                        .union(WindowInsets.navigationBars)
-                        .only(WindowInsetsSides.Bottom),
-                ),
-        ) {
+        // No inset modifier here — the parent Scaffold's
+        // contentWindowInsets = systemBars ∪ ime is the single source
+        // of truth that positions this bar above the keyboard when it's
+        // open and above the nav bar when it isn't.
+        Column(modifier = Modifier.fillMaxWidth()) {
             // Tool-approval banner when the agent is blocked on user input
             // that has to happen on the desktop. The compose row stays
             // enabled — queuing a follow-up message is harmless.
