@@ -36,6 +36,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
@@ -696,11 +697,18 @@ private fun UserBubble(entry: EntrySummary) {
             // renderer (stays as legible plain Text). Strip the upstream
             // `## User` header so bubbles don't echo what alignment+color
             // already encode.
-            Text(
-                text = stripRoleHeading(entry.markdown ?: entry.preview),
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-            )
+            //
+            // SelectionContainer enables long-press text selection + the
+            // system Copy/Share toolbar without us shipping our own context
+            // menu. Scoped per-bubble so handles stay inside the bubble's
+            // visual bounds; cross-bubble selection isn't a common UX.
+            SelectionContainer {
+                Text(
+                    text = stripRoleHeading(entry.markdown ?: entry.preview),
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
+            }
         }
     }
 }
@@ -718,17 +726,24 @@ private fun AssistantBubble(entry: EntrySummary) {
             modifier = Modifier.widthIn(max = 360.dp),
         ) {
             Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                val md = entry.markdown
-                if (md != null) {
-                    AssistantMarkdownBody(markdown = stripRoleHeading(md), images = entry.images.orEmpty())
-                } else {
-                    // No full markdown yet (placeholder during streaming, or
-                    // pre-R-5e server). Falls back to preview to keep the
-                    // bubble informative until the per-entry RPC settles.
-                    Text(
-                        text = stripRoleHeading(entry.preview),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+                // SelectionContainer wraps the assistant body so the rendered
+                // markdown + the fallback preview Text are both long-press
+                // selectable. The image-tap handler inside AssistantMarkdownBody
+                // continues to fire on tap because Compose routes long-press
+                // to the selection layer separately from clicks.
+                SelectionContainer {
+                    val md = entry.markdown
+                    if (md != null) {
+                        AssistantMarkdownBody(markdown = stripRoleHeading(md), images = entry.images.orEmpty())
+                    } else {
+                        // No full markdown yet (placeholder during streaming, or
+                        // pre-R-5e server). Falls back to preview to keep the
+                        // bubble informative until the per-entry RPC settles.
+                        Text(
+                            text = stripRoleHeading(entry.preview),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
                 }
             }
         }
@@ -891,6 +906,13 @@ private fun ToolCallBubble(call: ToolCallSummary, positionKey: Int) {
                     contentDescription = contentDesc
                 },
         ) {
+            // SelectionContainer wraps the whole tool-call body so the
+            // tool name + collapsed args preview + expanded args/result
+            // text are all long-press selectable. The Surface's
+            // `.clickable { expanded = !expanded }` continues to fire on
+            // short tap (no onLongClick set → long-press falls through to
+            // the selection layer).
+            SelectionContainer {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -967,6 +989,7 @@ private fun ToolCallBubble(call: ToolCallSummary, positionKey: Int) {
                         }
                     }
                 }
+            }
             }
         }
     }
