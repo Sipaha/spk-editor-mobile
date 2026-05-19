@@ -340,6 +340,28 @@ class RemoteClient internal constructor(
         return controller.queueCall(method, params, ttlMs)
     }
 
+    /**
+     * Send a raw binary frame on the active WebSocket. Used by the
+     * chunked-upload path ([buildUploadChunkFrame]) which multiplexes
+     * its 16-byte-header + payload frames alongside the JSON-RPC text
+     * traffic on the same socket — the OkHttp / okio layer dispatches
+     * by WS frame type (text vs. binary).
+     *
+     * Returns `false` when there's no live transport OR the transport
+     * refused the frame (closed / closing socket). The caller must
+     * treat that as "the upload is paused; resume on the next
+     * Connected edge".
+     *
+     * No queuing semantics — unlike [queueCall], a binary frame doesn't
+     * sit in the durable outbound queue. The upload state machine owns
+     * its own resume protocol (call `upload_status` after reconnect,
+     * restart the chunk loop from the server-reported offset).
+     */
+    fun sendBinary(bytes: ByteArray): Boolean {
+        val tx = transport ?: return false
+        return runCatching { tx.send(bytes) }.getOrDefault(false)
+    }
+
     /** Add [kinds] to the active subscription set and notify the server. */
     suspend fun subscribe(kinds: List<String>): JsonRpcResponse {
         synchronized(stateLock) { activeSubscriptions += kinds }
