@@ -208,6 +208,17 @@ data class EntrySummary(
      * fragile content-match against the truncated preview.
      */
     @SerialName("client_send_id") val clientSendId: Long? = null,
+    /**
+     * Every distinct `spk_client_send_id` carried by this user entry,
+     * in source order. The single-id [clientSendId] above stays for
+     * back-compat — modern servers populate both, older servers only
+     * populate the singular field. Mobile dedupe should prefer this
+     * list when non-empty: the server-side queue-merge path rolls N
+     * originating bundles into one ACP user message with N distinct
+     * stamps, and only popping the first leaves N-1 optimistic
+     * bubbles orphaned.
+     */
+    @SerialName("client_send_ids") val clientSendIds: List<Long> = emptyList(),
 )
 
 /**
@@ -292,6 +303,15 @@ data class MessageAppendedPayload(
      * notification handler.
      */
     @SerialName("client_send_id") val clientSendId: Long? = null,
+    /**
+     * All distinct `spk_client_send_id` stamps on the appended entry.
+     * Populated when the server-side queue-merge path rolled N
+     * originating bundles into one user message — see [EntrySummary]
+     * for the same field's semantics. Mobile should pop every csid
+     * in this list from its optimistic bubble set; falls back to
+     * [clientSendId] singular for old-server compatibility.
+     */
+    @SerialName("client_send_ids") val clientSendIds: List<Long> = emptyList(),
 )
 
 /**

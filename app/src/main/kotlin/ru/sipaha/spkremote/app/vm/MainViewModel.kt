@@ -388,7 +388,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     val optimisticEntries: StateFlow<List<EntrySummary>> get() = sessionDetail.optimisticEntries
     val pendingUploadProgress: StateFlow<Map<Long, PendingUploadProgress>>
         get() = sessionDetail.pendingUploadProgress
-    val queuedCsids: StateFlow<Set<Long>> get() = sessionDetail.queuedCsids
     val cancelInFlight: StateFlow<Boolean> get() = sessionDetail.cancelInFlight
     val sessionChildren: StateFlow<Map<String, List<SessionSummary>>> get() = sessionList.sessionChildren
     val agents: StateFlow<UiData<List<AgentSummary>>> get() = sessionList.agents

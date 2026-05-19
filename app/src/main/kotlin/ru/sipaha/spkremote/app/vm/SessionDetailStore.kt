@@ -8,10 +8,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -28,9 +25,7 @@ import ru.sipaha.spkremote.app.data.PersistedPendingSend
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.ContentBlockDto
-import ru.sipaha.spkremote.core.DisplayState
 import ru.sipaha.spkremote.core.EntrySummary
-import ru.sipaha.spkremote.core.parseDisplayState
 import ru.sipaha.spkremote.core.JsonRpc
 import ru.sipaha.spkremote.core.GetSessionResult
 import ru.sipaha.spkremote.core.MergeOutcome
@@ -261,64 +256,6 @@ internal class SessionDetailStore(
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
 
-    /**
-     * Set of `clientSendId`s whose send is gated waiting for the agent
-     * turn to settle. Populated by [gateOnSessionIdle] just before the
-     * actual `queueCall` fires when the session was in
-     * [DisplayState.Running] / [DisplayState.AwaitingInput] at send time,
-     * and cleared when the gate releases (either the session goes idle
-     * or [forceFlushQueue] forces it through). The chat surface routes
-     * the [UserBubbleStatus.Queued] badge off membership in this set —
-     * a queued bubble shows an hourglass icon instead of the regular
-     * "Sending" clock so the user can tell at a glance which messages
-     * are waiting for the agent's current turn to finish.
-     */
-    private val _queuedCsids = MutableStateFlow<Set<Long>>(emptySet())
-    val queuedCsids: StateFlow<Set<Long>> = _queuedCsids.asStateFlow()
-
-    /**
-     * Force-flush trigger. Emitting unblocks every coroutine currently
-     * suspended in [gateOnSessionIdle], so the queued sends fire even
-     * if the agent's turn is still running. Replay = 0 (one-shot
-     * broadcast; sends that aren't currently queued shouldn't get
-     * pulled forward from a prior flush press). Buffer = 16 so a fast
-     * burst of force-flushes doesn't drop — `tryEmit` returns false
-     * silently otherwise. The companion server-side step
-     * ([forceFlushQueue] dispatches `cancel_turn` before the unblock)
-     * is what produces the idle window that the auto-path would also
-     * unblock on; the explicit emit just removes the dependency on
-     * the round-trip latency.
-     */
-    private val _forceFlush = MutableSharedFlow<Unit>(
-        replay = 0,
-        extraBufferCapacity = 16,
-    )
-
-    /**
-     * Per-session in-memory "ghost bubble" that accumulates additional
-     * presses while the agent is mid-turn. Mirrors the desktop
-     * behaviour described in
-     * `solution_agent::store::queue::send_message_blocks` — subsequent
-     * queued sends merge into the existing pending entry separated by
-     * a blank line so the user sees a single bubble that grows, not a
-     * stack of fragments. Only the FIRST press in a Running window
-     * mints a fresh csid + optimistic row; later presses append to
-     * its `accumulatedBlocks` and refresh the row's preview through
-     * [updateOptimisticPreviewLocked]. The dispatcher that the first
-     * press launched drains [accumulatedBlocks] at flush time and
-     * sends the merged payload as one queueCall, so the server gets a
-     * single user entry with a single csid (no orphaned optimistic
-     * bubbles to clean up). Keyed by sessionId so a user juggling
-     * multiple chat sessions accumulates one draft per session.
-     */
-    private val mergedQueueDrafts: MutableMap<String, MergedQueueDraft> = mutableMapOf()
-
-    private data class MergedQueueDraft(
-        val csid: Long,
-        val localId: Long,
-        val sessionId: String,
-        val accumulatedBlocks: MutableList<ContentBlockDto>,
-    )
 
     /**
      * One-shot signal emitted after a successful Reset context. Carries the
@@ -500,18 +437,26 @@ internal class SessionDetailStore(
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
         lastSeen.recordIfNewer(payload.sessionId, payload.entryIndex)
-        // Fast-pop: when the notification carries a `client_send_id`
-        // (server lifted it from `_meta.spk_client_send_id` on the
-        // originating user message's first ContentBlock) AND it matches
-        // one of our pending optimistic bubbles, drop the bubble now
-        // instead of waiting for the post-fetch reconcile. Closes the
-        // duplicate-render window the user reported 2026-05-18.
-        val csid = payload.clientSendId
-        if (csid != null && payload.role == "user") {
+        // Fast-pop: when the notification carries any
+        // `spk_client_send_id` stamps that match our pending optimistic
+        // bubbles, drop ALL of them now instead of waiting for the
+        // post-fetch reconcile. Prefer the `client_send_ids` array
+        // (modern server: lists every csid the server-side queue-merge
+        // rolled into this entry); fall back to the singular field for
+        // older servers. Closes the duplicate-render window the user
+        // reported 2026-05-18 AND the "queue-merged echo leaves N-1
+        // bubbles orphaned" follow-up.
+        val singularCsid = payload.clientSendId
+        val csids: List<Long> = when {
+            payload.clientSendIds.isNotEmpty() -> payload.clientSendIds
+            singularCsid != null -> listOf(singularCsid)
+            else -> emptyList()
+        }
+        if (csids.isNotEmpty() && payload.role == "user") {
             scope.launch {
                 sessionMutex.withLock {
                     if (openSessionId != payload.sessionId) return@withLock
-                    popOptimisticByClientSendIdLocked(csid)
+                    for (c in csids) popOptimisticByClientSendIdLocked(c)
                 }
             }
         }
@@ -1005,72 +950,21 @@ internal class SessionDetailStore(
         if (blocks.isEmpty()) return
         val active = context.activeClient() ?: return
         val sessionId = openSessionId ?: return
+        val preview = buildBlocksPreview(blocks)
+        val localId = optimisticIdGen.incrementAndGet()
+        val clientSendId = clientSendIdGen.incrementAndGet()
+        val optimistic = EntrySummary(
+            role = "user",
+            preview = preview,
+            clientSendId = clientSendId,
+        )
+        val stamped = stampClientSendId(blocks, clientSendId)
         scope.launch {
-            // Merge-or-spawn decision under sessionMutex so a fast
-            // double-press can't race the dispatcher into thinking
-            // there's no existing draft when there is.
-            val dispatchCsid: Long? = sessionMutex.withLock {
-                val isBusy = currentSessionDisplayStateLocked()?.let {
-                    it == DisplayState.Running || it == DisplayState.AwaitingInput
-                } ?: false
-                val existing = if (isBusy) mergedQueueDrafts[sessionId] else null
-                if (existing != null) {
-                    // Merge into the existing ghost bubble. Two-block
-                    // separator ("\n\n") matches the desktop
-                    // `send_message_blocks` queue-merge so the agent
-                    // sees the same prompt shape as it would from a
-                    // single-client run.
-                    existing.accumulatedBlocks.add(
-                        ContentBlockDto.Text("\n\n"),
-                    )
-                    existing.accumulatedBlocks.addAll(blocks)
-                    val mergedPreview = buildBlocksPreview(existing.accumulatedBlocks)
-                    updateOptimisticPreviewLocked(existing.csid, mergedPreview)
-                    null
-                } else {
-                    val localId = optimisticIdGen.incrementAndGet()
-                    val csid = clientSendIdGen.incrementAndGet()
-                    val preview = buildBlocksPreview(blocks)
-                    _optimisticEntries.value = _optimisticEntries.value + EntrySummary(
-                        role = "user",
-                        preview = preview,
-                        clientSendId = csid,
-                    )
-                    optimisticIds.add(localId)
-                    optimisticClientSendIds.add(csid)
-                    if (isBusy) {
-                        // Stash for merging by subsequent presses.
-                        // Dropped on flush — see drain step below.
-                        mergedQueueDrafts[sessionId] = MergedQueueDraft(
-                            csid = csid,
-                            localId = localId,
-                            sessionId = sessionId,
-                            accumulatedBlocks = blocks.toMutableList(),
-                        )
-                    }
-                    csid
-                }
+            sessionMutex.withLock {
+                _optimisticEntries.value = _optimisticEntries.value + optimistic
+                optimisticIds.add(localId)
+                optimisticClientSendIds.add(clientSendId)
             }
-            val csid = dispatchCsid ?: return@launch
-            // Hold the wire dispatch until the agent's turn settles
-            // (auto-path) OR [forceFlushQueue] fires the unblock
-            // signal (manual path). Returns immediately if the
-            // session was already idle when we spawned.
-            gateOnSessionIdle(csid)
-            // Drain the merged draft if it's still ours — fast
-            // double-presses while we waited on the gate may have
-            // appended more content, and we want the merged payload
-            // to fire as one call, not a stale snapshot.
-            val finalBlocks: List<ContentBlockDto> = sessionMutex.withLock {
-                val draft = mergedQueueDrafts[sessionId]
-                if (draft?.csid == csid) {
-                    mergedQueueDrafts.remove(sessionId)
-                    draft.accumulatedBlocks.toList()
-                } else {
-                    blocks
-                }
-            }
-            val stamped = stampClientSendId(finalBlocks, csid)
             val blocksJson = JsonRpc.json.encodeToJsonElement(
                 ListSerializer(ContentBlockDto.serializer()),
                 stamped,
@@ -1079,6 +973,17 @@ internal class SessionDetailStore(
                 put("session_id", sessionId)
                 put("blocks", blocksJson)
             }
+            // Fire-and-forget: the server's `send_message_blocks`
+            // (store/queue.rs) already does the "if Running, queue +
+            // merge into pending_messages" half. Each press from the
+            // mobile becomes its own immediate queueCall; if the
+            // session is mid-turn the server appends the bundle to
+            // `pending_messages` (separated by `\n\n`) and flushes
+            // everything as one merged user entry once the turn
+            // settles. The mobile shows a Queued badge per optimistic
+            // bubble while the session is Running, derived from the
+            // bubble being optimistic + the live session state — no
+            // client-side gate or persistence needed.
             runCatching {
                 active.queueCall("remote.solution_agent.send_message_blocks", params)
             }
@@ -1089,15 +994,7 @@ internal class SessionDetailStore(
                     if (toolErr != null) error(toolErr)
                 }
                 .onFailure {
-                    // The localId is the FIRST press's id — that's
-                    // the one we created the optimistic entry under
-                    // and the only one in the optimistic list (later
-                    // merges didn't create their own rows).
-                    val draftLocalId = mergedQueueDrafts[sessionId]?.localId
-                    if (draftLocalId != null) {
-                        sessionMutex.withLock { mergedQueueDrafts.remove(sessionId) }
-                    }
-                    removeOptimisticByClientSendId(csid)
+                    removeOptimisticById(localId)
                     val msg = when (it) {
                         is QueueTtlException ->
                             "send timed out — the editor was offline for too long"
@@ -1107,55 +1004,6 @@ internal class SessionDetailStore(
                     }
                     context.emitError(msg)
                 }
-        }
-    }
-
-    /**
-     * Read the current session's parsed [DisplayState]. Must be called
-     * while holding [sessionMutex] — both the read and any merge-or-
-     * spawn decision keyed off the result need to land atomically with
-     * the optimistic-list / [mergedQueueDrafts] mutation that follows.
-     */
-    private fun currentSessionDisplayStateLocked(): DisplayState? {
-        val loaded = (_session.value as? UiData.Loaded)?.value ?: return null
-        return parseDisplayState(loaded.state)
-    }
-
-    /**
-     * Replace the preview of an optimistic entry identified by [csid]
-     * (used by merge presses to grow the ghost bubble's content in
-     * place). Must be called while holding [sessionMutex]. No-op when
-     * no matching entry exists — defensive against a race where the
-     * bubble was popped (e.g. server echo landed) between the merge
-     * append and this update.
-     */
-    private fun updateOptimisticPreviewLocked(csid: Long, newPreview: String) {
-        val current = _optimisticEntries.value
-        var hit = false
-        val next = current.map { entry ->
-            if (entry.clientSendId == csid) {
-                hit = true
-                entry.copy(preview = newPreview)
-            } else entry
-        }
-        if (hit) _optimisticEntries.value = next
-    }
-
-    /**
-     * Remove an optimistic entry by its `clientSendId`. Used by the
-     * failure path in [sendMessageBlocks] where we don't have the
-     * original `localId` after the merge fan-in (subsequent presses
-     * appended to an existing draft without remembering their own
-     * localId).
-     */
-    private suspend fun removeOptimisticByClientSendId(csid: Long) {
-        sessionMutex.withLock {
-            val current = _optimisticEntries.value
-            val filtered = current.filter { it.clientSendId != csid }
-            if (filtered.size != current.size) {
-                _optimisticEntries.value = filtered
-                optimisticClientSendIds.remove(csid)
-            }
         }
     }
 
@@ -1418,13 +1266,11 @@ internal class SessionDetailStore(
                 inflightDeferred.remove(send.csid)
                 return@launch
             }
-            // Hold the wire send until the agent's turn settles — same
-            // session-busy gate as [sendMessageBlocks] above. Goes
-            // strictly AFTER the upload-await + spk-upload://<id>
-            // assembly so the gate timer doesn't overlap with the
-            // (potentially long) upload phase; runDeferredSend's own
-            // disk persistence covers a kill during this wait.
-            gateOnSessionIdle(send.csid)
+            // Fire-and-forget once uploads have all reached terminal.
+            // Server-side `send_message_blocks` queues+merges into
+            // `pending_messages` when the session is Running, so we
+            // don't need a client-side gate here either — same model
+            // as the text-only [sendMessageBlocks] path.
             runCatching {
                 active.queueCall("remote.solution_agent.send_message_blocks", params)
             }
@@ -1628,70 +1474,37 @@ internal class SessionDetailStore(
     }
 
     /**
-     * User-pressed "send now" button on the queue strip.
+     * User-pressed "send queued now" button. Cancels the in-flight
+     * agent turn with the server-side `flush_pending` flag set so the
+     * accumulated `pending_messages` bundle gets flushed as a fresh
+     * merged turn the moment the cancel settles, instead of being
+     * dropped along with the cancelled turn.
      *
-     * Cancels the current agent turn and unblocks every coroutine
-     * currently waiting in [gateOnSessionIdle] so the queued sends
-     * fire immediately afterwards. The unblock signal goes out BEFORE
-     * the cancel RPC resolves: the gate would also release on its own
-     * once the cancel produces an Idle/Errored state notification, but
-     * the explicit emit removes the round-trip from the user-visible
-     * latency. The auto-path race is benign because gate releases are
-     * idempotent (each gated coroutine `first()`s on the merged flow
-     * and proceeds with its queueCall regardless of which leg fired).
-     *
-     * No-op when there's nothing in the queue — pressing the button
-     * with an empty queue is treated as a misclick.
+     * No client-side queue state to manage — all the waiting +
+     * merging lives in `solution_agent::store::queue` (see
+     * `interrupt_and_flush_pending`). The mobile just kicks the
+     * server and lets the regular SessionStateChanged →
+     * SessionMessageAppended notifications drive the UI update.
      */
     fun forceFlushQueue() {
-        if (_queuedCsids.value.isEmpty()) return
-        // Fire the unblock first so the gated coroutines can race the
-        // cancel — same reasoning as the kdoc above.
-        _forceFlush.tryEmit(Unit)
-        cancelTurn()
-    }
-
-    /**
-     * Suspend the calling coroutine until the agent's current turn
-     * settles — either it transitions out of [DisplayState.Running] /
-     * [DisplayState.AwaitingInput] (auto-path), or [forceFlushQueue]
-     * fires the unblock signal (manual path). Returns immediately when
-     * the session is already idle so the no-queue happy path stays
-     * zero-overhead.
-     *
-     * Threads the csid through [_queuedCsids] for the bubble status
-     * surface — the chat row renders an hourglass while the membership
-     * holds. `try/finally` guarantees the set drains even if the gate
-     * is cancelled by the user dismissing the optimistic bubble.
-     */
-    private suspend fun gateOnSessionIdle(csid: Long) {
-        val currentDisplayState = (_session.value as? UiData.Loaded)
-            ?.value
-            ?.state
-            ?.let { parseDisplayState(it) }
-        val isBusy = currentDisplayState == DisplayState.Running ||
-            currentDisplayState == DisplayState.AwaitingInput
-        if (!isBusy) return
-        _queuedCsids.value = _queuedCsids.value + csid
-        try {
-            // Merge the two unblock conditions into a single Flow and
-            // await its first emission. The session-state leg keys off
-            // each new value of `_session`; once the parsed display
-            // state leaves Running/AwaitingInput the auto-path lets
-            // through. The force-flush leg is a SharedFlow with no
-            // replay so a previous press doesn't pre-unblock a fresh
-            // gate — only presses landing while THIS gate is active
-            // count.
-            val autoUnblock: kotlinx.coroutines.flow.Flow<Unit> = _session
-                .filter { state ->
-                    val loaded = (state as? UiData.Loaded)?.value ?: return@filter false
-                    val ds = parseDisplayState(loaded.state)
-                    ds != DisplayState.Running && ds != DisplayState.AwaitingInput
+        val active = context.activeClient() ?: return
+        val sessionId = openSessionId ?: return
+        if (_cancelInFlight.value) return
+        _cancelInFlight.value = true
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("flush_pending", true)
+        }
+        scope.launch {
+            runCatching { active.call("remote.solution_agent.cancel_turn", params) }
+                .mapCatching { resp ->
+                    val err = resp.error
+                    if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
                 }
-                .map { Unit }
-            merge(autoUnblock, _forceFlush).first()
-        } finally {
-            _queuedCsids.value = _queuedCsids.value - csid
+                .onFailure { context.emitError("flush failed: ${it.message ?: "?"}") }
+            _cancelInFlight.value = false
         }
     }
 

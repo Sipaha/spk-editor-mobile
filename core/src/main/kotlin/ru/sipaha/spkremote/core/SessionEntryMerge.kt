@@ -98,7 +98,20 @@ fun reconcileOptimistic(
         return Triple(emptyList(), emptyList(), emptyList())
     }
     val serverUser = serverEntries.filter { it.role == "user" }
-    val serverIds: MutableSet<Long> = serverUser.mapNotNull { it.clientSendId }.toHashSet()
+    // Modern servers expose every csid the queue-merge rolled into a
+    // single user entry via [EntrySummary.clientSendIds]; fall back to
+    // the singular [EntrySummary.clientSendId] for old servers that
+    // only populate one. Build the union into a flat set so every
+    // optimistic bubble whose csid matches any contributor pops.
+    val serverIds: MutableSet<Long> = HashSet<Long>().also { set ->
+        for (entry in serverUser) {
+            if (entry.clientSendIds.isNotEmpty()) {
+                set.addAll(entry.clientSendIds)
+            } else if (entry.clientSendId != null) {
+                set.add(entry.clientSendId)
+            }
+        }
+    }
     val serverPreviews: MutableList<String> = serverUser
         .filter { it.clientSendId == null }
         .map { stripRoleHeading(it.preview) }

@@ -176,7 +176,6 @@ fun SessionDetailScreen(
     val sessionState by viewModel.session.collectAsState()
     val optimistic by viewModel.optimisticEntries.collectAsState()
     val pendingUploads by viewModel.pendingUploadProgress.collectAsState()
-    val queuedCsids by viewModel.queuedCsids.collectAsState()
     val cancelInFlight by viewModel.cancelInFlight.collectAsState()
     val isLoadingOlder by viewModel.isLoadingOlder.collectAsState()
     val childrenMap by viewModel.sessionChildren.collectAsState()
@@ -413,7 +412,7 @@ fun SessionDetailScreen(
                     onCancelUpload = viewModel::cancelAttachmentUpload,
                     onForgetUpload = viewModel::forgetAttachmentUpload,
                     awaitUploadTerminal = viewModel::awaitAttachmentUploadTerminal,
-                    queuedCsids = queuedCsids,
+                    hasOptimisticSends = optimistic.isNotEmpty(),
                     onForceFlush = viewModel::forceFlushQueue,
                 )
             }
@@ -439,7 +438,7 @@ fun SessionDetailScreen(
                     server = s.value,
                     optimistic = optimistic,
                     pendingUploads = pendingUploads,
-                    queuedCsids = queuedCsids,
+                    sessionDisplayState = displayState,
                     isLoadingOlder = isLoadingOlder,
                     onRequestOlder = { viewModel.loadOlder(sessionId) },
                 )
@@ -542,7 +541,7 @@ private fun ChatList(
     server: GetSessionResult,
     optimistic: List<EntrySummary>,
     pendingUploads: Map<Long, PendingUploadProgress>,
-    queuedCsids: Set<Long>,
+    sessionDisplayState: DisplayState,
     isLoadingOlder: Boolean,
     onRequestOlder: () -> Unit,
 ) {
@@ -661,7 +660,7 @@ private fun ChatList(
                         entry = entry,
                         isOptimistic = entry in optimisticIdentitySet,
                         pendingUploads = pendingUploads,
-                        queuedCsids = queuedCsids,
+                        sessionDisplayState = sessionDisplayState,
                     )
                     ChatBubble(entry = entry, userStatus = status)
                 }
@@ -746,7 +745,7 @@ private fun userBubbleStatusFor(
     entry: EntrySummary,
     isOptimistic: Boolean,
     pendingUploads: Map<Long, PendingUploadProgress>,
-    queuedCsids: Set<Long>,
+    sessionDisplayState: DisplayState,
 ): UserBubbleStatus {
     if (entry.role != "user") return UserBubbleStatus.None
     val csid = entry.clientSendId
@@ -760,12 +759,19 @@ private fun userBubbleStatusFor(
                     paused = pending.status == PendingUploadProgress.Status.Paused,
                 )
             }
-            // Uploads finished but the gate (`gateOnSessionIdle`) is
-            // still holding the wire dispatch — show Queued. Falls
-            // through to Sending once the gate releases.
-            if (csid in queuedCsids) return UserBubbleStatus.Queued
         }
-        return UserBubbleStatus.Sending
+        // The mobile fires `send_message_blocks` immediately; the
+        // server queues it server-side (into `pending_messages`) when
+        // the agent is mid-turn. From the bubble's perspective that
+        // looks identical to "wire send in flight, server hasn't
+        // echoed", so we use the live session state to differentiate:
+        // Running / AwaitingInput → the entry is sitting in the
+        // server-side queue and will flush when the turn ends, render
+        // as Queued (hourglass) so the user can tell from a glance
+        // which presses are pending agent-busy vs awaiting wire ack.
+        val busy = sessionDisplayState == DisplayState.Running ||
+            sessionDisplayState == DisplayState.AwaitingInput
+        return if (busy) UserBubbleStatus.Queued else UserBubbleStatus.Sending
     }
     // Server-echoed user entry — if it carries a client_send_id (every
     // recent client stamps one) the server obviously received it. The
@@ -1539,17 +1545,16 @@ private fun ComposeBar(
      */
     awaitUploadTerminal: suspend (localKey: String) -> String?,
     /**
-     * Set of `clientSendId`s that are currently held by the agent-busy
-     * gate ([SessionDetailStore.gateOnSessionIdle]). Drives whether the
-     * Force-flush button appears in the right-action row, and the
-     * compose row uses it to hint the user that the upcoming Send will
-     * land in the queue rather than fire immediately.
+     * True when the user has at least one optimistic user bubble
+     * pending — i.e. there's something the server-side `pending_messages`
+     * queue could flush. Drives whether the Force-flush button is
+     * shown in the right-action cluster while the agent is mid-turn.
      */
-    queuedCsids: Set<Long>,
+    hasOptimisticSends: Boolean,
     /**
-     * Cancel the current agent turn and immediately unblock every
-     * waiting [gateOnSessionIdle] coroutine so the queued sends fire
-     * straight after.
+     * Cancel the current agent turn AND request the server-side
+     * `flush_pending` so the accumulated `pending_messages` bundle
+     * fires immediately as a fresh merged turn.
      */
     onForceFlush: () -> Unit,
 ) {
@@ -1686,7 +1691,7 @@ private fun ComposeBar(
     val sendEnabled = enabled && !anyUploadFailed &&
         (draft.isNotBlank() || pickedAttachments.isNotEmpty())
     val showCancel = isRunning
-    val showForceFlush = isRunning && queuedCsids.isNotEmpty()
+    val showForceFlush = isRunning && hasOptimisticSends
 
     Surface(
         tonalElevation = 3.dp,
