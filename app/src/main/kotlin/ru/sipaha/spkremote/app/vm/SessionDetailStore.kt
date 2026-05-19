@@ -8,7 +8,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -25,7 +28,9 @@ import ru.sipaha.spkremote.app.data.PersistedPendingSend
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.ContentBlockDto
+import ru.sipaha.spkremote.core.DisplayState
 import ru.sipaha.spkremote.core.EntrySummary
+import ru.sipaha.spkremote.core.parseDisplayState
 import ru.sipaha.spkremote.core.JsonRpc
 import ru.sipaha.spkremote.core.GetSessionResult
 import ru.sipaha.spkremote.core.MergeOutcome
@@ -255,6 +260,39 @@ internal class SessionDetailStore(
 
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
+
+    /**
+     * Set of `clientSendId`s whose send is gated waiting for the agent
+     * turn to settle. Populated by [gateOnSessionIdle] just before the
+     * actual `queueCall` fires when the session was in
+     * [DisplayState.Running] / [DisplayState.AwaitingInput] at send time,
+     * and cleared when the gate releases (either the session goes idle
+     * or [forceFlushQueue] forces it through). The chat surface routes
+     * the [UserBubbleStatus.Queued] badge off membership in this set —
+     * a queued bubble shows an hourglass icon instead of the regular
+     * "Sending" clock so the user can tell at a glance which messages
+     * are waiting for the agent's current turn to finish.
+     */
+    private val _queuedCsids = MutableStateFlow<Set<Long>>(emptySet())
+    val queuedCsids: StateFlow<Set<Long>> = _queuedCsids.asStateFlow()
+
+    /**
+     * Force-flush trigger. Emitting unblocks every coroutine currently
+     * suspended in [gateOnSessionIdle], so the queued sends fire even
+     * if the agent's turn is still running. Replay = 0 (one-shot
+     * broadcast; sends that aren't currently queued shouldn't get
+     * pulled forward from a prior flush press). Buffer = 16 so a fast
+     * burst of force-flushes doesn't drop — `tryEmit` returns false
+     * silently otherwise. The companion server-side step
+     * ([forceFlushQueue] dispatches `cancel_turn` before the unblock)
+     * is what produces the idle window that the auto-path would also
+     * unblock on; the explicit emit just removes the dependency on
+     * the round-trip latency.
+     */
+    private val _forceFlush = MutableSharedFlow<Unit>(
+        replay = 0,
+        extraBufferCapacity = 16,
+    )
 
     /**
      * One-shot signal emitted after a successful Reset context. Carries the
@@ -964,6 +1002,14 @@ internal class SessionDetailStore(
                 put("session_id", sessionId)
                 put("blocks", blocksJson)
             }
+            // Gate the dispatch on the agent turn settling. When the
+            // user types into the compose row while the agent is
+            // mid-turn we still want the bubble to appear immediately
+            // (UX: "the queue accepted my message") but we hold off
+            // hitting the wire until the current turn finishes —
+            // otherwise the server would dispatch it as a follow-up
+            // bundle that races the in-flight reply.
+            gateOnSessionIdle(clientSendId)
             runCatching {
                 active.queueCall("remote.solution_agent.send_message_blocks", params)
             }
@@ -1246,6 +1292,13 @@ internal class SessionDetailStore(
                 inflightDeferred.remove(send.csid)
                 return@launch
             }
+            // Hold the wire send until the agent's turn settles — same
+            // session-busy gate as [sendMessageBlocks] above. Goes
+            // strictly AFTER the upload-await + spk-upload://<id>
+            // assembly so the gate timer doesn't overlap with the
+            // (potentially long) upload phase; runDeferredSend's own
+            // disk persistence covers a kill during this wait.
+            gateOnSessionIdle(send.csid)
             runCatching {
                 active.queueCall("remote.solution_agent.send_message_blocks", params)
             }
@@ -1445,6 +1498,74 @@ internal class SessionDetailStore(
                 }
                 .onFailure { context.emitError("cancel failed: ${it.message ?: "?"}") }
             _cancelInFlight.value = false
+        }
+    }
+
+    /**
+     * User-pressed "send now" button on the queue strip.
+     *
+     * Cancels the current agent turn and unblocks every coroutine
+     * currently waiting in [gateOnSessionIdle] so the queued sends
+     * fire immediately afterwards. The unblock signal goes out BEFORE
+     * the cancel RPC resolves: the gate would also release on its own
+     * once the cancel produces an Idle/Errored state notification, but
+     * the explicit emit removes the round-trip from the user-visible
+     * latency. The auto-path race is benign because gate releases are
+     * idempotent (each gated coroutine `first()`s on the merged flow
+     * and proceeds with its queueCall regardless of which leg fired).
+     *
+     * No-op when there's nothing in the queue — pressing the button
+     * with an empty queue is treated as a misclick.
+     */
+    fun forceFlushQueue() {
+        if (_queuedCsids.value.isEmpty()) return
+        // Fire the unblock first so the gated coroutines can race the
+        // cancel — same reasoning as the kdoc above.
+        _forceFlush.tryEmit(Unit)
+        cancelTurn()
+    }
+
+    /**
+     * Suspend the calling coroutine until the agent's current turn
+     * settles — either it transitions out of [DisplayState.Running] /
+     * [DisplayState.AwaitingInput] (auto-path), or [forceFlushQueue]
+     * fires the unblock signal (manual path). Returns immediately when
+     * the session is already idle so the no-queue happy path stays
+     * zero-overhead.
+     *
+     * Threads the csid through [_queuedCsids] for the bubble status
+     * surface — the chat row renders an hourglass while the membership
+     * holds. `try/finally` guarantees the set drains even if the gate
+     * is cancelled by the user dismissing the optimistic bubble.
+     */
+    private suspend fun gateOnSessionIdle(csid: Long) {
+        val currentDisplayState = (_session.value as? UiData.Loaded)
+            ?.value
+            ?.state
+            ?.let { parseDisplayState(it) }
+        val isBusy = currentDisplayState == DisplayState.Running ||
+            currentDisplayState == DisplayState.AwaitingInput
+        if (!isBusy) return
+        _queuedCsids.value = _queuedCsids.value + csid
+        try {
+            // Merge the two unblock conditions into a single Flow and
+            // await its first emission. The session-state leg keys off
+            // each new value of `_session`; once the parsed display
+            // state leaves Running/AwaitingInput the auto-path lets
+            // through. The force-flush leg is a SharedFlow with no
+            // replay so a previous press doesn't pre-unblock a fresh
+            // gate — only presses landing while THIS gate is active
+            // count.
+            val autoUnblock: kotlinx.coroutines.flow.Flow<Unit> = _session
+                .filter { state ->
+                    val loaded = (state as? UiData.Loaded)?.value ?: return@filter false
+                    val ds = parseDisplayState(loaded.state)
+                    ds != DisplayState.Running && ds != DisplayState.AwaitingInput
+                }
+                .map { Unit }
+            merge(autoUnblock, _forceFlush).first()
+        } finally {
+            _queuedCsids.value = _queuedCsids.value - csid
         }
     }
 

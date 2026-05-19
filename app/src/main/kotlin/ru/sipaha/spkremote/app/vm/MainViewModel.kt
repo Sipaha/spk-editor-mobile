@@ -388,6 +388,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     val optimisticEntries: StateFlow<List<EntrySummary>> get() = sessionDetail.optimisticEntries
     val pendingUploadProgress: StateFlow<Map<Long, PendingUploadProgress>>
         get() = sessionDetail.pendingUploadProgress
+    val queuedCsids: StateFlow<Set<Long>> get() = sessionDetail.queuedCsids
     val cancelInFlight: StateFlow<Boolean> get() = sessionDetail.cancelInFlight
     val sessionChildren: StateFlow<Map<String, List<SessionSummary>>> get() = sessionList.sessionChildren
     val agents: StateFlow<UiData<List<AgentSummary>>> get() = sessionList.agents
@@ -405,6 +406,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     fun sendMessage(text: String) = sessionDetail.sendMessage(text)
     fun sendMessageBlocks(blocks: List<ContentBlockDto>) =
         sessionDetail.sendMessageBlocks(blocks)
+    fun forceFlushQueue() = sessionDetail.forceFlushQueue()
     /**
      * Pending-send variant for the chat compose row: caller pressed
      * Send while one or more attachments were still uploading. The

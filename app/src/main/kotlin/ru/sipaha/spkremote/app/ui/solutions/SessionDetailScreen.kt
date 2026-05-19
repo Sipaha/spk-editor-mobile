@@ -51,6 +51,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Done
@@ -58,6 +59,7 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.HourglassBottom
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.CheckCircle
@@ -174,6 +176,7 @@ fun SessionDetailScreen(
     val sessionState by viewModel.session.collectAsState()
     val optimistic by viewModel.optimisticEntries.collectAsState()
     val pendingUploads by viewModel.pendingUploadProgress.collectAsState()
+    val queuedCsids by viewModel.queuedCsids.collectAsState()
     val cancelInFlight by viewModel.cancelInFlight.collectAsState()
     val isLoadingOlder by viewModel.isLoadingOlder.collectAsState()
     val childrenMap by viewModel.sessionChildren.collectAsState()
@@ -410,6 +413,8 @@ fun SessionDetailScreen(
                     onCancelUpload = viewModel::cancelAttachmentUpload,
                     onForgetUpload = viewModel::forgetAttachmentUpload,
                     awaitUploadTerminal = viewModel::awaitAttachmentUploadTerminal,
+                    queuedCsids = queuedCsids,
+                    onForceFlush = viewModel::forceFlushQueue,
                 )
             }
         },
@@ -434,6 +439,7 @@ fun SessionDetailScreen(
                     server = s.value,
                     optimistic = optimistic,
                     pendingUploads = pendingUploads,
+                    queuedCsids = queuedCsids,
                     isLoadingOlder = isLoadingOlder,
                     onRequestOlder = { viewModel.loadOlder(sessionId) },
                 )
@@ -536,6 +542,7 @@ private fun ChatList(
     server: GetSessionResult,
     optimistic: List<EntrySummary>,
     pendingUploads: Map<Long, PendingUploadProgress>,
+    queuedCsids: Set<Long>,
     isLoadingOlder: Boolean,
     onRequestOlder: () -> Unit,
 ) {
@@ -654,6 +661,7 @@ private fun ChatList(
                         entry = entry,
                         isOptimistic = entry in optimisticIdentitySet,
                         pendingUploads = pendingUploads,
+                        queuedCsids = queuedCsids,
                     )
                     ChatBubble(entry = entry, userStatus = status)
                 }
@@ -723,6 +731,13 @@ internal sealed class UserBubbleStatus {
         val totalBytes: Long,
         val paused: Boolean,
     ) : UserBubbleStatus()
+    /**
+     * Send is waiting for the agent's current turn to finish (or for
+     * the user to press the force-flush button). Shown with an
+     * hourglass icon to differentiate from [Sending] (which is on-the-
+     * wire and waiting for the server echo).
+     */
+    object Queued : UserBubbleStatus()
     object Sending : UserBubbleStatus()
     object Delivered : UserBubbleStatus()
 }
@@ -731,6 +746,7 @@ private fun userBubbleStatusFor(
     entry: EntrySummary,
     isOptimistic: Boolean,
     pendingUploads: Map<Long, PendingUploadProgress>,
+    queuedCsids: Set<Long>,
 ): UserBubbleStatus {
     if (entry.role != "user") return UserBubbleStatus.None
     val csid = entry.clientSendId
@@ -744,6 +760,10 @@ private fun userBubbleStatusFor(
                     paused = pending.status == PendingUploadProgress.Status.Paused,
                 )
             }
+            // Uploads finished but the gate (`gateOnSessionIdle`) is
+            // still holding the wire dispatch — show Queued. Falls
+            // through to Sending once the gate releases.
+            if (csid in queuedCsids) return UserBubbleStatus.Queued
         }
         return UserBubbleStatus.Sending
     }
@@ -917,6 +937,20 @@ private fun UserBubbleStatusRow(status: UserBubbleStatus) {
                 }
                 Text(
                     text = label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.75f),
+                )
+            }
+            UserBubbleStatus.Queued -> {
+                Icon(
+                    imageVector = Icons.Filled.HourglassBottom,
+                    contentDescription = "Queued — waiting for current turn",
+                    modifier = Modifier.size(14.dp),
+                    tint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.75f),
+                )
+                Spacer(Modifier.size(6.dp))
+                Text(
+                    text = "Queued",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.75f),
                 )
@@ -1504,6 +1538,20 @@ private fun ComposeBar(
      * Done transition lands ~1 RTT later).
      */
     awaitUploadTerminal: suspend (localKey: String) -> String?,
+    /**
+     * Set of `clientSendId`s that are currently held by the agent-busy
+     * gate ([SessionDetailStore.gateOnSessionIdle]). Drives whether the
+     * Force-flush button appears in the right-action row, and the
+     * compose row uses it to hint the user that the upcoming Send will
+     * land in the queue rather than fire immediately.
+     */
+    queuedCsids: Set<Long>,
+    /**
+     * Cancel the current agent turn and immediately unblock every
+     * waiting [gateOnSessionIdle] coroutine so the queued sends fire
+     * straight after.
+     */
+    onForceFlush: () -> Unit,
 ) {
     val context = LocalContext.current
     val composeScope = rememberCoroutineScope()
@@ -1629,9 +1677,16 @@ private fun ComposeBar(
     // message after the bubble appears. Better to refuse the press +
     // tell the user to remove / retry the failing attachment first.
     val anyUploadFailed = uploadStates.any { it is UploadManager.State.Failed }
-    val sendEnabled = enabled && !isRunning && !anyUploadFailed &&
+    // Send is now enabled regardless of session-running state — the
+    // store gates the actual wire dispatch via
+    // [SessionDetailStore.gateOnSessionIdle]. Pressing Send during a
+    // running turn appends an optimistic bubble with the "Queued"
+    // badge; the wire send fires once the turn settles or the user
+    // taps Force-flush.
+    val sendEnabled = enabled && !anyUploadFailed &&
         (draft.isNotBlank() || pickedAttachments.isNotEmpty())
     val showCancel = isRunning
+    val showForceFlush = isRunning && queuedCsids.isNotEmpty()
 
     Surface(
         tonalElevation = 3.dp,
@@ -1766,7 +1821,25 @@ private fun ComposeBar(
                         }
                     }
                 }
-                // Right-hand action — Cancel when running, Send otherwise.
+                // Right-hand action cluster. Send is always present;
+                // Cancel appears only while the agent is mid-turn;
+                // Force-flush appears only when there's a queued send
+                // AND the agent is still running (otherwise the queue
+                // would drain on its own once the turn settles).
+                if (showForceFlush) {
+                    FilledIconButton(
+                        onClick = onForceFlush,
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                        ),
+                    ) {
+                        Icon(
+                            Icons.Filled.Bolt,
+                            contentDescription = "Force-send queued",
+                        )
+                    }
+                }
                 if (showCancel) {
                     FilledIconButton(
                         onClick = onCancel,
@@ -1786,12 +1859,12 @@ private fun ComposeBar(
                             Icon(Icons.Filled.Clear, contentDescription = "Cancel turn")
                         }
                     }
-                } else {
-                    FilledIconButton(
-                        onClick = {
-                            val toSendText = draft.trim()
-                            val attachments = pickedAttachments
-                            if (toSendText.isEmpty() && attachments.isEmpty()) return@FilledIconButton
+                }
+                FilledIconButton(
+                    onClick = {
+                        val toSendText = draft.trim()
+                        val attachments = pickedAttachments
+                        if (toSendText.isEmpty() && attachments.isEmpty()) return@FilledIconButton
 
                             // Branch on whether every attachment is
                             // already Done. If so, fire the existing
@@ -1858,10 +1931,9 @@ private fun ComposeBar(
                                 pickedAttachments = emptyList()
                             }
                         },
-                        enabled = sendEnabled,
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
-                    }
+                    enabled = sendEnabled,
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                 }
             }
         }
