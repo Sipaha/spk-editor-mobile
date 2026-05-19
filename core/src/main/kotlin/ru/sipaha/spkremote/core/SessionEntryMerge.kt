@@ -1,6 +1,8 @@
 package ru.sipaha.spkremote.core
 
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
@@ -104,19 +106,56 @@ fun reconcileOptimisticContent(
 
 /**
  * Pure parser for the bounce-to-input recovery path. Returns
- * `(sessionId, content)` when [message] is a non-blank
- * `remote.solution_agent.send_message` queued message, or `null` when it
- * should be ignored.
+ * `(sessionId, content)` when [message] is a non-blank user-shaped
+ * queued message that survived a process restart and we can route its
+ * text back into the compose field, or `null` when the message should
+ * be silently dropped.
+ *
+ * Two methods are recognised:
+ *  - `remote.solution_agent.send_message` — the legacy text-only
+ *    path. `content` is the raw text payload.
+ *  - `remote.solution_agent.send_message_blocks` — the multi-block
+ *    path (post-R-6c-attach). We recover the FIRST text block's body
+ *    as the bounce content so the user gets their typed message back.
+ *    Image / file blocks can't be reconstructed without the original
+ *    URIs (which we never persisted), so they are dropped from the
+ *    bounce — V1 behaviour, acceptable given the queue TTL is 24 h
+ *    and the user is likely to re-attach if they cared.
  *
  * Extracted from `SessionDetailStore.handleExpiredMessage` so the JVM
  * test target can exercise it directly without instantiating a
  * `DraftRepository` (which depends on Android `SharedPreferences`).
  */
 fun parseExpiredSendMessage(message: QueuedMessage): Pair<String, String>? {
-    if (message.method != "remote.solution_agent.send_message") return null
     val params = (message.params as? JsonObject) ?: return null
     val sessionId = params["session_id"]?.jsonPrimitive?.content ?: return null
-    val content = params["content"]?.jsonPrimitive?.content ?: return null
-    if (content.isBlank()) return null
+    val content: String? = when (message.method) {
+        "remote.solution_agent.send_message" ->
+            params["content"]?.jsonPrimitive?.content
+        "remote.solution_agent.send_message_blocks" ->
+            extractFirstTextBlockBody(params["blocks"] as? JsonArray)
+        else -> return null
+    }
+    if (content.isNullOrBlank()) return null
     return sessionId to content
+}
+
+/**
+ * Pluck the body of the first `{"type": "text", "text": "..."}` entry
+ * from a `blocks` array. Returns null when [blocks] is null, empty, or
+ * contains only non-text variants. The discriminator is read from the
+ * `"type"` field (matches the ACP `#[serde(tag = "type")]` envelope —
+ * see [ContentBlockDto]).
+ */
+private fun extractFirstTextBlockBody(blocks: JsonArray?): String? {
+    if (blocks == null) return null
+    for (element in blocks) {
+        val obj = element as? JsonObject ?: continue
+        val type = obj["type"]?.jsonPrimitive?.content ?: continue
+        if (type == "text") {
+            val text = obj["text"]?.jsonPrimitive?.content
+            if (!text.isNullOrBlank()) return text
+        }
+    }
+    return null
 }

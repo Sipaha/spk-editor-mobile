@@ -307,6 +307,120 @@ class SessionEntryMergeTest {
         assertEquals("s2" to text, out)
     }
 
+    @Test
+    fun `parseExpiredSendMessage recovers the first text block of a blocks-bearing send`() {
+        // Construct what RemoteClient persisted for a sendMessageBlocks
+        // call — { session_id, blocks: [...] } where the blocks array
+        // mixes the user's typed text with an image attachment.
+        val blocksJson = kotlinx.serialization.json.buildJsonArray {
+            add(buildJsonObject {
+                put("type", "text")
+                put("text", "Hello with photo")
+            })
+            add(buildJsonObject {
+                put("type", "image")
+                put("data", "Zm9v")
+                put("mimeType", "image/png")
+            })
+        }
+        val msg = QueuedMessage(
+            id = "7",
+            method = "remote.solution_agent.send_message_blocks",
+            params = buildJsonObject {
+                put("session_id", "session-blocks")
+                put("blocks", blocksJson)
+            },
+            enqueuedAtMs = 0L,
+        )
+        val out = parseExpiredSendMessage(msg)
+        assertEquals("session-blocks" to "Hello with photo", out)
+    }
+
+    @Test
+    fun `parseExpiredSendMessage skips a blocks send with no text blocks`() {
+        val blocksJson = kotlinx.serialization.json.buildJsonArray {
+            add(buildJsonObject {
+                put("type", "image")
+                put("data", "Zm9v")
+                put("mimeType", "image/png")
+            })
+        }
+        val msg = QueuedMessage(
+            id = "8",
+            method = "remote.solution_agent.send_message_blocks",
+            params = buildJsonObject {
+                put("session_id", "session-blocks")
+                put("blocks", blocksJson)
+            },
+            enqueuedAtMs = 0L,
+        )
+        assertNull(parseExpiredSendMessage(msg))
+    }
+
+    @Test
+    fun `parseExpiredSendMessage skips a blocks send with missing blocks field`() {
+        val msg = QueuedMessage(
+            id = "9",
+            method = "remote.solution_agent.send_message_blocks",
+            params = buildJsonObject {
+                put("session_id", "session-blocks")
+            },
+            enqueuedAtMs = 0L,
+        )
+        assertNull(parseExpiredSendMessage(msg))
+    }
+
+    // -------------------------------------------------------------------------
+    // QueueStore round-trip for blocks-bearing payloads
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `InMemoryQueueStore round-trips a sendMessageBlocks payload alongside legacy text`() {
+        val store: QueueStore = InMemoryQueueStore()
+        val textPayload = QueuedMessage(
+            id = "qa",
+            method = "remote.solution_agent.send_message",
+            params = buildJsonObject {
+                put("session_id", "s1")
+                put("content", "plain")
+            },
+            enqueuedAtMs = 100L,
+        )
+        val blocksPayload = QueuedMessage(
+            id = "qb",
+            method = "remote.solution_agent.send_message_blocks",
+            params = buildJsonObject {
+                put("session_id", "s1")
+                put(
+                    "blocks",
+                    kotlinx.serialization.json.buildJsonArray {
+                        add(buildJsonObject {
+                            put("type", "text")
+                            put("text", "with image")
+                        })
+                        add(buildJsonObject {
+                            put("type", "image")
+                            put("data", "Zm9v")
+                            put("mimeType", "image/jpeg")
+                        })
+                    },
+                )
+            },
+            enqueuedAtMs = 200L,
+        )
+        store.add(textPayload)
+        store.add(blocksPayload)
+        val loaded = store.loadAll()
+        // FIFO order preserved across the two payload shapes.
+        assertEquals(listOf("qa", "qb"), loaded.map { it.id })
+        // Blocks payload survives the round-trip with its params intact —
+        // the queue layer treats params as opaque so it doesn't matter that
+        // the second message uses a fundamentally different shape than the
+        // first. This is the property that lets EncryptedQueueStore persist
+        // both methods without a schema bump.
+        assertEquals(blocksPayload, loaded[1])
+    }
+
     // Reference unused JsonObject import so it isn't pruned by IDE.
     @Suppress("unused")
     private val _ref: JsonObject = buildJsonObject {}
