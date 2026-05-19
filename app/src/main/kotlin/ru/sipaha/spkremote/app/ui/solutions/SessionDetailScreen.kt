@@ -420,23 +420,17 @@ private fun ChatList(
                 }
                 // R-6e: history-edge affordance. Sits at the LOGICAL TOP
                 // of the visible list (= last item in the reverse-layout
-                // LazyColumn). Three states:
+                // LazyColumn). Two states:
                 //   - hasOlder && isLoadingOlder: spinner row.
                 //   - hasOlder && !isLoadingOlder: "Load older" tappable.
                 //     The scroll trigger usually fires this automatically,
                 //     but the explicit tap gives the user a way to recover
                 //     if the trigger missed (e.g. fling stopped just shy
                 //     of the trigger window).
-                //   - !hasOlder: a quiet "—" separator so the user has a
-                //     visual confirmation they're at the start of the
-                //     transcript. Skipped when totalCount is the -1
-                //     sentinel (pre-R-6e server) because we can't tell.
                 item("history-edge") {
                     HistoryEdgeRow(
                         isLoadingOlder = isLoadingOlder,
                         hasOlder = hasOlder,
-                        oldestIndexKnown = oldestLoadedIndex >= 0,
-                        totalKnown = server.totalCount >= 0,
                         onTap = onRequestOlder,
                     )
                 }
@@ -1158,24 +1152,14 @@ private fun ComposeBar(
 
 /**
  * History-edge affordance rendered at the logical top of the chat list
- * (= LazyColumn's last item, with `reverseLayout = true`).
- *
- * Three states, narrowest first:
- *   - `isLoadingOlder` → small inline spinner + "Loading older messages..."
- *   - `hasOlder` (idle) → "Load older messages" tap target (the auto-
- *     scroll-trigger fires this most of the time; the explicit tap is
- *     the recovery hatch when the trigger misses).
- *   - Else (`hasOlder == false`) → quiet "—" separator iff we know we're
- *     genuinely at the start (`oldestIndexKnown` AND `totalKnown` are
- *     true). Suppresses entirely on pre-R-6e servers where neither is
- *     known so we don't lie about reaching the start.
+ * (= LazyColumn's last item, with `reverseLayout = true`). Absence of
+ * the "Load older messages" tap target already conveys "you're at the
+ * start" — no separate sentinel is rendered for the start of history.
  */
 @Composable
 private fun HistoryEdgeRow(
     isLoadingOlder: Boolean,
     hasOlder: Boolean,
-    oldestIndexKnown: Boolean,
-    totalKnown: Boolean,
     onTap: () -> Unit,
 ) {
     when {
@@ -1209,23 +1193,6 @@ private fun HistoryEdgeRow(
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary,
             )
-        }
-        oldestIndexKnown && totalKnown -> Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 8.dp),
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            Text(
-                text = "—",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        else -> {
-            // Pre-R-6e server (no pagination metadata) — render nothing
-            // to avoid asserting "start of conversation" when we can't
-            // actually tell.
         }
     }
 }
