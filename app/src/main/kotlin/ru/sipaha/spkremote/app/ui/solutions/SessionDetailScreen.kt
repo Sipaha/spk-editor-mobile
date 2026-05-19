@@ -42,6 +42,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -111,9 +112,14 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.mikepenz.markdown.m3.Markdown
@@ -850,6 +856,20 @@ private fun ChatBubble(
 
 @Composable
 private fun UserBubble(entry: EntrySummary, status: UserBubbleStatus = UserBubbleStatus.None) {
+    val rawText = stripRoleHeading(entry.markdown ?: entry.preview)
+    val images = entry.images.orEmpty()
+    var fullscreen by remember(entry.index) { mutableStateOf<EntryImage?>(null) }
+    // Decode images once per entry so the [Image #N] tap target opens
+    // the same Painter the assistant-side preview would. Cheap enough
+    // to do up-front (the user's own attachments are bounded by the
+    // 5 MB cap and the mobile picker enforces a small count).
+    val decodedImages: Map<Int, Painter> = remember(images) {
+        images.associate { it.index to bitmapPainterFromBase64(it.dataBase64) }
+    }
+    val linkColor = MaterialTheme.colorScheme.onPrimary
+    val annotated = remember(rawText, linkColor) {
+        buildUserBubbleAnnotatedText(rawText, linkColor)
+    }
     Row(
         // start = 48 dp gives the right-aligned user bubble a clear left
         // gutter so even when it grows to its widthIn max the gradient of
@@ -876,24 +896,103 @@ private fun UserBubble(entry: EntrySummary, status: UserBubbleStatus = UserBubbl
                 // Users overwhelmingly send plain text — but accept markdown when
                 // the server returns it (e.g. a paste from a markdown source).
                 // The pinned light-on-primary palette would clobber inline-code
-                // colours, so for user bubbles we never run the markdown
-                // renderer (stays as legible plain Text). Strip the upstream
-                // `## User` header so bubbles don't echo what alignment+color
-                // already encode.
+                // colours, so for user bubbles we never run the full markdown
+                // renderer. What we DO rewrite are the desktop-style
+                // `[image #N]` placeholders the server emits for image
+                // chunks — they become clickable spans that open the
+                // image in a fullscreen Dialog, matching the desktop's
+                // `clean_user_message_text` → `on_url_click` flow.
                 //
                 // SelectionContainer enables long-press text selection + the
                 // system Copy/Share toolbar without us shipping our own context
                 // menu. Scoped per-bubble so handles stay inside the bubble's
                 // visual bounds; cross-bubble selection isn't a common UX.
                 SelectionContainer {
-                    Text(
-                        text = stripRoleHeading(entry.markdown ?: entry.preview),
-                        style = MaterialTheme.typography.bodyMedium,
+                    ClickableText(
+                        text = annotated,
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        ),
+                        onClick = { offset ->
+                            val tag = annotated
+                                .getStringAnnotations(IMAGE_LINK_TAG, offset, offset)
+                                .firstOrNull()
+                                ?: return@ClickableText
+                            val idx = tag.item.toIntOrNull() ?: return@ClickableText
+                            // Map nth occurrence to nth EntryImage. The
+                            // server emits image content blocks in the
+                            // same order as the `[image #N]` placeholders
+                            // in markdown, so position-based lookup
+                            // matches the desktop's `spk-image://idx`
+                            // rewrite exactly.
+                            val target = images.getOrNull(idx) ?: return@ClickableText
+                            fullscreen = target
+                        },
                     )
                 }
                 UserBubbleStatusRow(status = status)
             }
         }
+    }
+    val tapped = fullscreen
+    if (tapped != null) {
+        Dialog(onDismissRequest = { fullscreen = null }) {
+            Surface(
+                color = Color.Black,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 600.dp)
+                    .clickable { fullscreen = null },
+            ) {
+                val painter = decodedImages[tapped.index]
+                if (painter != null) {
+                    androidx.compose.foundation.Image(
+                        painter = painter,
+                        contentDescription = "Full-screen image",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+private const val IMAGE_LINK_TAG = "spk-image"
+private val IMAGE_PLACEHOLDER_REGEX = Regex("""\[image #(\d+)]""", RegexOption.IGNORE_CASE)
+
+/**
+ * Convert `[image #N]` placeholders in a user-message text into an
+ * [AnnotatedString] with each placeholder annotated as a clickable
+ * span. The annotation value is the OCCURRENCE index (0-based) within
+ * the text, not the placeholder number N — the latter is a session-
+ * monotonic counter (e.g. third pasted image in the session shows
+ * `image #3`) and would mis-index a message that only carries one
+ * image. Mirrors the desktop's `clean_user_message_text` rewrite of
+ * `[image #N]` → `[image #N](spk-image://<occurrence_idx>)`.
+ */
+private fun buildUserBubbleAnnotatedText(
+    text: String,
+    linkColor: Color,
+): AnnotatedString = buildAnnotatedString {
+    var cursor = 0
+    var occurrence = 0
+    val linkStyle = SpanStyle(
+        color = linkColor,
+        textDecoration = TextDecoration.Underline,
+    )
+    for (match in IMAGE_PLACEHOLDER_REGEX.findAll(text)) {
+        if (match.range.first > cursor) {
+            append(text.substring(cursor, match.range.first))
+        }
+        pushStringAnnotation(tag = IMAGE_LINK_TAG, annotation = occurrence.toString())
+        withStyle(linkStyle) { append(match.value) }
+        pop()
+        cursor = match.range.last + 1
+        occurrence += 1
+    }
+    if (cursor < text.length) {
+        append(text.substring(cursor))
     }
 }
 
