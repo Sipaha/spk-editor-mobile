@@ -867,8 +867,8 @@ private fun UserBubble(entry: EntrySummary, status: UserBubbleStatus = UserBubbl
         images.associate { it.index to bitmapPainterFromBase64(it.dataBase64) }
     }
     val linkColor = MaterialTheme.colorScheme.onPrimary
-    val annotated = remember(rawText, linkColor) {
-        buildUserBubbleAnnotatedText(rawText, linkColor)
+    val annotated = remember(rawText, images, linkColor) {
+        buildUserBubbleAnnotatedText(rawText, images.size, linkColor)
     }
     Row(
         // start = 48 dp gives the right-aligned user bubble a clear left
@@ -962,37 +962,48 @@ private const val IMAGE_LINK_TAG = "spk-image"
 private val IMAGE_PLACEHOLDER_REGEX = Regex("""\[image #(\d+)]""", RegexOption.IGNORE_CASE)
 
 /**
- * Convert `[image #N]` placeholders in a user-message text into an
- * [AnnotatedString] with each placeholder annotated as a clickable
- * span. The annotation value is the OCCURRENCE index (0-based) within
- * the text, not the placeholder number N — the latter is a session-
- * monotonic counter (e.g. third pasted image in the session shows
- * `image #3`) and would mis-index a message that only carries one
- * image. Mirrors the desktop's `clean_user_message_text` rewrite of
- * `[image #N]` → `[image #N](spk-image://<occurrence_idx>)`.
+ * Build the user-bubble body as an [AnnotatedString]:
+ *
+ *   1. Strip every inline `[image #N]` placeholder from the source
+ *      text — the desktop renders them in-place, but the mobile
+ *      bubble surfaces image links at the END of the message so the
+ *      user-typed body stays clean and the affordances cluster
+ *      together at the bottom.
+ *   2. Append one clickable, underlined `[image #N]` link per
+ *      attachment in `entry.images`, in source order, separated by
+ *      single spaces, after a blank-line separator from the body.
+ *      The annotation value is the occurrence index so the tap
+ *      handler can look up `entry.images[idx]` directly.
+ *
+ * `N` in the rendered label is the 1-based occurrence number, not
+ * the server-side session-monotonic counter the desktop uses —
+ * mobile doesn't have the session counter to hand, and the simpler
+ * 1..N labelling is what a fresh user expects for "two attachments
+ * shown as `[image #1] [image #2]`".
  */
 private fun buildUserBubbleAnnotatedText(
     text: String,
+    imageCount: Int,
     linkColor: Color,
 ): AnnotatedString = buildAnnotatedString {
-    var cursor = 0
-    var occurrence = 0
     val linkStyle = SpanStyle(
         color = linkColor,
         textDecoration = TextDecoration.Underline,
     )
-    for (match in IMAGE_PLACEHOLDER_REGEX.findAll(text)) {
-        if (match.range.first > cursor) {
-            append(text.substring(cursor, match.range.first))
-        }
-        pushStringAnnotation(tag = IMAGE_LINK_TAG, annotation = occurrence.toString())
-        withStyle(linkStyle) { append(match.value) }
-        pop()
-        cursor = match.range.last + 1
-        occurrence += 1
+    val stripped = IMAGE_PLACEHOLDER_REGEX.replace(text, "").trim()
+    if (stripped.isNotEmpty()) {
+        append(stripped)
     }
-    if (cursor < text.length) {
-        append(text.substring(cursor))
+    if (imageCount > 0) {
+        if (stripped.isNotEmpty()) {
+            append("\n\n")
+        }
+        for (idx in 0 until imageCount) {
+            if (idx > 0) append(" ")
+            pushStringAnnotation(tag = IMAGE_LINK_TAG, annotation = idx.toString())
+            withStyle(linkStyle) { append("[image #${idx + 1}]") }
+            pop()
+        }
     }
 }
 
