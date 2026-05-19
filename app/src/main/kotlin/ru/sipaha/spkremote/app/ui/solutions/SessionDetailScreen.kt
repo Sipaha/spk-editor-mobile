@@ -564,18 +564,32 @@ private fun ChatList(
     val scope = rememberCoroutineScope()
 
     // Auto-scroll behaviour: with reverseLayout = true, item 0 is the
-    // newest entry visually pinned to the bottom. So "user is at bottom"
-    // = first visible item index 0 AND scroll offset 0.
+    // newest entry visually pinned to the bottom of the viewport.
+    // `atBottom` is used by the "jump to bottom" FAB — strict index 0
+    // + offset 0 = the viewport is showing the newest entry flush at
+    // the bottom edge.
     val atBottom by remember {
         derivedStateOf {
             lazyState.firstVisibleItemIndex == 0 && lazyState.firstVisibleItemScrollOffset == 0
         }
     }
-    // When the entries grow and the user is already pinned to the bottom,
-    // animate to keep them there. `combined.size` as the key — both
-    // server-side growth and a new optimistic bubble bump it.
+    // Auto-scroll on growth. Subtle: when a new entry lands, the
+    // LazyColumn (reverseLayout = true) keeps the PREVIOUS bottom
+    // pinned visually, so the user's `firstVisibleItemIndex` bumps
+    // from 0 to 1 and the strict `atBottom` check above would
+    // immediately read false — the entry that just arrived would
+    // sit one item below the visible region with no auto-scroll.
+    // Threshold `<= 1` captures the post-grow "previous bottom shifted
+    // up by one" state and still considers the user pinned. We also
+    // suppress while [isScrollInProgress] so a user mid-drag to read
+    // history doesn't get yanked back by a freshly-arrived turn.
+    val isScrolling by remember {
+        derivedStateOf { lazyState.isScrollInProgress }
+    }
     LaunchedEffect(combined.size) {
-        if (combined.isNotEmpty() && atBottom) {
+        if (combined.isEmpty()) return@LaunchedEffect
+        if (isScrolling) return@LaunchedEffect
+        if (lazyState.firstVisibleItemIndex <= 1) {
             lazyState.animateScrollToItem(0)
         }
     }
