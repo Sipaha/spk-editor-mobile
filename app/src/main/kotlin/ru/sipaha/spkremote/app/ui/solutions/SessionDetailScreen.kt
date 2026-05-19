@@ -182,6 +182,7 @@ fun SessionDetailScreen(
     val sessionState by viewModel.session.collectAsState()
     val optimistic by viewModel.optimisticEntries.collectAsState()
     val pendingUploads by viewModel.pendingUploadProgress.collectAsState()
+    val serverQueuedBundles by viewModel.serverQueuedBundles.collectAsState()
     val cancelInFlight by viewModel.cancelInFlight.collectAsState()
     val isLoadingOlder by viewModel.isLoadingOlder.collectAsState()
     val childrenMap by viewModel.sessionChildren.collectAsState()
@@ -418,7 +419,8 @@ fun SessionDetailScreen(
                     onCancelUpload = viewModel::cancelAttachmentUpload,
                     onForgetUpload = viewModel::forgetAttachmentUpload,
                     awaitUploadTerminal = viewModel::awaitAttachmentUploadTerminal,
-                    hasOptimisticSends = optimistic.isNotEmpty(),
+                    hasOptimisticSends = optimistic.isNotEmpty() ||
+                        serverQueuedBundles.isNotEmpty(),
                     onForceFlush = viewModel::forceFlushQueue,
                 )
             }
@@ -444,6 +446,7 @@ fun SessionDetailScreen(
                     server = s.value,
                     optimistic = optimistic,
                     pendingUploads = pendingUploads,
+                    serverQueuedBundles = serverQueuedBundles,
                     sessionDisplayState = displayState,
                     isLoadingOlder = isLoadingOlder,
                     onRequestOlder = { viewModel.loadOlder(sessionId) },
@@ -547,11 +550,33 @@ private fun ChatList(
     server: GetSessionResult,
     optimistic: List<EntrySummary>,
     pendingUploads: Map<Long, PendingUploadProgress>,
+    serverQueuedBundles: List<ru.sipaha.spkremote.core.QueuedBundleSummary>,
     sessionDisplayState: DisplayState,
     isLoadingOlder: Boolean,
     onRequestOlder: () -> Unit,
 ) {
-    val combined: List<EntrySummary> = server.entries + optimistic
+    // Server-side `pending_messages` flattened into synthetic
+    // EntrySummary rows so they slot into the same LazyColumn pass as
+    // server entries + local optimistic. `clientSendId = csids.first`
+    // when present so the LazyColumn key stays stable across
+    // broadcasts of the same bundle; null csid (desktop-typed
+    // bundle) falls back to the role+preview hash key. The bubble
+    // status row picks them up via [serverQueueIdentitySet] below.
+    val syntheticQueueEntries: List<EntrySummary> = remember(serverQueuedBundles) {
+        serverQueuedBundles.map { bundle ->
+            EntrySummary(
+                role = "user",
+                preview = bundle.preview,
+                clientSendId = bundle.csids.firstOrNull(),
+            )
+        }
+    }
+    val serverQueueIdentitySet = remember(syntheticQueueEntries) {
+        java.util.IdentityHashMap<EntrySummary, Unit>().also { map ->
+            for (e in syntheticQueueEntries) map[e] = Unit
+        }
+    }
+    val combined: List<EntrySummary> = server.entries + optimistic + syntheticQueueEntries
     // Identity of every optimistic entry is referential — they are the
     // same objects the store published — so we can use `===` to flip
     // the per-bubble status icon without touching server entries.
@@ -679,6 +704,7 @@ private fun ChatList(
                     val status = userBubbleStatusFor(
                         entry = entry,
                         isOptimistic = entry in optimisticIdentitySet,
+                        isServerQueued = entry in serverQueueIdentitySet,
                         pendingUploads = pendingUploads,
                         sessionDisplayState = sessionDisplayState,
                     )
@@ -764,10 +790,16 @@ internal sealed class UserBubbleStatus {
 private fun userBubbleStatusFor(
     entry: EntrySummary,
     isOptimistic: Boolean,
+    isServerQueued: Boolean,
     pendingUploads: Map<Long, PendingUploadProgress>,
     sessionDisplayState: DisplayState,
 ): UserBubbleStatus {
     if (entry.role != "user") return UserBubbleStatus.None
+    // Server-broadcast queue bundle: ALWAYS Queued regardless of
+    // local optimistic state or session display state. The server
+    // is the source of truth — if the bundle is still in
+    // `pending_messages`, the agent hasn't flushed it yet.
+    if (isServerQueued) return UserBubbleStatus.Queued
     val csid = entry.clientSendId
     if (isOptimistic) {
         if (csid != null) {

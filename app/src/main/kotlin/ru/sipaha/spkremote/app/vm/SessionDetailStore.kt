@@ -26,6 +26,8 @@ import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.ContentBlockDto
 import ru.sipaha.spkremote.core.EntrySummary
+import ru.sipaha.spkremote.core.QueuedBundleSummary
+import ru.sipaha.spkremote.core.SessionQueueChangedPayload
 import ru.sipaha.spkremote.core.JsonRpc
 import ru.sipaha.spkremote.core.GetSessionResult
 import ru.sipaha.spkremote.core.MergeOutcome
@@ -256,6 +258,24 @@ internal class SessionDetailStore(
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
 
+    /**
+     * Server-broadcast `pending_messages` view for the open session.
+     * One [QueuedBundleSummary] per bundle the server is holding while
+     * the agent finishes its current turn. Mobile renders each as a
+     * Queued bubble alongside the regular transcript — single
+     * mechanism whether the queued bundle was enqueued from this
+     * device, from a paired desktop, or from another mobile.
+     *
+     * Live updates ride the `agent_session_queue_changed`
+     * notification; cold-start seed comes from
+     * `GetSessionResult.pendingBundles`. Cleared on
+     * [closeSession] / session switch so a stale broadcast from the
+     * previous session can't leak into the new one.
+     */
+    private val _serverQueuedBundles = MutableStateFlow<List<QueuedBundleSummary>>(emptyList())
+    val serverQueuedBundles: StateFlow<List<QueuedBundleSummary>> =
+        _serverQueuedBundles.asStateFlow()
+
 
     /**
      * One-shot signal emitted after a successful Reset context. Carries the
@@ -343,6 +363,10 @@ internal class SessionDetailStore(
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
                 optimisticClientSendIds.clear()
+                // Drop the previous session's server-queue view; the
+                // next fetchInitialOrDiff seeds from the new
+                // session's `pendingBundles`.
+                _serverQueuedBundles.value = emptyList()
                 lastSeen.primeFromDisk(sessionId)
                 // Re-materialise optimistic state for every deferred
                 // send whose waiter coroutine is still alive for THIS
@@ -411,6 +435,7 @@ internal class SessionDetailStore(
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
                 optimisticClientSendIds.clear()
+                _serverQueuedBundles.value = emptyList()
             }
         }
     }
@@ -473,6 +498,48 @@ internal class SessionDetailStore(
         val openSid = openSessionId ?: return
         if (notifSessionId != null && notifSessionId != openSid) return
         refreshSession(openSid)
+    }
+
+    override fun onSessionQueueChanged(payload: SessionQueueChangedPayload) {
+        val openSid = openSessionId ?: return
+        if (payload.sessionId != openSid) return
+        scope.launch {
+            sessionMutex.withLock {
+                if (openSessionId != payload.sessionId) return@withLock
+                _serverQueuedBundles.value = payload.bundles
+                // Every csid that landed in a server-broadcast bundle
+                // is no longer a "client-only optimistic" — drop the
+                // matching local bubble so the server's bundle takes
+                // over the visual slot, matching the desktop's single-
+                // ghost-bubble UX even when the bundle absorbed multiple
+                // originating sends.
+                val csidsFromBundles: Set<Long> =
+                    payload.bundles.flatMap { it.csids }.toHashSet()
+                if (csidsFromBundles.isNotEmpty()) {
+                    val current = _optimisticEntries.value
+                    val filtered = current.filter { entry ->
+                        entry.clientSendId !in csidsFromBundles
+                    }
+                    if (filtered.size != current.size) {
+                        _optimisticEntries.value = filtered
+                        // Mirror the in-list shrink onto the parallel
+                        // bookkeeping arrays so a future
+                        // `reconcileOptimisticLocked` sees consistent
+                        // state. iterate by index since we want the
+                        // SAME positions we just dropped.
+                        val keptIndices: List<Int> = current.indices.filter {
+                            current[it].clientSendId !in csidsFromBundles
+                        }
+                        val keptIds = keptIndices.mapNotNull { optimisticIds.getOrNull(it) }
+                        val keptCsids = keptIndices.mapNotNull { optimisticClientSendIds.getOrNull(it) }
+                        optimisticIds.clear()
+                        optimisticIds.addAll(keptIds)
+                        optimisticClientSendIds.clear()
+                        optimisticClientSendIds.addAll(keptCsids)
+                    }
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -550,6 +617,7 @@ internal class SessionDetailStore(
             // stale-write barrier (see class kdoc invariant 1)
             if (openSessionId != sessionId) return@withLock
             _session.value = UiData.Loaded(result)
+            _serverQueuedBundles.value = result.pendingBundles
             reconcileOptimisticLocked(result.entries)
         }
         persistCache(sessionId, result, result.entries, result.totalCount)
@@ -635,6 +703,7 @@ internal class SessionDetailStore(
             if (openSessionId != sessionId) return@withLock
             val result = fetched.copy(entries = entries, totalCount = newTotalCount)
             _session.value = UiData.Loaded(result)
+            _serverQueuedBundles.value = fetched.pendingBundles
             _isLoadingOlder.value = false
             reconcileOptimisticLocked(entries)
             entries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
@@ -655,6 +724,7 @@ internal class SessionDetailStore(
             if (openSessionId != sessionId) return@withLock
             val result = fetched.copy(entries = mergedEntries, totalCount = newTotalCount)
             _session.value = UiData.Loaded(result)
+            _serverQueuedBundles.value = fetched.pendingBundles
             _isLoadingOlder.value = false
             reconcileOptimisticLocked(mergedEntries)
             mergedEntries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
@@ -837,6 +907,7 @@ internal class SessionDetailStore(
                 outcome
                     .onSuccess { result ->
                         _session.value = UiData.Loaded(result)
+                        _serverQueuedBundles.value = result.pendingBundles
                         reconcileOptimisticLocked(result.entries)
                         snapshotForCache = result
                     }

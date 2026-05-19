@@ -21,6 +21,7 @@ import ru.sipaha.spkremote.core.ListSessionsResult
 import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.SessionCreatedPayload
+import ru.sipaha.spkremote.core.SessionQueueChangedPayload
 import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.UploadChunkAckedPayload
 
@@ -213,6 +214,7 @@ internal class SessionListStore(
                             "agent_session_closed",
                             "agent_session_title_changed",
                             "agent_session_message_appended",
+                            "agent_session_queue_changed",
                             // Chunked-upload acks share this collector — server
                             // forwards them through the same notification path
                             // (allow_list pattern `upload_*`). Subscribing
@@ -335,6 +337,17 @@ internal class SessionListStore(
             "agent_session_title_changed" -> {
                 val notifSessionId = data?.get("session_id")?.jsonPrimitive?.content
                 router.onSessionStateOrTitleChanged(notifSessionId)
+            }
+            "agent_session_queue_changed" -> {
+                val payload = data?.let {
+                    runCatching {
+                        JsonRpc.json.decodeFromJsonElement(
+                            SessionQueueChangedPayload.serializer(),
+                            it,
+                        )
+                    }.getOrNull()
+                } ?: return
+                router.onSessionQueueChanged(payload)
             }
         }
     }
@@ -559,4 +572,12 @@ internal interface DetailNotificationRouter {
 
     /** A session-state or title-change notification. [notifSessionId] is null when the payload didn't carry one. */
     fun onSessionStateOrTitleChanged(notifSessionId: String?)
+
+    /**
+     * The server-side `pending_messages` queue mutated. Carries every
+     * bundle currently waiting for the agent turn to finish — drives
+     * the cross-client Queued bubble surface in the detail screen.
+     * `bundles: []` is the canonical "queue drained" payload.
+     */
+    fun onSessionQueueChanged(payload: SessionQueueChangedPayload)
 }

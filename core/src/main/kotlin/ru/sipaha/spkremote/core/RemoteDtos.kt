@@ -288,6 +288,52 @@ data class GetSessionEntryResult(val entry: EntrySummary)
  * full entry via `remote.solution_agent.get_session_entry { index }`
  * rather than re-polling the entire transcript on every append.
  */
+/**
+ * One queued-message descriptor from the server's `pending_messages`.
+ * Mirrors `mcp::QueuedBundleSummary` on the desktop side. Mobile
+ * surfaces each as a Queued bubble in the chat list, on equal
+ * footing whether the bundle was enqueued from a paired desktop or
+ * from another mobile — single mechanism for "what's waiting for
+ * the agent's current turn to finish".
+ */
+@Serializable
+data class QueuedBundleSummary(
+    /**
+     * Every `spk_client_send_id` carried by the bundle. Mobile pops
+     * its own local optimistic bubbles whose csid lands in this set,
+     * so the bundle replaces them visually with a single Queued
+     * bubble (matching the desktop's "single ghost bubble that
+     * grows" UX for merged sends). Empty for desktop-typed bundles
+     * (no client-stamped csid).
+     */
+    val csids: List<Long> = emptyList(),
+    /**
+     * Markdown rendering of the bundle's content (queue marker
+     * stripped, `[image #N]` placeholders left in-place).
+     */
+    val preview: String,
+    /**
+     * Image-block count inside the bundle — drives the
+     * `[image #N]` link affordance on the Queued bubble without
+     * needing to ship the actual image bytes on this wire.
+     */
+    @SerialName("image_count") val imageCount: Int = 0,
+)
+
+/**
+ * Decoded `params.payload` of an `agent_session_queue_changed`
+ * notification. Server emits one of these every time
+ * `SolutionSession::pending_messages` mutates (push, merge into
+ * back, drain on flush, clear on cancel) so every paired client
+ * keeps a live view of the unified server-side queue. `bundles: []`
+ * is the canonical "queue is empty" payload.
+ */
+@Serializable
+data class SessionQueueChangedPayload(
+    @SerialName("session_id") val sessionId: String,
+    val bundles: List<QueuedBundleSummary> = emptyList(),
+)
+
 @Serializable
 data class MessageAppendedPayload(
     @SerialName("session_id") val sessionId: String,
@@ -410,6 +456,15 @@ data class GetSessionResult(
      * loaded" rather than fall through to a misleading gap-detect.
      */
     @SerialName("total_count") val totalCount: Int = -1,
+    /**
+     * Cold-start seed for the server-side `pending_messages` queue.
+     * Each bundle is one Queued bubble in the chat list. Live updates
+     * arrive via the `agent_session_queue_changed` notification —
+     * this field is just what the queue looked like at the moment
+     * `get_session` resolved. Empty for sessions with nothing
+     * pending or pre-R6i server builds.
+     */
+    @SerialName("pending_bundles") val pendingBundles: List<QueuedBundleSummary> = emptyList(),
 )
 
 enum class DisplayState { Idle, Running, AwaitingInput, Errored, Unknown }
