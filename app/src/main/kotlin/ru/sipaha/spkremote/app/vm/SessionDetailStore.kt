@@ -2,8 +2,11 @@ package ru.sipaha.spkremote.app.vm
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -19,6 +22,8 @@ import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.QueueTtlException
 import ru.sipaha.spkremote.core.QueuedMessage
 import ru.sipaha.spkremote.core.RemoteClient
+import ru.sipaha.spkremote.core.RestartAgentResult
+import ru.sipaha.spkremote.core.StartCompactResult
 import ru.sipaha.spkremote.core.applyAppendedPlaceholder
 import ru.sipaha.spkremote.core.parseExpiredSendMessage
 import ru.sipaha.spkremote.core.reconcileOptimisticContent
@@ -84,6 +89,17 @@ internal class SessionDetailStore(
 
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
+
+    /**
+     * One-shot signal emitted after a successful Reset context. Carries the
+     * new session id the server minted; the UI collector hops navigation
+     * onto the fresh session so the open chat surface stops pointing at
+     * the now-closed source session. Replay = 0 (a missed emission while
+     * the screen is gone is fine — the user picks up the new session via
+     * the list).
+     */
+    private val _resetSwitch = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    val resetSwitch: SharedFlow<String> = _resetSwitch.asSharedFlow()
 
     @Volatile
     var openSessionId: String? = null
@@ -543,6 +559,56 @@ internal class SessionDetailStore(
                 }
                 .onFailure { context.emitError("cancel failed: ${it.message ?: "?"}") }
             _cancelInFlight.value = false
+        }
+    }
+
+    /**
+     * Reset the agent backing the currently-open session — drops the
+     * pooled subprocess, closes the source session, and opens a fresh
+     * one against the same `(solution, agent)` pair. The new session id
+     * comes back on the RPC result; we emit it via [resetSwitch] so the
+     * chat surface can navigate to the freshly-minted session (the
+     * current screen's `DisposableEffect` would otherwise re-open the
+     * closed source id on next composition).
+     */
+    fun resetContext() {
+        val active = context.activeClient() ?: return
+        val sessionId = openSessionId ?: return
+        val params = buildJsonObject { put("session_id", sessionId) }
+        scope.launch {
+            runCatching { active.call("remote.solution_agent.restart_agent", params) }
+                .mapCatching { resp -> resp.decodeResultOrThrow(RestartAgentResult.serializer()) }
+                .onSuccess { _resetSwitch.tryEmit(it.sessionId) }
+                .onFailure { context.emitError("Reset failed: ${it.message ?: "?"}") }
+        }
+    }
+
+    /**
+     * Kick off the Compact context workflow on the currently-open
+     * session. The server returns immediately with a [queued][StartCompactResult.queued]
+     * flag — `false` means a precondition wasn't met (session busy /
+     * context below 20% / cold session / not enough headroom); the
+     * accompanying message surfaces via the shared error channel so the
+     * snackbar tells the user why. On `queued = true` no immediate UI
+     * swap happens: the agent picks up the compact prompt on its next
+     * turn and the resulting new session lands via the standard
+     * `agent_session_created` notification path.
+     */
+    fun compactContext() {
+        val active = context.activeClient() ?: return
+        val sessionId = openSessionId ?: return
+        val params = buildJsonObject { put("session_id", sessionId) }
+        scope.launch {
+            runCatching { active.call("remote.solution_agent.start_compact", params) }
+                .mapCatching { resp -> resp.decodeResultOrThrow(StartCompactResult.serializer()) }
+                .onSuccess { outcome ->
+                    if (!outcome.queued) {
+                        val reason = outcome.message?.takeIf { it.isNotBlank() }
+                            ?: "Compact declined"
+                        context.emitError(reason)
+                    }
+                }
+                .onFailure { context.emitError("Compact failed: ${it.message ?: "?"}") }
         }
     }
 

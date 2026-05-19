@@ -36,12 +36,15 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FloatingActionButton
@@ -55,6 +58,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -149,6 +153,13 @@ fun SessionDetailScreen(
         viewModel.sendError.collect { msg -> snackbarHostState.showSnackbar(msg) }
     }
 
+    // Reset context produces a new session id server-side; hop the open
+    // chat surface onto it so DisposableEffect's restart doesn't reopen
+    // the closed source session on next composition.
+    LaunchedEffect(Unit) {
+        viewModel.resetSwitch.collect { newSessionId -> onOpenSibling(newSessionId) }
+    }
+
     // R-6d: bounce-to-input recovery. If a previous queueCall expired
     // (TTL hit / process kill while offline / terminal RPC failure), the
     // ViewModel stashed the text on DraftRepository's bounced channel.
@@ -214,6 +225,9 @@ fun SessionDetailScreen(
     val showChipRow = parentId != null || children.isNotEmpty()
 
     var showRenameDialog by rememberSaveable { mutableStateOf(false) }
+    var showOverflowMenu by remember { mutableStateOf(false) }
+    var showResetConfirm by rememberSaveable { mutableStateOf(false) }
+    var showCompactConfirm by rememberSaveable { mutableStateOf(false) }
     Scaffold(
         topBar = {
             SlimTopBar(
@@ -223,6 +237,41 @@ fun SessionDetailScreen(
                 trailing = {
                     if (sessionState is UiData.Loaded) {
                         StatePill(state = displayState, raw = rawState)
+                        // Overflow menu — Reset / Compact context. The
+                        // anchor's `Box` wrapping is what lets DropdownMenu
+                        // compute its caret position; placing the menu
+                        // inside the IconButton's lambda would re-anchor
+                        // on every recomposition and flicker.
+                        Box {
+                            IconButton(
+                                onClick = { showOverflowMenu = true },
+                                modifier = Modifier.size(40.dp),
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.MoreVert,
+                                    contentDescription = "Session actions",
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = showOverflowMenu,
+                                onDismissRequest = { showOverflowMenu = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Reset context") },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        showResetConfirm = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Compact context") },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        showCompactConfirm = true
+                                    },
+                                )
+                            }
+                        }
                     }
                 },
             )
@@ -297,6 +346,53 @@ fun SessionDetailScreen(
             },
         )
     }
+
+    if (showResetConfirm) {
+        ConfirmActionDialog(
+            title = "Reset context",
+            body = "Reset will start a fresh session and discard the conversation. Continue?",
+            confirmLabel = "Reset",
+            onDismiss = { showResetConfirm = false },
+            onConfirm = {
+                showResetConfirm = false
+                viewModel.resetContextOnActiveSession()
+            },
+        )
+    }
+
+    if (showCompactConfirm) {
+        ConfirmActionDialog(
+            title = "Compact context",
+            body = "Compact will summarise the current context into a fresh session. Continue?",
+            confirmLabel = "Compact",
+            onDismiss = { showCompactConfirm = false },
+            onConfirm = {
+                showCompactConfirm = false
+                viewModel.compactContextOnActiveSession()
+            },
+        )
+    }
+}
+
+@Composable
+private fun ConfirmActionDialog(
+    title: String,
+    body: String,
+    confirmLabel: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text(confirmLabel) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable

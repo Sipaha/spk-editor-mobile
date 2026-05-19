@@ -509,6 +509,56 @@ class RemoteDtosTest {
     }
 
     @Test
+    fun `RestartAgentResult round-trips snake_case session_id`() {
+        // Server emits `session_id` (the freshly-minted session) on the
+        // structured result of `remote.solution_agent.restart_agent` —
+        // the SerialName must hold so the Reset action can hop the open
+        // chat surface onto the new session.
+        val text = """{"session_id": "ses-restart-1"}"""
+        val parsed = JsonRpc.json.decodeFromString(RestartAgentResult.serializer(), text)
+        assertEquals("ses-restart-1", parsed.sessionId)
+
+        val reencoded = JsonRpc.json.encodeToString(RestartAgentResult.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(RestartAgentResult.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `StartCompactResult round-trips queued=true without message`() {
+        // Success path — the server returns `queued = true` and omits the
+        // `message` field entirely (per `skip_serializing_if` on the Rust
+        // side). The DTO must decode with `message = null`.
+        val text = """{"queued": true}"""
+        val parsed = JsonRpc.json.decodeFromString(StartCompactResult.serializer(), text)
+        assertTrue(parsed.queued)
+        assertNull(parsed.message)
+
+        val reencoded = JsonRpc.json.encodeToString(StartCompactResult.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(StartCompactResult.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `StartCompactResult round-trips queued=false with decline message`() {
+        // Decline path — server returns `queued = false` and carries a
+        // human-readable reason (busy / cold / not-enough-headroom / …)
+        // which the UI surfaces via the shared error channel.
+        val text = """
+            {
+              "queued": false,
+              "message": "context below 20%, nothing to compact"
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(StartCompactResult.serializer(), text)
+        assertEquals(false, parsed.queued)
+        assertEquals("context below 20%, nothing to compact", parsed.message)
+
+        val reencoded = JsonRpc.json.encodeToString(StartCompactResult.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(StartCompactResult.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
     fun `EntrySummary round-trips with R-6e index field populated`() {
         // R-6e: server now stamps an absolute `index` on every entry so
         // paginated clients can stitch slices together. The DTO must

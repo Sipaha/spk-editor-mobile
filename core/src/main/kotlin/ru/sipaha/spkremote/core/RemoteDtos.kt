@@ -279,6 +279,35 @@ data class CreateSessionResult(
     @SerialName("session_id") val sessionId: String,
 )
 
+/**
+ * Result envelope for `remote.solution_agent.restart_agent`.
+ *
+ * The server drops the agent subprocess pooled for the session's
+ * `(solution, agent)` pair, closes the existing session, and opens a
+ * brand-new one against the same project — returning the freshly-minted
+ * id so the caller can switch focus to it.
+ */
+@Serializable
+data class RestartAgentResult(
+    @SerialName("session_id") val sessionId: String,
+)
+
+/**
+ * Result envelope for `remote.solution_agent.start_compact`.
+ *
+ * The compact orchestration is asynchronous — the server returns
+ * immediately after enqueueing the compact-instructions prompt on the
+ * agent's next turn ([queued] `= true`). When a precondition isn't met
+ * (session busy / context below 20% / less than 30k tokens of headroom /
+ * cold session), [queued] is `false` and [message] carries the
+ * human-readable reason for surfacing on the UI.
+ */
+@Serializable
+data class StartCompactResult(
+    val queued: Boolean,
+    val message: String? = null,
+)
+
 @Serializable
 data class GetSessionResult(
     val id: String,

@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -282,6 +283,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     fun loadOlder(sessionId: String) = sessionDetail.loadOlder(sessionId)
     fun sendMessage(text: String) = sessionDetail.sendMessage(text)
     fun cancelTurn() = sessionDetail.cancelTurn()
+
+    /**
+     * Reset the agent for the currently-open session. The server mints a
+     * fresh session id and emits it via [resetSwitch]; UI surfaces should
+     * observe that flow to hop navigation onto the new session.
+     */
+    fun resetContextOnActiveSession() = sessionDetail.resetContext()
+
+    /**
+     * Kick off the Compact context workflow on the currently-open
+     * session. On a server-side decline (cold session, context below 20%,
+     * busy, etc.) the snackbar surfaces the server's reason via
+     * [sendError]; on success the workflow runs asynchronously and a new
+     * session lands later via the standard notification path.
+     */
+    fun compactContextOnActiveSession() = sessionDetail.compactContext()
+
+    /**
+     * One-shot signal carrying the new session id after a successful
+     * Reset context. The chat screen collects this and hops the
+     * navigation route to the new id so the open chat surface stops
+     * pointing at the closed source session.
+     */
+    val resetSwitch: Flow<String> get() = sessionDetail.resetSwitch
     fun loadAgents() = sessionList.loadAgents()
     fun createSession(
         solutionId: String,
