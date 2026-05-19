@@ -13,12 +13,13 @@ class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // No enableEdgeToEdge(). The manifest declares
-        // windowSoftInputMode="adjustResize", so the system shrinks the
-        // activity window when the keyboard opens — the chat compose
-        // bar (positioned at the bottom of the window) ends up just
-        // above the keyboard automatically, with no inset modifiers
-        // needed inside the Composable tree.
+        // No explicit enableEdgeToEdge(), but Android 15+ (targetSdk 35+)
+        // FORCES edge-to-edge regardless — adjustResize alone no longer
+        // lifts the activity window above the IME on those targets.
+        // SessionDetailScreen's Scaffold zeroes contentWindowInsets and
+        // its bottomBar applies WindowInsets.ime.union(navigationBars)
+        // explicitly so the compose row stays above the keyboard AND
+        // clears the system nav bar at rest.
         super.onCreate(savedInstanceState)
         // Cold-start auto-resume: the VM inspects [PairingRepository.loadAll]
         // and returns the appropriate landing destination — `pairing` when

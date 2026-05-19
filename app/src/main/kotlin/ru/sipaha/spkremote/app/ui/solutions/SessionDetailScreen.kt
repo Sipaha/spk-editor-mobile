@@ -20,8 +20,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -109,6 +114,7 @@ import androidx.compose.ui.window.Dialog
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownColor
 import com.mikepenz.markdown.m3.markdownTypography
+import com.mikepenz.markdown.model.markdownPadding
 import com.mikepenz.markdown.model.ImageData
 import com.mikepenz.markdown.model.ImageTransformer
 import kotlinx.coroutines.Dispatchers
@@ -264,6 +270,12 @@ fun SessionDetailScreen(
     val activeMaxTokens: Long? = activeSummary?.maxTokens
     val activeStateStartedAtMs: Long? = activeSummary?.stateStartedAtMs
     Scaffold(
+        // Android 15+ (targetSdk 35+) forces edge-to-edge; Scaffold's
+        // default contentWindowInsets = systemBars would then double-
+        // consume against the topBar / bottomBar's own inset handling.
+        // Zero it here and apply insets explicitly on each slot so the
+        // chat surface reaches edge-to-edge without overlap.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             SlimTopBar(
                 title = displayTitle,
@@ -321,7 +333,17 @@ fun SessionDetailScreen(
         },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            Column {
+            // Single-source inset on the bottomBar: lifts above the IME
+            // when the keyboard opens AND clears the system 3-button nav
+            // bar at rest. Without this, Android 15+'s implicit edge-to-
+            // edge mode renders the system nav bar over the compose row
+            // and the keyboard covers the input. Union (not sum) because
+            // when the IME is up it already includes the nav-bar
+            // region — summing would add it twice.
+            Column(
+                modifier = Modifier
+                    .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+            ) {
                 if (showChipRow) {
                     SubAgentChipRow(
                         parentId = parentId,
@@ -734,7 +756,15 @@ private fun AssistantBubble(entry: EntrySummary) {
                 SelectionContainer {
                     val md = entry.markdown
                     if (md != null) {
-                        AssistantMarkdownBody(markdown = stripRoleHeading(md), images = entry.images.orEmpty())
+                        // Strip <thinking>...</thinking> blocks BEFORE rendering
+                        // (not just for visibility-check). The markdown widget
+                        // doesn't display unknown HTML but still allocates layout
+                        // space for the block — the user sees a phantom gap above
+                        // the actual answer.
+                        AssistantMarkdownBody(
+                            markdown = stripThinkingBlocks(stripRoleHeading(md)),
+                            images = entry.images.orEmpty(),
+                        )
                     } else {
                         // No full markdown yet (placeholder during streaming, or
                         // pre-R-5e server). Falls back to preview to keep the
@@ -801,6 +831,13 @@ private fun AssistantMarkdownBody(markdown: String, images: List<EntryImage>) {
             h5 = MaterialTheme.typography.labelMedium,
             h6 = MaterialTheme.typography.labelSmall,
         ),
+        // Library default `block` padding adds top-padding to every
+        // markdown block including the first → noticeable empty-line gap
+        // above the first paragraph inside a chat bubble. Override to a
+        // smaller value: 6.dp still gives visible separation between
+        // paragraphs in multi-paragraph replies but doesn't push the
+        // first paragraph away from the bubble's top edge.
+        padding = markdownPadding(block = 6.dp),
         imageTransformer = transformer,
     )
 
@@ -1121,8 +1158,19 @@ private fun CenteredAnnotatedBubble(
  */
 private fun hasVisibleAssistantBody(raw: String): Boolean {
     val stripped = stripRoleHeading(raw)
-    return THINKING_BLOCK.replace(stripped, "").isNotBlank()
+    return stripThinkingBlocks(stripped).isNotBlank()
 }
+
+/**
+ * Remove every `<thinking>…</thinking>` block from [md] AND tidy the
+ * surrounding whitespace so the renderer doesn't see leading newlines
+ * (which the multiplatform-markdown-renderer turns into a phantom
+ * empty paragraph above the actual content). Shared by the visibility
+ * filter and the renderer feed so a thought-only turn is hidden AND a
+ * mixed thought+answer turn renders flush-top.
+ */
+internal fun stripThinkingBlocks(md: String): String =
+    THINKING_BLOCK.replace(md, "").trim()
 
 // `[\s\S]` matches across newlines so multi-line `<thinking>` payloads
 // are removed in one pass. The lazy `*?` keeps each match minimal so two
