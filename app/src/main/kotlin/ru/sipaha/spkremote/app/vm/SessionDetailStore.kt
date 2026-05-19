@@ -33,7 +33,8 @@ import ru.sipaha.spkremote.core.StartCompactResult
 import ru.sipaha.spkremote.core.applyAppendedPlaceholder
 import ru.sipaha.spkremote.core.mergeSessionHistory
 import ru.sipaha.spkremote.core.parseExpiredSendMessage
-import ru.sipaha.spkremote.core.reconcileOptimisticContent
+import ru.sipaha.spkremote.core.reconcileOptimistic
+import ru.sipaha.spkremote.core.stampClientSendId
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
 
@@ -61,10 +62,14 @@ private const val SESSION_PAGE_SIZE = 50
  *     fetchAndReplaceEntry, loadOlder, resumeSession) compete for the
  *     same flow; without the mutex a stale snapshot can be re-published
  *     on top of a newer one.
- *  4. **Optimistic bubbles carry a stable client id** — see
- *     [optimisticIdGen]. The pure `reconcileOptimisticContent` matches
- *     by content (FIFO order of arrival) so sending duplicate text
- *     twice in a row reconciles when both echoes land.
+ *  4. **Optimistic bubbles carry two ids** — a local stable id
+ *     ([optimisticIdGen]) used by the cancel-by-id failure path and a
+ *     wire-side `client_send_id` stamp ([optimisticClientSendIds])
+ *     stamped onto the originating ContentBlock's
+ *     `_meta.spk_client_send_id`. The pure `reconcileOptimistic`
+ *     prefers id-based matching; falls back to content-match for legacy
+ *     server entries (pre-rollout) or cross-client echoes that don't
+ *     carry a csid.
  *  5. **The shared [lastSeen] index is the single source of truth** —
  *     don't store a sibling map; both this store and [SessionListStore]
  *     read/write through [LastSeenIndex].
@@ -110,21 +115,25 @@ internal class SessionDetailStore(
     private val optimisticIdGen = AtomicLong(0L)
 
     /**
-     * Per-optimistic-bubble flag marking whether the bubble was produced by
-     * a multi-block send (`sendMessageBlocks`) rather than a plain text
-     * [sendMessage]. Paired with [optimisticIds] by list index. Mutated
-     * together with the entry / id lists under [sessionMutex].
+     * Per-optimistic-bubble `client_send_id` stamp paired with
+     * [optimisticIds] by list index. `null` slot when the bubble wasn't
+     * stamped (legacy [sendMessage] path — text-only — or a producer that
+     * opts out). Mutated together with the entry / id lists under
+     * [sessionMutex].
      *
-     * **Why a separate list?** The content-match dedupe in
-     * `reconcileOptimisticContent` compares the optimistic `preview` (the
-     * user's typed text + a `[image]` / `[file]` annotation) against the
-     * server-echoed user entry. For a blocks send the server formats the
-     * user entry with ACP rendering — different structure, different
-     * preview — so the content-match fires for plain-text bubbles only.
-     * We use this flag to drive the FIFO "drop oldest blocks bubble when
-     * any user-role echo arrives" fallback in [reconcileOptimisticLocked].
+     * **Role of the stamp.** When the user fires a send the producer
+     * generates a monotonic id, stamps it onto the first ContentBlock's
+     * `_meta.spk_client_send_id`, and records it here. The server echoes
+     * the value back on the resulting `EntrySummary.clientSendId` and on
+     * the matching `agent_session_message_appended` notification — both
+     * paths in `reconcileOptimisticLocked` and [onMessageAppended] use
+     * the id to pop the optimistic bubble unambiguously. Replaces the
+     * fragile `(role, preview)` content-match that broke for long
+     * messages truncated server-side to ~200 chars (and the
+     * `optimisticBlocksFlags` parallel hack added for #11 to work
+     * around the same shape mismatch on multi-block sends).
      */
-    private val optimisticBlocksFlags: MutableList<Boolean> = mutableListOf()
+    private val optimisticClientSendIds: MutableList<Long?> = mutableListOf()
 
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
@@ -171,7 +180,7 @@ internal class SessionDetailStore(
                 _session.value = UiData.Loading
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
-                optimisticBlocksFlags.clear()
+                optimisticClientSendIds.clear()
             }
         }
     }
@@ -214,7 +223,7 @@ internal class SessionDetailStore(
                 _isLoadingOlder.value = false
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
-                optimisticBlocksFlags.clear()
+                optimisticClientSendIds.clear()
                 lastSeen.primeFromDisk(sessionId)
                 if (cached != null && cached.entries.isNotEmpty()) {
                     // Render the cached transcript immediately so the
@@ -254,7 +263,7 @@ internal class SessionDetailStore(
                 _isLoadingOlder.value = false
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
-                optimisticBlocksFlags.clear()
+                optimisticClientSendIds.clear()
             }
         }
     }
@@ -281,6 +290,21 @@ internal class SessionDetailStore(
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
         lastSeen.recordIfNewer(payload.sessionId, payload.entryIndex)
+        // Fast-pop: when the notification carries a `client_send_id`
+        // (server lifted it from `_meta.spk_client_send_id` on the
+        // originating user message's first ContentBlock) AND it matches
+        // one of our pending optimistic bubbles, drop the bubble now
+        // instead of waiting for the post-fetch reconcile. Closes the
+        // duplicate-render window the user reported 2026-05-18.
+        val csid = payload.clientSendId
+        if (csid != null && payload.role == "user") {
+            scope.launch {
+                sessionMutex.withLock {
+                    if (openSessionId != payload.sessionId) return@withLock
+                    popOptimisticByClientSendIdLocked(csid)
+                }
+            }
+        }
         applyAppendedPlaceholderToFlow(payload)
         fetchAndReplaceEntry(openSid, payload.entryIndex)
     }
@@ -675,68 +699,34 @@ internal class SessionDetailStore(
 
     /**
      * Pop optimistic bubbles whose corresponding server-side "user"
-     * entry has now landed. Delegates to the pure
-     * `reconcileOptimisticContent` (in `:core`); MUST be called while
-     * holding [sessionMutex] — mutates both [_optimisticEntries] and
-     * [optimisticIds] in lock-step.
+     * entry has now landed. Delegates to the pure [reconcileOptimistic]
+     * (in `:core`); MUST be called while holding [sessionMutex] —
+     * mutates [_optimisticEntries], [optimisticIds] and
+     * [optimisticClientSendIds] in lock-step.
      *
-     * Audit Phase 3 caveat: this is content-match, NOT strict FIFO
-     * stable-id matching. Sending the same text twice in a row where
-     * the first send fails before the server echoes can briefly
-     * appear to dedup the wrong bubble; the optimisticId rewrite
-     * keeps the cancel path correct nonetheless.
+     * Matching is id-first (server echoes `client_send_id` on user
+     * entries that carried `_meta.spk_client_send_id`) with a
+     * content-match fallback for entries that don't carry one (older
+     * server, desktop-originated send, etc.). The id path is what
+     * makes long messages (> 200 chars, server-truncated preview)
+     * dedupe correctly — the regression user-reported on 2026-05-18.
      */
     private fun reconcileOptimisticLocked(serverEntries: List<EntrySummary>) {
         if (_optimisticEntries.value.isEmpty()) return
-        // Snapshot the pre-reconcile state so we can rewrite the parallel
-        // [optimisticBlocksFlags] list to match the kept-id ordering that
-        // the pure reconciler returns.
         val priorEntries = _optimisticEntries.value
         val priorIds = optimisticIds.toList()
-        val priorBlocks = optimisticBlocksFlags.toList()
-        val (keptEntries, keptIds) = reconcileOptimisticContent(
+        val priorCsids = optimisticClientSendIds.toList()
+        val (keptEntries, keptIds, keptCsids) = reconcileOptimistic(
             optimistic = priorEntries,
             optimisticIds = priorIds,
-            serverUserEntries = serverEntries,
+            optimisticClientSendIds = priorCsids,
+            serverEntries = serverEntries,
         )
-        // Rebuild the blocks-flag list against the post-reconcile id list
-        // so positional pairing with entries/ids stays consistent.
-        val keptBlocks = keptIds.map { id ->
-            val idx = priorIds.indexOf(id)
-            if (idx >= 0) priorBlocks.getOrElse(idx) { false } else false
-        }
-        // Fallback dedupe (block-bearing bubbles): the content-match
-        // above cannot dedup a blocks-bearing optimistic bubble because
-        // the server-side rendered user entry doesn't equal the local
-        // preview. If the server emitted at least one user entry that
-        // the content-match consumed (or that wasn't in `priorEntries`
-        // at all), pop the oldest still-pending blocks bubble — under
-        // the assumption the user can't fire two blocks sends faster
-        // than a round-trip. Worst case the wrong bubble disappears for
-        // a fraction of a second before the next refresh restores it.
-        val serverUserCount = serverEntries.count { it.role == "user" }
-        val poppedByContent = priorEntries.size - keptEntries.size
-        val remainingUserEchoes = (serverUserCount - poppedByContent).coerceAtLeast(0)
-        var blocksToDrop = remainingUserEchoes
-        val finalEntries = keptEntries.toMutableList()
-        val finalIds = keptIds.toMutableList()
-        val finalBlocks = keptBlocks.toMutableList()
-        var i = 0
-        while (i < finalBlocks.size && blocksToDrop > 0) {
-            if (finalBlocks[i]) {
-                finalEntries.removeAt(i)
-                finalIds.removeAt(i)
-                finalBlocks.removeAt(i)
-                blocksToDrop -= 1
-            } else {
-                i += 1
-            }
-        }
-        _optimisticEntries.value = finalEntries
+        _optimisticEntries.value = keptEntries
         optimisticIds.clear()
-        optimisticIds.addAll(finalIds)
-        optimisticBlocksFlags.clear()
-        optimisticBlocksFlags.addAll(finalBlocks)
+        optimisticIds.addAll(keptIds)
+        optimisticClientSendIds.clear()
+        optimisticClientSendIds.addAll(keptCsids)
     }
 
     fun sendMessage(text: String) {
@@ -745,11 +735,17 @@ internal class SessionDetailStore(
         val sessionId = openSessionId ?: return
         val optimistic = EntrySummary(role = "user", preview = text)
         val localId = optimisticIdGen.incrementAndGet()
+        // Legacy text-only path uses `send_message` which carries `content`
+        // (a string), not a ContentBlock list — there's no `_meta` seam to
+        // stamp. We record `null` in the csid slot so [reconcileOptimistic]
+        // falls through to the content-match path; previews from
+        // `send_message` are short enough that the server preview equals
+        // the optimistic preview verbatim.
         scope.launch {
             sessionMutex.withLock {
                 _optimisticEntries.value = _optimisticEntries.value + optimistic
                 optimisticIds.add(localId)
-                optimisticBlocksFlags.add(false)
+                optimisticClientSendIds.add(null)
             }
             val params = buildJsonObject {
                 put("session_id", sessionId)
@@ -786,10 +782,14 @@ internal class SessionDetailStore(
      *
      * The optimistic bubble carries a flattened text preview (text blocks
      * concatenated, plus `[image]` / `[file]` annotations for non-text
-     * payloads) so the chat surface shows immediate feedback. The bubble
-     * is dropped on the next user-role server echo — see
-     * [reconcileOptimisticLocked]'s fallback path. Failure removes the
-     * bubble synchronously and surfaces the reason via [ConnectionContext.emitError].
+     * payloads) so the chat surface shows immediate feedback. We stamp
+     * `_meta.spk_client_send_id` onto the first block before send and
+     * record the same id in [optimisticClientSendIds] — the server echoes
+     * it back on the resulting user entry, letting
+     * [reconcileOptimisticLocked] dedupe by id rather than a fragile
+     * preview-content match (which the server-side ACP rendering of a
+     * blocks send doesn't honour anyway). Failure removes the bubble
+     * synchronously and surfaces the reason via [ConnectionContext.emitError].
      */
     fun sendMessageBlocks(blocks: List<ContentBlockDto>) {
         if (blocks.isEmpty()) return
@@ -798,15 +798,21 @@ internal class SessionDetailStore(
         val preview = buildBlocksPreview(blocks)
         val optimistic = EntrySummary(role = "user", preview = preview)
         val localId = optimisticIdGen.incrementAndGet()
+        // Monotonic-ms id is fine: a single client can't fire two sends
+        // in the same wall-clock ms in practice, and the server treats
+        // the value as opaque. Generated up-front so the meta stamp on
+        // the wire and the local optimisticClientSendIds slot agree.
+        val clientSendId = System.currentTimeMillis()
+        val stamped = stampClientSendId(blocks, clientSendId)
         scope.launch {
             sessionMutex.withLock {
                 _optimisticEntries.value = _optimisticEntries.value + optimistic
                 optimisticIds.add(localId)
-                optimisticBlocksFlags.add(true)
+                optimisticClientSendIds.add(clientSendId)
             }
             val blocksJson = JsonRpc.json.encodeToJsonElement(
                 ListSerializer(ContentBlockDto.serializer()),
-                blocks,
+                stamped,
             )
             val params = buildJsonObject {
                 put("session_id", sessionId)
@@ -837,24 +843,53 @@ internal class SessionDetailStore(
 
     /**
      * Drop one optimistic bubble matched by stable [localId]. Both
-     * [optimisticIds] and [optimisticBlocksFlags] stay paired by index
+     * [optimisticIds] and [optimisticClientSendIds] stay paired by index
      * with [_optimisticEntries] because we always mutate the three lists
      * under [sessionMutex] together; the indexOf lookup here is therefore
-     * referentially safe even after a content-match reconcile.
+     * referentially safe even after a reconcile.
      */
     private suspend fun removeOptimisticById(localId: Long) {
         sessionMutex.withLock {
             val idx = optimisticIds.indexOf(localId)
             if (idx < 0) return@withLock
             optimisticIds.removeAt(idx)
-            if (idx < optimisticBlocksFlags.size) {
-                optimisticBlocksFlags.removeAt(idx)
+            if (idx < optimisticClientSendIds.size) {
+                optimisticClientSendIds.removeAt(idx)
             }
             val list = _optimisticEntries.value.toMutableList()
             if (idx < list.size) {
                 list.removeAt(idx)
                 _optimisticEntries.value = list
             }
+        }
+    }
+
+    /**
+     * Notification-driven fast-pop of an optimistic bubble whose
+     * server-side echo just arrived. Called from [onMessageAppended] when
+     * the payload carries a `client_send_id` that matches one of our
+     * stamped bubbles — pops it immediately rather than waiting for the
+     * next `list_sessions`-driven reconcile. This is what closes the
+     * round-trip window that produced the user-visible duplicate
+     * reported 2026-05-18 (long message → server echoes via notification
+     * → next refresh would normally reconcile, but the user already saw
+     * the duplicate in between).
+     *
+     * MUST hold [sessionMutex] before mutating — same discipline as
+     * [reconcileOptimisticLocked] / [removeOptimisticById]. The caller
+     * wraps the call in `sessionMutex.withLock`.
+     */
+    private fun popOptimisticByClientSendIdLocked(clientSendId: Long) {
+        val idx = optimisticClientSendIds.indexOf(clientSendId)
+        if (idx < 0) return
+        optimisticClientSendIds.removeAt(idx)
+        if (idx < optimisticIds.size) {
+            optimisticIds.removeAt(idx)
+        }
+        val list = _optimisticEntries.value.toMutableList()
+        if (idx < list.size) {
+            list.removeAt(idx)
+            _optimisticEntries.value = list
         }
     }
 
