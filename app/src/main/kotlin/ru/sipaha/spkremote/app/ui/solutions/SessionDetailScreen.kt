@@ -1148,14 +1148,18 @@ private fun AssistantBubble(entry: EntrySummary) {
             color = MaterialTheme.colorScheme.surfaceVariant,
             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
-            // animateContentSize: see UserBubble. Especially important
-            // for assistant bubbles because the markdown body grows
-            // through a series of debounced EntryUpdated notifications
-            // during the streaming reply — each new tween snapshot
-            // would otherwise visibly snap.
-            modifier = Modifier
-                .widthIn(max = 360.dp)
-                .animateContentSize(),
+            // No `animateContentSize` here. The bubble's body grows
+            // through ~5 debounced EntryUpdated emits per second
+            // during a streaming reply; the default spring-based
+            // content-size animation stacks across those updates and
+            // produces a visible vertical jitter (compress/expand
+            // cycle reported by the user 2026-05-20). Discrete snaps
+            // between updates are barely noticeable and avoid the
+            // stacked-animation artefact entirely. The
+            // [UserBubble]'s analogous animation stays — user bubbles
+            // get at most one placeholder→full-markdown transition
+            // per send, never a streaming sequence.
+            modifier = Modifier.widthIn(max = 360.dp),
         ) {
             Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 // SelectionContainer wraps the assistant body so the rendered

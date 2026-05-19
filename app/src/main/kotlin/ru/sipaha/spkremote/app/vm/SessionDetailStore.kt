@@ -462,31 +462,56 @@ internal class SessionDetailStore(
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
         lastSeen.recordIfNewer(payload.sessionId, payload.entryIndex)
-        // Fast-pop: when the notification carries any
-        // `spk_client_send_id` stamps that match our pending optimistic
-        // bubbles, drop ALL of them now instead of waiting for the
-        // post-fetch reconcile. Prefer the `client_send_ids` array
-        // (modern server: lists every csid the server-side queue-merge
-        // rolled into this entry); fall back to the singular field for
-        // older servers. Closes the duplicate-render window the user
-        // reported 2026-05-18 AND the "queue-merged echo leaves N-1
-        // bubbles orphaned" follow-up.
         val singularCsid = payload.clientSendId
         val csids: List<Long> = when {
             payload.clientSendIds.isNotEmpty() -> payload.clientSendIds
             singularCsid != null -> listOf(singularCsid)
             else -> emptyList()
         }
-        if (csids.isNotEmpty() && payload.role == "user") {
-            scope.launch {
-                sessionMutex.withLock {
-                    if (openSessionId != payload.sessionId) return@withLock
+        scope.launch {
+            sessionMutex.withLock {
+                if (openSessionId != payload.sessionId) return@withLock
+                // Fast-pop optimistic bubbles whose csid lands in the
+                // notification. Done FIRST inside the mutex so the
+                // subsequent placeholder add can't create a brief
+                // duplicate-bubble window (the prior two-launch
+                // arrangement made `pop` and `applyPlaceholder` race —
+                // when the apply landed before the pop the chat
+                // briefly showed both the local + server bubble).
+                if (payload.role == "user" && csids.isNotEmpty()) {
                     for (c in csids) popOptimisticByClientSendIdLocked(c)
                 }
+                // Apply the placeholder ONLY for new entries (slot
+                // doesn't exist yet). For updates to an existing entry
+                // (the common case under throttled EntryUpdated
+                // streaming — ~5 emits/sec while the agent writes a
+                // long reply), skipping the placeholder lets the
+                // already-rendered full markdown stay on screen while
+                // [fetchAndReplaceEntry] races the new content in.
+                // Without this guard the bubble collapsed to the
+                // truncated preview between every two updates and the
+                // `animateContentSize` tween produced a vertical
+                // jitter the user noticed on 2026-05-20.
+                val current = _session.value as? UiData.Loaded ?: return@withLock
+                val entries = current.value.entries
+                if (payload.entryIndex >= entries.size) {
+                    when (val outcome = applyAppendedPlaceholder(entries, payload)) {
+                        is AppendedPlaceholderOutcome.Replaced -> {
+                            _session.value = UiData.Loaded(
+                                current.value.copy(entries = outcome.entries),
+                            )
+                        }
+                        AppendedPlaceholderOutcome.OutOfRange -> {
+                            val active = context.activeClient() ?: return@withLock
+                            scope.launch {
+                                runCatching { fetchFullSession(active, payload.sessionId) }
+                            }
+                        }
+                    }
+                }
             }
+            fetchAndReplaceEntry(openSid, payload.entryIndex)
         }
-        applyAppendedPlaceholderToFlow(payload)
-        fetchAndReplaceEntry(openSid, payload.entryIndex)
     }
 
     override fun onMessageAppendedFallback() {
@@ -545,28 +570,6 @@ internal class SessionDetailStore(
     // -------------------------------------------------------------------------
     // Network ops
     // -------------------------------------------------------------------------
-
-    private fun applyAppendedPlaceholderToFlow(payload: MessageAppendedPayload) {
-        scope.launch {
-            sessionMutex.withLock {
-                // stale-write barrier (see class kdoc invariant 1)
-                if (openSessionId != payload.sessionId) return@withLock
-                val current = _session.value as? UiData.Loaded ?: return@withLock
-                when (val outcome = applyAppendedPlaceholder(current.value.entries, payload)) {
-                    is AppendedPlaceholderOutcome.Replaced -> {
-                        _session.value = UiData.Loaded(current.value.copy(entries = outcome.entries))
-                    }
-                    AppendedPlaceholderOutcome.OutOfRange -> {
-                        // Out-of-range index — fall back to a full refetch.
-                        val active = context.activeClient() ?: return@withLock
-                        scope.launch {
-                            runCatching { fetchFullSession(active, payload.sessionId) }
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     private fun fetchAndReplaceEntry(sessionId: String, index: Int) {
         val active = context.activeClient() ?: return
