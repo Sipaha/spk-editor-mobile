@@ -115,6 +115,19 @@ internal class SessionDetailStore(
     private val optimisticIdGen = AtomicLong(0L)
 
     /**
+     * Monotonic generator for [client_send_id] stamps. Initialised lazily
+     * on first use to `System.currentTimeMillis()` so the values are both
+     * monotonically increasing within a process AND ordered across app
+     * restarts (the next session's start value sits above every id this
+     * one issued, assuming wall-clock didn't move backward). Eliminates
+     * the same-millisecond collision risk of using `currentTimeMillis()`
+     * directly: a queue-flush-on-reconnect coinciding with a fresh user
+     * send in the same ms would have stamped identical ids; with the
+     * counter every send gets a strictly distinct value.
+     */
+    private val clientSendIdGen = AtomicLong(System.currentTimeMillis())
+
+    /**
      * Per-optimistic-bubble `client_send_id` stamp paired with
      * [optimisticIds] by list index. `null` slot when the bubble wasn't
      * stamped (legacy [sendMessage] path — text-only — or a producer that
@@ -798,11 +811,11 @@ internal class SessionDetailStore(
         val preview = buildBlocksPreview(blocks)
         val optimistic = EntrySummary(role = "user", preview = preview)
         val localId = optimisticIdGen.incrementAndGet()
-        // Monotonic-ms id is fine: a single client can't fire two sends
-        // in the same wall-clock ms in practice, and the server treats
-        // the value as opaque. Generated up-front so the meta stamp on
-        // the wire and the local optimisticClientSendIds slot agree.
-        val clientSendId = System.currentTimeMillis()
+        // Monotonic counter seeded with currentTimeMillis at startup —
+        // see [clientSendIdGen] for the rationale on why a raw timestamp
+        // isn't enough. Generated up-front so the meta stamp on the wire
+        // and the local optimisticClientSendIds slot agree.
+        val clientSendId = clientSendIdGen.incrementAndGet()
         val stamped = stampClientSendId(blocks, clientSendId)
         scope.launch {
             sessionMutex.withLock {
