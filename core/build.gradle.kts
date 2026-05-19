@@ -1,6 +1,6 @@
 plugins {
-    kotlin("jvm")
-    kotlin("plugin.serialization")
+    alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 kotlin {
@@ -13,18 +13,18 @@ dependencies {
     // JsonElement, exposes SharedFlow<JsonElement> for notifications). Consumers
     // (:app, :cli) need these symbols transitively to bind ViewModels/UIs/CLI
     // output without re-declaring the deps themselves.
-    api("com.squareup.okhttp3:okhttp:5.3.0")
-    api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
-    api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    api(libs.okhttp)
+    api(libs.kotlinx.coroutines.core)
+    api(libs.kotlinx.serialization.json)
     // Explicit kotlin-stdlib pin: OkHttp 5.x's transitive Kotlin runtime could
     // otherwise diverge from the compiler version. Propagated via `api` so
     // downstream `:app` / `:cli` see the same stdlib.
-    api("org.jetbrains.kotlin:kotlin-stdlib:2.3.21")
+    api(libs.kotlin.stdlib)
 
     testImplementation(kotlin("test"))
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.12.0")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.12.0")
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
 }
 
 tasks.test {

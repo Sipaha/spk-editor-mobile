@@ -1,11 +1,11 @@
 plugins {
-    id("com.android.application")
+    alias(libs.plugins.android.application)
     // Note: AGP 9.0+ ships built-in Kotlin support, so `kotlin("android")` must
     // NOT be applied — doing so makes plugin-apply fail.
     // R-6c-multi: needed by [PairedServer] which is JSON-serialised into
     // the EncryptedSharedPreferences-backed paired-server list.
-    kotlin("plugin.serialization")
-    id("org.jetbrains.kotlin.plugin.compose")
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
@@ -88,23 +88,23 @@ kotlin {
 dependencies {
     implementation(project(":core"))
     // When upgrading: `Modifier.onFirstVisible` was renamed to `onVisibilityChanged` in 2026.04+.
-    implementation(platform("androidx.compose:compose-bom:2026.04.00"))
-    implementation("androidx.activity:activity-compose:1.13.0")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-tooling-preview")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.0")
-    implementation("androidx.navigation:navigation-compose:2.9.8")
-    implementation("androidx.core:core-ktx:1.16.0")
-    implementation("androidx.appcompat:appcompat:1.7.1")
+    implementation(platform(libs.compose.bom))
+    implementation(libs.activity.compose)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.runtime.ktx)
+    implementation(libs.navigation.compose)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.appcompat)
     // Encrypted SharedPreferences for persisting the pairing URL. The
     // 1.1.0-alpha07 release is the final published alpha on Google's
     // Maven (security-crypto has been in alpha for ages; the stable
     // 1.0.0 branch depends on a deprecated Tink and breaks on AGP 8+).
-    implementation("androidx.security:security-crypto:1.1.0-alpha07")
+    implementation(libs.androidx.security.crypto)
     // 4.3.0 is the final upstream release (project is no longer maintained).
-    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation(libs.zxing.android.embedded)
     // Markdown rendering for assistant bubbles. The library pins a Compose
     // runtime version under the hood; keep this in step with the Compose
     // BoM above when bumping.
@@ -114,15 +114,15 @@ dependencies {
     // network/disk loaders are unnecessary — every image we render is
     // already a base64 blob carried inline on the wire.
     // TODO verify androidx.compose.runtime aligns with BoM after AGP-9 plugin migration lands.
-    implementation("com.mikepenz:multiplatform-markdown-renderer-m3:0.39.0")
+    implementation(libs.markdown.renderer)
 
     // JUnit 5 + kotlinx-coroutines-test for pure-JVM unit tests of the
     // `:app` ViewModel-side helpers (e.g. RpcDecoding). The bulk of
     // `:app` is Android-only; only test files of pure JVM classes belong
     // here.
-    testImplementation("org.junit.jupiter:junit-jupiter:5.12.0")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.12.0")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
+    testImplementation(libs.junit.jupiter)
+    testRuntimeOnly(libs.junit.platform.launcher)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 tasks.withType<Test>().configureEach {

@@ -66,13 +66,16 @@ sealed interface UiData<out T> {
 }
 
 /**
- * Thin coordinator around three collaborators that share [viewModelScope]:
+ * Thin coordinator around four collaborators that share [viewModelScope]:
  *
  *   - [ConnectionManager] — pairing CRUD + the active [RemoteClient] +
  *     wire-level connection state observation.
  *   - [SolutionStore] — solutions list + solution detail RPCs.
- *   - [SessionStore] — sessions list, open-session transcript / diff
- *     streaming, optimistic bubbles, draft seeds, send/cancel/create.
+ *   - [SessionListStore] — per-solution sessions list, agents catalogue,
+ *     create / rename / sub-agent children, and the single shared
+ *     notifications collector that fans out to the detail store.
+ *   - [SessionDetailStore] — open-session transcript / diff streaming,
+ *     optimistic bubbles, drafts, send / cancel / resume / paginate.
  *
  * Every public property / method below either delegates to a
  * collaborator or orchestrates a multi-collaborator action (e.g. server
@@ -118,12 +121,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         listCacheRepository = listCacheRepository,
     )
 
-    private val sessionStore: SessionStore = SessionStore(
+    private val lastSeenIndex: LastSeenIndex = LastSeenIndex(lastSeenRepository)
+
+    private val sessionList: SessionListStore = SessionListStore(
         scope = viewModelScope,
         context = this,
         listCacheRepository = listCacheRepository,
-        lastSeenRepository = lastSeenRepository,
+        lastSeen = lastSeenIndex,
+    )
+
+    private val sessionDetail: SessionDetailStore = SessionDetailStore(
+        scope = viewModelScope,
+        context = this,
         draftRepository = draftRepository,
+        lastSeen = lastSeenIndex,
+        sessionList = sessionList,
     )
 
     // ---- ConnectionLifecycle impl (audit Fix T light variant) ----
@@ -139,26 +151,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         // client. Keeps the UI from briefly showing server A's
         // transcript while server B's initial fetch is pending.
         solutionStore.reset()
-        sessionStore.reset()
+        sessionList.reset()
+        sessionDetail.reset()
     }
 
     override fun onReconnected() {
         // Disconnected → Connected edge. If a session detail screen
         // is currently active, resume it incrementally; otherwise
         // just refresh the solutions list.
-        val openSid = sessionStore.openSessionId
+        val openSid = sessionDetail.openSessionId
         if (openSid != null) {
-            sessionStore.resumeSession(openSid)
+            sessionDetail.resumeSession(openSid)
         }
         solutionStore.refreshSolutions()
     }
 
     override fun onMessageExpired(message: QueuedMessage) {
-        sessionStore.handleExpiredMessage(message)
+        sessionDetail.handleExpiredMessage(message)
     }
 
     override fun onBeforeSwitch() {
-        sessionStore.beforeServerSwitch()
+        sessionDetail.beforeServerSwitch()
     }
 
     override fun onError(message: String) {
@@ -247,26 +260,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
 
     // ---- Sessions surface ----
 
-    val sessions: StateFlow<UiData<List<SessionSummary>>> get() = sessionStore.sessions
-    val session: StateFlow<UiData<GetSessionResult>> get() = sessionStore.session
-    val isLoadingOlder: StateFlow<Boolean> get() = sessionStore.isLoadingOlder
-    val optimisticEntries: StateFlow<List<EntrySummary>> get() = sessionStore.optimisticEntries
-    val cancelInFlight: StateFlow<Boolean> get() = sessionStore.cancelInFlight
-    val sessionChildren: StateFlow<Map<String, List<SessionSummary>>> get() = sessionStore.sessionChildren
-    val agents: StateFlow<UiData<List<AgentSummary>>> get() = sessionStore.agents
-    val createSessionInFlight: StateFlow<Boolean> get() = sessionStore.createSessionInFlight
-    val lastCreateAutoOpened: StateFlow<Boolean> get() = sessionStore.lastCreateAutoOpened
+    val sessions: StateFlow<UiData<List<SessionSummary>>> get() = sessionList.sessions
+    val session: StateFlow<UiData<GetSessionResult>> get() = sessionDetail.session
+    val isLoadingOlder: StateFlow<Boolean> get() = sessionDetail.isLoadingOlder
+    val optimisticEntries: StateFlow<List<EntrySummary>> get() = sessionDetail.optimisticEntries
+    val cancelInFlight: StateFlow<Boolean> get() = sessionDetail.cancelInFlight
+    val sessionChildren: StateFlow<Map<String, List<SessionSummary>>> get() = sessionList.sessionChildren
+    val agents: StateFlow<UiData<List<AgentSummary>>> get() = sessionList.agents
+    val createSessionInFlight: StateFlow<Boolean> get() = sessionList.createSessionInFlight
+    val lastCreateAutoOpened: StateFlow<Boolean> get() = sessionList.lastCreateAutoOpened
 
-    fun refreshSessions(solutionId: String) = sessionStore.refreshSessions(solutionId)
-    fun startObservingSessions(solutionId: String) = sessionStore.startObservingSessions(solutionId)
-    fun stopObservingSessions() = sessionStore.stopObservingSessions()
-    fun clearSessions() = sessionStore.clearSessions()
-    fun openSession(sessionId: String) = sessionStore.openSession(sessionId)
-    fun closeSession() = sessionStore.closeSession()
-    fun loadOlder(sessionId: String) = sessionStore.loadOlder(sessionId)
-    fun sendMessage(text: String) = sessionStore.sendMessage(text)
-    fun cancelTurn() = sessionStore.cancelTurn()
-    fun loadAgents() = sessionStore.loadAgents()
+    fun refreshSessions(solutionId: String) = sessionList.refreshSessions(solutionId)
+    fun startObservingSessions(solutionId: String) = sessionList.startObservingSessions(solutionId)
+    fun stopObservingSessions() = sessionList.stopObservingSessions()
+    fun clearSessions() = sessionList.clearSessions()
+    fun openSession(sessionId: String) = sessionDetail.openSession(sessionId)
+    fun closeSession() = sessionDetail.closeSession()
+    fun loadOlder(sessionId: String) = sessionDetail.loadOlder(sessionId)
+    fun sendMessage(text: String) = sessionDetail.sendMessage(text)
+    fun cancelTurn() = sessionDetail.cancelTurn()
+    fun loadAgents() = sessionList.loadAgents()
     fun createSession(
         solutionId: String,
         agentId: String,
@@ -274,16 +287,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         title: String?,
         cwd: String?,
         onCreated: (sessionId: String) -> Unit,
-    ) = sessionStore.createSession(solutionId, agentId, initialMessage, title, cwd, onCreated)
+    ) = sessionList.createSession(solutionId, agentId, initialMessage, title, cwd, onCreated)
 
     fun renameSession(sessionId: String, newTitle: String) =
-        sessionStore.renameSession(sessionId, newTitle)
+        sessionList.renameSession(sessionId, newTitle)
 
     suspend fun loadDraftSeed(sessionId: String): Pair<String, Boolean> =
-        sessionStore.loadDraftSeed(sessionId)
+        sessionDetail.loadDraftSeed(sessionId)
 
-    suspend fun saveDraft(sessionId: String, text: String) = sessionStore.saveDraft(sessionId, text)
-    fun clearDraft(sessionId: String) = sessionStore.clearDraft(sessionId)
+    suspend fun saveDraft(sessionId: String, text: String) = sessionDetail.saveDraft(sessionId, text)
+    fun clearDraft(sessionId: String) = sessionDetail.clearDraft(sessionId)
 
     // ---- Nav-state surface (no collaborator — this is a tiny two-method
     // hook directly on the coordinator). ----
@@ -311,10 +324,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     }
 
     override fun onCleared() {
-        // SessionStore's previous onCleared() did the same work that
-        // [SessionStore.reset] already does via the onTearDown hook;
+        // The session stores' reset hooks are wired through onTearDown;
         // [ConnectionManager.tearDownConnection] fires onTearDown which
-        // resets both stores. No separate hook needed (audit Fix U).
+        // resets all three stores. No separate hook needed (audit Fix U).
         connectionMgr.tearDownConnection()
     }
 }

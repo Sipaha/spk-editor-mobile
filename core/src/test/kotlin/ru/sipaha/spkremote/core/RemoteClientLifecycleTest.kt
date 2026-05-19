@@ -265,7 +265,7 @@ class RemoteClientLifecycleTest {
         val result = outcome.await()
         assertTrue(result.isFailure, "TTL should fail the queued call: $result")
         assertTrue(
-            result.exceptionOrNull() is RemoteClient.QueueTtlException,
+            result.exceptionOrNull() is QueueTtlException,
             "expected QueueTtlException, got ${result.exceptionOrNull()}",
         )
         client.close()
@@ -725,7 +725,6 @@ class RemoteClientLifecycleTest {
      * Setup note: the anonymous subclass requires [FakeRemoteTransport] to be
      * `open`, which was done as part of this test infrastructure update.
      */
-    @Disabled("M1 fix from backlog drain agent is incomplete — test hangs (UncompletedCoroutinesError after 60s). dispatchQueuedItems sequential-drain implementation needs revisit; remains in .audit-backlog.md.")
     @Test
     fun `mid-flush drop re-enqueues remaining items at head in FIFO order`() = runTest(
         StandardTestDispatcher(),
@@ -968,7 +967,7 @@ class RemoteClientLifecycleTest {
         val shortResult = shortOutcome.await()
         assertTrue(shortResult.isFailure, "short-TTL item should fail: $shortResult")
         assertTrue(
-            shortResult.exceptionOrNull() is RemoteClient.QueueTtlException,
+            shortResult.exceptionOrNull() is QueueTtlException,
             "short-TTL item should throw QueueTtlException: ${shortResult.exceptionOrNull()}",
         )
         assertEquals(1, expired.size, "onMessageExpired must fire for short-TTL: $expired")

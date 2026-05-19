@@ -1,0 +1,437 @@
+package ru.sipaha.spkremote.app.vm
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+import ru.sipaha.spkremote.app.data.ListCacheRepository
+import ru.sipaha.spkremote.core.AgentSummary
+import ru.sipaha.spkremote.core.CreateSessionResult
+import ru.sipaha.spkremote.core.GetSessionChildrenResult
+import ru.sipaha.spkremote.core.JsonRpc
+import ru.sipaha.spkremote.core.ListAgentsResult
+import ru.sipaha.spkremote.core.ListSessionsResult
+import ru.sipaha.spkremote.core.MessageAppendedPayload
+import ru.sipaha.spkremote.core.RemoteClient
+import ru.sipaha.spkremote.core.SessionCreatedPayload
+import ru.sipaha.spkremote.core.SessionSummary
+
+/**
+ * Sessions-list + agents + create-session + sub-agent children + the
+ * single shared notifications collector. The "list seam" half of the
+ * previous god-object `SessionStore`.
+ *
+ * Responsibilities:
+ *   - per-solution sessions list with single-flight refresh + cache hydration,
+ *   - agents catalogue + auto-open-after-create flag,
+ *   - create / rename / close-by-id orchestration,
+ *   - sub-agent children map,
+ *   - the single notifications-observer that fans out to both this store
+ *     and [SessionDetailStore] (the detail side is consulted via a small
+ *     callback set by the coordinator on construction).
+ *
+ * ### Invariants
+ *
+ *  1. **One notifications observer per active client** — started lazily
+ *     when either [startObservingSessions] or [SessionDetailStore.openSession]
+ *     needs it, torn down in [reset] on server switch.
+ *  2. **`refreshSessionsJob` is single-flight** — see [singleFlightRefresh]
+ *     for the semantics. A new refresh cancels the previous in-flight one.
+ *  3. **The create-session in-flight flag is server-scoped** — it MUST
+ *     be cleared in [reset] otherwise a server switch mid-create leaves
+ *     the "Create" button permanently disabled on the new server.
+ */
+internal class SessionListStore(
+    private val scope: CoroutineScope,
+    private val context: ConnectionContext,
+    private val listCacheRepository: ListCacheRepository,
+    private val lastSeen: LastSeenIndex,
+) {
+    private val _sessions = MutableStateFlow<UiData<List<SessionSummary>>>(UiData.Loading)
+    val sessions: StateFlow<UiData<List<SessionSummary>>> = _sessions.asStateFlow()
+
+    private val _agents = MutableStateFlow<UiData<List<AgentSummary>>>(UiData.Loading)
+    val agents: StateFlow<UiData<List<AgentSummary>>> = _agents.asStateFlow()
+
+    private val _createSessionInFlight = MutableStateFlow(false)
+    val createSessionInFlight: StateFlow<Boolean> = _createSessionInFlight.asStateFlow()
+
+    private val _lastCreateAutoOpened = MutableStateFlow(false)
+    val lastCreateAutoOpened: StateFlow<Boolean> = _lastCreateAutoOpened.asStateFlow()
+
+    private val _sessionChildren = MutableStateFlow<Map<String, List<SessionSummary>>>(emptyMap())
+    val sessionChildren: StateFlow<Map<String, List<SessionSummary>>> = _sessionChildren.asStateFlow()
+
+    /**
+     * Detail-side notification routing — wired by the coordinator after
+     * both stores are constructed. The list store owns the collector
+     * (so we don't double-subscribe) and just delegates detail-shaped
+     * events through this callback.
+     */
+    internal var detailNotificationRouter: DetailNotificationRouter? = null
+
+    private var listSubscribed = false
+    private var detailSubscribed = false
+    private var notificationsObserverJob: Job? = null
+
+    /**
+     * The currently-observed solution id for the list path. Null when
+     * no list observer is active. The single notification collector
+     * reads this to decide whether to refresh the sessions list when
+     * an `agent_session_*` event arrives.
+     */
+    @Volatile
+    private var observingSolutionId: String? = null
+
+    private var refreshSessionsJob: Job? = null
+
+    /** Tear-down hook called from coordinator on server switch / disconnect. */
+    fun reset() {
+        notificationsObserverJob?.cancel()
+        notificationsObserverJob = null
+        observingSolutionId = null
+        refreshSessionsJob?.cancel()
+        refreshSessionsJob = null
+        listSubscribed = false
+        detailSubscribed = false
+        _sessions.value = UiData.Loading
+        _agents.value = UiData.Loading
+        _sessionChildren.value = emptyMap()
+        // The create-session in-flight flag is keyed to the *previous*
+        // server's client. If a create was racing the server switch its
+        // continuation no-ops on the new server, so we must clear the
+        // flag here — otherwise the Create button stays permanently
+        // disabled on the new server.
+        _createSessionInFlight.value = false
+    }
+
+    fun refreshSessions(solutionId: String) {
+        val active = context.activeClient()
+        if (active == null) {
+            val cached = listCacheRepository.loadSessions(solutionId)
+            if (cached != null) {
+                _sessions.value = UiData.Loaded(cached)
+                context.emitError(context.notConnectedMessage())
+            } else {
+                _sessions.value = UiData.Error(context.notConnectedMessage())
+            }
+            return
+        }
+        if (_sessions.value !is UiData.Loaded) {
+            val cached = listCacheRepository.loadSessions(solutionId)
+            if (cached != null) {
+                _sessions.value = UiData.Loaded(cached)
+            } else {
+                _sessions.value = UiData.Loading
+            }
+        }
+        val params = buildJsonObject { put("solution_id", solutionId) }
+        singleFlightRefresh(
+            scope = scope,
+            target = _sessions,
+            jobHolder = { refreshSessionsJob },
+            setJob = { refreshSessionsJob = it },
+            emitError = { context.emitError("Couldn't refresh sessions: $it") },
+            fetch = {
+                val resp = active.call("remote.solution_agent.list_sessions", params)
+                resp.decodeResultOrThrow(ListSessionsResult.serializer()).sessions
+            },
+            onSuccess = { listCacheRepository.saveSessions(solutionId, it) },
+        )
+    }
+
+    fun startObservingSessions(solutionId: String) {
+        if (context.activeClient() == null) return
+        observingSolutionId = solutionId
+        ensureNotificationsObserver()
+    }
+
+    fun stopObservingSessions() {
+        observingSolutionId = null
+        // Don't tear the consolidated observer down if a detail screen
+        // is still mounted — only ditch this side of the fan-out. The
+        // observer itself is cancelled by [reset] on server switch.
+    }
+
+    fun clearSessions() {
+        _sessions.value = UiData.Loading
+    }
+
+    /**
+     * Public entry point for the detail store to make sure the
+     * notifications collector is running. Idempotent.
+     */
+    fun ensureNotificationsObserver() {
+        val active = context.activeClient() ?: return
+        if (notificationsObserverJob?.isActive == true) return
+        notificationsObserverJob = scope.launch {
+            // Subscribe to both list-level and detail-level kinds in one
+            // call so the server only sees one subscription event. The
+            // subscribe() call is idempotent on the server side.
+            if (!listSubscribed || !detailSubscribed) {
+                runCatching {
+                    active.subscribe(
+                        listOf(
+                            "agent_session_state_changed",
+                            "agent_session_created",
+                            "agent_session_closed",
+                            "agent_session_title_changed",
+                            "agent_session_message_appended",
+                        ),
+                    )
+                }.onSuccess {
+                    listSubscribed = true
+                    detailSubscribed = true
+                }
+            }
+            active.notifications.collect { frame ->
+                val params = (frame as? JsonObject)?.get("params") as? JsonObject
+                    ?: return@collect
+                val kind = params["kind"]?.jsonPrimitive?.content ?: return@collect
+                val data = params["data"] as? JsonObject
+                handleNotification(kind, data)
+            }
+        }
+    }
+
+    private fun handleNotification(kind: String, data: JsonObject?) {
+        // List handler — refresh sessions list when a session-shaped
+        // event arrives, regardless of whether a detail screen is also
+        // mounted.
+        val solutionId = observingSolutionId
+        when (kind) {
+            "agent_session_state_changed",
+            "agent_session_created",
+            "agent_session_closed",
+            "agent_session_title_changed" -> if (solutionId != null) refreshSessions(solutionId)
+        }
+
+        // Detail handler — fan out to the detail store. The router
+        // is responsible for filtering by [SessionDetailStore.openSessionId].
+        val router = detailNotificationRouter ?: return
+        when (kind) {
+            "agent_session_created" -> {
+                val payload = data?.let {
+                    runCatching {
+                        JsonRpc.json.decodeFromJsonElement(
+                            SessionCreatedPayload.serializer(),
+                            it,
+                        )
+                    }.getOrNull()
+                } ?: return
+                val parent = payload.parentSessionId ?: return
+                router.onChildSessionCreated(parent)
+            }
+            "agent_session_message_appended" -> {
+                if (data == null) {
+                    router.onMessageAppendedFallback()
+                    return
+                }
+                val payload = runCatching {
+                    JsonRpc.json.decodeFromJsonElement(
+                        MessageAppendedPayload.serializer(),
+                        data,
+                    )
+                }.getOrNull()
+                if (payload == null) {
+                    router.onMessageAppendedFallback()
+                    return
+                }
+                router.onMessageAppended(payload)
+            }
+            "agent_session_state_changed",
+            "agent_session_title_changed" -> {
+                val notifSessionId = data?.get("session_id")?.jsonPrimitive?.content
+                router.onSessionStateOrTitleChanged(notifSessionId)
+            }
+        }
+    }
+
+    /**
+     * Fetch the sub-agent children of [sessionId] and merge into
+     * [_sessionChildren]. Public so the detail store can request it on
+     * [SessionDetailStore.openSession] / on parent-creation events.
+     */
+    fun loadChildren(sessionId: String) {
+        val active = context.activeClient() ?: return
+        val params = buildJsonObject { put("session_id", sessionId) }
+        scope.launch {
+            runCatching { active.call("remote.solution_agent.get_session_children", params) }
+                .mapCatching { resp ->
+                    resp.decodeResultOrThrow(GetSessionChildrenResult.serializer())
+                }
+                .onSuccess { result ->
+                    _sessionChildren.value = _sessionChildren.value + (sessionId to result.children)
+                }
+        }
+    }
+
+    fun loadAgents() {
+        val active = context.activeClient()
+        _lastCreateAutoOpened.value = false
+        if (active == null) {
+            _agents.value = UiData.Error(context.notConnectedMessage())
+            return
+        }
+        _agents.value = UiData.Loading
+        scope.launch {
+            runCatching {
+                active.call("remote.solution_agent.list_agents", buildJsonObject {})
+            }
+                .mapCatching { resp ->
+                    resp.decodeResultOrThrow(ListAgentsResult.serializer()).agents
+                }
+                .onSuccess { _agents.value = UiData.Loaded(it) }
+                .onFailure { _agents.value = UiData.Error(it.message ?: "unknown error") }
+        }
+    }
+
+    fun createSession(
+        solutionId: String,
+        agentId: String,
+        initialMessage: String?,
+        title: String?,
+        cwd: String?,
+        onCreated: (sessionId: String) -> Unit,
+    ) {
+        val active = context.activeClient()
+        if (active == null) {
+            context.emitError(context.notConnectedMessage())
+            return
+        }
+        if (_createSessionInFlight.value) return
+        _createSessionInFlight.value = true
+        _lastCreateAutoOpened.value = false
+        scope.launch {
+            val firstAttempt = attemptCreateSession(active, solutionId, agentId, initialMessage, title, cwd)
+            firstAttempt
+                .onSuccess { sessionId ->
+                    _createSessionInFlight.value = false
+                    onCreated(sessionId)
+                }
+                .onFailure { firstError ->
+                    val message = firstError.message.orEmpty()
+                    if (message.contains("no_active_workspace_for_solution", ignoreCase = true)) {
+                        val opened = attemptOpenSolution(active, solutionId)
+                        if (opened.isFailure) {
+                            _createSessionInFlight.value = false
+                            val openErr = opened.exceptionOrNull()?.message ?: "open failed"
+                            context.emitError("Couldn't open solution: $openErr")
+                            return@launch
+                        }
+                        val retry = attemptCreateSession(active, solutionId, agentId, initialMessage, title, cwd)
+                        retry
+                            .onSuccess { sessionId ->
+                                _lastCreateAutoOpened.value = true
+                                _createSessionInFlight.value = false
+                                onCreated(sessionId)
+                            }
+                            .onFailure { retryErr ->
+                                _createSessionInFlight.value = false
+                                context.emitError(
+                                    "Create session failed after opening: ${retryErr.message ?: "?"}",
+                                )
+                            }
+                    } else {
+                        _createSessionInFlight.value = false
+                        context.emitError("Create session failed: ${message.ifBlank { "?" }}")
+                    }
+                }
+        }
+    }
+
+    private suspend fun attemptCreateSession(
+        active: RemoteClient,
+        solutionId: String,
+        agentId: String,
+        initialMessage: String?,
+        title: String?,
+        cwd: String?,
+    ): Result<String> {
+        val params = buildJsonObject {
+            put("solution_id", solutionId)
+            put("agent_id", agentId)
+            if (!initialMessage.isNullOrBlank()) {
+                put("initial_message", initialMessage)
+            }
+            if (!title.isNullOrBlank()) {
+                put("title", title)
+            }
+            if (!cwd.isNullOrBlank()) {
+                put("cwd", cwd)
+            }
+        }
+        return runCatching {
+            val resp = active.call("remote.solution_agent.create_session", params)
+            resp.decodeResultOrThrow(CreateSessionResult.serializer()).sessionId
+        }
+    }
+
+    fun renameSession(sessionId: String, newTitle: String) {
+        val active = context.activeClient()
+        if (active == null) {
+            context.emitError(context.notConnectedMessage())
+            return
+        }
+        val trimmed = newTitle.trim()
+        if (trimmed.isEmpty()) {
+            context.emitError("Session title can't be empty")
+            return
+        }
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("title", trimmed)
+        }
+        scope.launch {
+            runCatching { active.call("remote.solution_agent.rename_session", params) }
+                .mapCatching { resp ->
+                    val err = resp.error
+                    if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
+                }
+                .onFailure { context.emitError("Couldn't rename session: ${it.message ?: "?"}") }
+        }
+    }
+
+    private suspend fun attemptOpenSolution(
+        active: RemoteClient,
+        solutionId: String,
+    ): Result<Unit> {
+        val params = buildJsonObject { put("solution_id", solutionId) }
+        return runCatching {
+            val resp = active.call("remote.solutions.open", params)
+            val err = resp.error
+            if (err != null) error(err.message)
+            val toolErr = resp.toolError()
+            if (toolErr != null) error(toolErr)
+        }
+    }
+}
+
+/**
+ * Callback surface that [SessionListStore] uses to forward detail-shaped
+ * notifications to [SessionDetailStore]. Each method is invoked from
+ * the single consolidated collector coroutine inside the list store —
+ * implementations should treat them as ordinary suspend-friendly
+ * dispatch points and offload work to their own scope.
+ */
+internal interface DetailNotificationRouter {
+    /** Called when a child session was created somewhere; the detail store decides if [parentSessionId] matches its open session. */
+    fun onChildSessionCreated(parentSessionId: String)
+
+    /** Typed payload for a message-appended event. */
+    fun onMessageAppended(payload: MessageAppendedPayload)
+
+    /** Fallback when the message-appended notification couldn't be decoded — full refetch. */
+    fun onMessageAppendedFallback()
+
+    /** A session-state or title-change notification. [notifSessionId] is null when the payload didn't carry one. */
+    fun onSessionStateOrTitleChanged(notifSessionId: String?)
+}
