@@ -240,6 +240,7 @@ fun SessionDetailScreen(
     val activeSummary: SessionSummary? = sessionsCache.firstOrNull { it.id == sessionId }
     val activeTotalTokens: Long? = activeSummary?.totalTokens
     val activeMaxTokens: Long? = activeSummary?.maxTokens
+    val activeStateStartedAtMs: Long? = activeSummary?.stateStartedAtMs
     Scaffold(
         topBar = {
             SlimTopBar(
@@ -253,6 +254,10 @@ fun SessionDetailScreen(
                             maxTokens = activeMaxTokens,
                         )
                         StatePill(state = displayState, raw = rawState)
+                        RunningElapsed(
+                            displayState = displayState,
+                            stateStartedAtMs = activeStateStartedAtMs,
+                        )
                         // Overflow menu — Reset / Compact context. The
                         // anchor's `Box` wrapping is what lets DropdownMenu
                         // compute its caret position; placing the menu
@@ -1483,6 +1488,41 @@ internal fun formatElapsed(secs: Long): String {
         s < 3600L -> String.format(java.util.Locale.ROOT, "%dm%02ds", s / 60L, s % 60L)
         else -> String.format(java.util.Locale.ROOT, "%dh%02dm", s / 3600L, (s % 3600L) / 60L)
     }
+}
+
+/**
+ * Live "Xs" badge rendered next to the [StatePill] in the chat top bar
+ * while the session is in `Running` state. Ticks once per second from
+ * [stateStartedAtMs], a wall-clock anchor populated server-side from
+ * the monotonic `SessionState::Running { started_at: Instant }`.
+ *
+ * Renders nothing when state isn't Running OR when the server omits
+ * the anchor (pre-`state_started_at_ms` build). Mirrors the per-tool
+ * elapsed badge in [ToolCallBubble] both visually and in tick-cancel
+ * semantics — the [LaunchedEffect] rekeys on `displayState`, so the
+ * coroutine exits the moment the agent reports Idle / AwaitingInput /
+ * Errored.
+ */
+@Composable
+internal fun RunningElapsed(displayState: DisplayState, stateStartedAtMs: Long?) {
+    if (displayState != DisplayState.Running || stateStartedAtMs == null) return
+    var elapsedSeconds by remember(stateStartedAtMs) {
+        mutableStateOf(
+            ((System.currentTimeMillis() - stateStartedAtMs) / 1000L).coerceAtLeast(0L)
+        )
+    }
+    LaunchedEffect(stateStartedAtMs, displayState) {
+        if (displayState != DisplayState.Running) return@LaunchedEffect
+        while (true) {
+            delay(1000L)
+            elapsedSeconds = ((System.currentTimeMillis() - stateStartedAtMs) / 1000L)
+                .coerceAtLeast(0L)
+        }
+    }
+    Text(
+        text = formatElapsed(elapsedSeconds),
+        style = MaterialTheme.typography.labelSmall,
+    )
 }
 
 /**

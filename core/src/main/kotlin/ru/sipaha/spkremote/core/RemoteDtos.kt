@@ -84,6 +84,16 @@ data class SessionSummary(
      */
     @SerialName("max_tokens") val maxTokens: Long? = null,
     /**
+     * Wall-clock ms when [state] last flipped to `Running` (server-side
+     * derived from the monotonic `Instant` payload inside the Rust
+     * `SessionState::Running` variant). `null` when state isn't
+     * currently Running, or when the server omits the field (pre-
+     * `state_started_at_ms` build). Lets the chat header tick a
+     * "Running for Xs" badge from a local clock without polling the
+     * server for elapsed updates.
+     */
+    @SerialName("state_started_at_ms") val stateStartedAtMs: Long? = null,
+    /**
      * Parent session id when this session was spawned by another agent
      * (Claude Code Task dispatch, etc.). Null at the top of the tree.
      * Drives the sub-agent chip row on `SessionDetailScreen` (F-phone).

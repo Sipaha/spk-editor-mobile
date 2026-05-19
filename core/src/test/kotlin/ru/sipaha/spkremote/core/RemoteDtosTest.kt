@@ -801,6 +801,50 @@ class RemoteDtosTest {
     }
 
     @Test
+    fun `SessionSummary round-trips with state_started_at_ms populated`() {
+        // Mobile R-running-elapsed: server-side serialises the wall-clock
+        // anchor when SessionState::Running is active so the chat header
+        // can tick "Running for Xs" without polling. DTO must round-trip.
+        val text = """
+            {
+              "id": "ses-running",
+              "solution_id": "sol-1",
+              "agent_id": "claude",
+              "title": "In flight",
+              "state": "Running",
+              "created_at": 1715900000000,
+              "last_activity_at": 1715900200000,
+              "state_started_at_ms": 1715900201500
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(SessionSummary.serializer(), text)
+        assertEquals(1715900201500L, parsed.stateStartedAtMs)
+
+        val reencoded = JsonRpc.json.encodeToString(SessionSummary.serializer(), parsed)
+        val again = JsonRpc.json.decodeFromString(SessionSummary.serializer(), reencoded)
+        assertEquals(parsed, again)
+    }
+
+    @Test
+    fun `SessionSummary defaults state_started_at_ms to null when omitted by Idle session`() {
+        // Server skips the field when state != Running, and on pre-anchor
+        // builds it's never sent. DTO must decode to null in both cases.
+        val text = """
+            {
+              "id": "ses-idle",
+              "solution_id": "sol-1",
+              "agent_id": "claude",
+              "title": "Quiet",
+              "state": "Idle",
+              "created_at": 0,
+              "last_activity_at": 0
+            }
+        """.trimIndent()
+        val parsed = JsonRpc.json.decodeFromString(SessionSummary.serializer(), text)
+        assertNull(parsed.stateStartedAtMs)
+    }
+
+    @Test
     fun `SessionSummary defaults total_tokens and parent_session_id to null when omitted`() {
         // Back-compat with pre-F-server payloads: both fields absent →
         // both decode to null. Critical so a mixed-version mobile/server
