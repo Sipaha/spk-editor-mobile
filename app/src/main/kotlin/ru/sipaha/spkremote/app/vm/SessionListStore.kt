@@ -22,6 +22,7 @@ import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.SessionCreatedPayload
 import ru.sipaha.spkremote.core.SessionSummary
+import ru.sipaha.spkremote.core.UploadChunkAckedPayload
 
 /**
  * Sessions-list + agents + create-session + sub-agent children + the
@@ -77,6 +78,16 @@ internal class SessionListStore(
      * events through this callback.
      */
     internal var detailNotificationRouter: DetailNotificationRouter? = null
+
+    /**
+     * Upload-ack notification routing — wired by the coordinator after
+     * [UploadManager] is constructed. The single collector receives
+     * `upload_chunk_acked` notifications and forwards them via this
+     * callback so the per-upload state-machine coroutine can advance
+     * its offset. Same single-collector discipline as the detail
+     * router above to avoid double subscriptions.
+     */
+    internal var uploadNotificationRouter: ((UploadChunkAckedPayload) -> Unit)? = null
 
     private var listSubscribed = false
     private var detailSubscribed = false
@@ -202,6 +213,14 @@ internal class SessionListStore(
                             "agent_session_closed",
                             "agent_session_title_changed",
                             "agent_session_message_appended",
+                            // Chunked-upload acks share this collector — server
+                            // forwards them through the same notification path
+                            // (allow_list pattern `upload_*`). Subscribing
+                            // here keeps a single notification observer per
+                            // active client; without this UploadManager would
+                            // need its own subscribe + collector duplicating
+                            // the lifecycle handling.
+                            "upload_chunk_acked",
                         ),
                     )
                 }.onSuccess {
@@ -220,6 +239,23 @@ internal class SessionListStore(
     }
 
     private fun handleNotification(kind: String, data: JsonObject?) {
+        // Upload-ack — bypass the list/detail branches entirely; this
+        // is the chunked-upload notification path (see
+        // [uploadNotificationRouter] kdoc).
+        if (kind == "upload_chunk_acked") {
+            val router = uploadNotificationRouter ?: return
+            val payload = data?.let {
+                runCatching {
+                    JsonRpc.json.decodeFromJsonElement(
+                        UploadChunkAckedPayload.serializer(),
+                        it,
+                    )
+                }.getOrNull()
+            } ?: return
+            router(payload)
+            return
+        }
+
         // List handler — refresh sessions list when a session-shaped
         // event arrives, regardless of whether a detail screen is also
         // mounted.

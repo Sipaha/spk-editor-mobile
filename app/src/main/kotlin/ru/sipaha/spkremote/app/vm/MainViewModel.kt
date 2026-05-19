@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.sipaha.spkremote.app.data.DraftRepository
+import ru.sipaha.spkremote.app.data.InFlightUploadsRepository
 import ru.sipaha.spkremote.app.data.LastSeenRepository
 import ru.sipaha.spkremote.app.data.ListCacheRepository
 import ru.sipaha.spkremote.app.data.NavStateRepository
@@ -111,6 +112,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
             connectionMgr.activeServerId.value
         }
 
+    private val inFlightUploadsRepository: InFlightUploadsRepository =
+        InFlightUploadsRepository.get(application) { connectionMgr.activeServerId.value }
+
     // ---- Collaborators (internal names suffixed with `Mgr` / `Store` so
     // they don't clash with the public state-flow names below). ----
 
@@ -147,6 +151,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         sessionList = sessionList,
         sessionHistoryRepository = sessionHistoryRepository,
     )
+
+    /**
+     * Chunked-upload coordinator for the mobile attach flow. Constructed
+     * here so its lifetime matches the coordinator's; the compose row
+     * reaches it via [startAttachmentUpload] / [cancelAttachmentUpload] /
+     * [forgetAttachmentUpload] / [attachmentUploadStateOf] etc.
+     */
+    private val uploadManager: UploadManager = UploadManager(
+        scope = viewModelScope,
+        context = this,
+        persistence = inFlightUploadsRepository,
+        contentResolver = application.contentResolver,
+    ).also {
+        // Wire the upload-ack notification fan-out: the single shared
+        // collector in SessionListStore forwards every upload_chunk_acked
+        // payload to UploadManager via this callback. Mirrors how
+        // SessionDetailStore plugs into the same observer via
+        // DetailNotificationRouter.
+        sessionList.uploadNotificationRouter = it::onChunkAcked
+    }
 
     init {
         // Foreground-refresh hook (see ForegroundEventBus KDoc + the
@@ -194,6 +218,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         // Pull the solutions cache so the navigation surface is
         // interactable before the live refresh lands.
         solutionStore.hydrateFromCache()
+        // Revive any in-flight uploads persisted by a previous process
+        // for THIS server. resumeAllFromDisk is idempotent — calling
+        // it twice on a rapid re-bind is fine, the second call's list
+        // will skip entries that are already registered in memory.
+        uploadManager.resumeAllFromDisk()
     }
 
     override fun onTearDown() {
@@ -203,6 +232,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         solutionStore.reset()
         sessionList.reset()
         sessionDetail.reset()
+        // The client just went away — every chunk-loop coroutine
+        // would otherwise immediately see sendBinary return false on
+        // its next iteration. Pause them explicitly so the StateFlow
+        // surfaces a "paused (disconnected)" label rather than
+        // racing into Failed states.
+        uploadManager.pauseAll("connection closed")
     }
 
     override fun onReconnected() {
@@ -214,6 +249,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
             sessionDetail.resumeSession(openSid)
         }
         solutionStore.refreshSolutions()
+        // Wake any paused upload coroutines back up. Each will hit
+        // upload_status first (server is authoritative on offset).
+        uploadManager.resumeAll()
     }
 
     override fun onMessageExpired(message: QueuedMessage) {
@@ -290,6 +328,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
             navStateRepository.clearFor(serverId)
             listCacheRepository.clearAllFor(serverId)
             sessionHistoryRepository.evictAll(serverId)
+            // Wipe in-flight uploads for the removed server so a
+            // future reconnect against a different server doesn't
+            // attempt a resume against a wire that knows nothing
+            // about those upload_ids.
+            uploadManager.forgetAllForServer(serverId)
             connectionMgr.removeServer(serverId)
         }
     }
@@ -377,6 +420,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
 
     suspend fun saveDraft(sessionId: String, text: String) = sessionDetail.saveDraft(sessionId, text)
     fun clearDraft(sessionId: String) = sessionDetail.clearDraft(sessionId)
+
+    // ---- Chunked-upload surface for the attach flow ----
+
+    /** See [UploadManager.start]. */
+    fun startAttachmentUpload(
+        uri: android.net.Uri,
+        sessionId: String,
+        mime: String,
+        displayName: String,
+        totalSize: Long,
+    ): Pair<String, kotlinx.coroutines.flow.StateFlow<UploadManager.State>> =
+        uploadManager.start(uri, sessionId, mime, displayName, totalSize)
+
+    /** See [UploadManager.cancel]. */
+    fun cancelAttachmentUpload(localKey: String) = uploadManager.cancel(localKey)
+
+    /** See [UploadManager.forget]. */
+    fun forgetAttachmentUpload(localKey: String) = uploadManager.forget(localKey)
+
+    /** See [UploadManager.awaitTerminal]. */
+    suspend fun awaitAttachmentUploadTerminal(localKey: String): String? =
+        uploadManager.awaitTerminal(localKey)
 
     // ---- Nav-state surface (no collaborator — this is a tiny two-method
     // hook directly on the coordinator). ----
