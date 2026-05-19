@@ -373,6 +373,44 @@ internal class SessionListStore(
         }
     }
 
+    /**
+     * Close the session [sessionId] on the server. On success, optimistically
+     * remove the session from the in-memory list (so the row vanishes
+     * immediately even before the `agent_session_closed` notification round-
+     * trips back) and trigger a refresh against the currently-observed
+     * solution (if any) so cached state stays consistent with the server.
+     * Failures surface through the shared error channel.
+     */
+    fun closeSession(sessionId: String) {
+        val active = context.activeClient()
+        if (active == null) {
+            context.emitError(context.notConnectedMessage())
+            return
+        }
+        val params = buildJsonObject { put("session_id", sessionId) }
+        scope.launch {
+            runCatching { active.call("remote.solution_agent.close_session", params) }
+                .mapCatching { resp ->
+                    val err = resp.error
+                    if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
+                }
+                .onSuccess {
+                    val current = _sessions.value
+                    if (current is UiData.Loaded) {
+                        val filtered = current.value.filterNot { it.id == sessionId }
+                        if (filtered.size != current.value.size) {
+                            _sessions.value = UiData.Loaded(filtered)
+                        }
+                    }
+                    val solutionId = observingSolutionId
+                    if (solutionId != null) refreshSessions(solutionId)
+                }
+                .onFailure { context.emitError("Couldn't close session: ${it.message ?: "?"}") }
+        }
+    }
+
     fun renameSession(sessionId: String, newTitle: String) {
         val active = context.activeClient()
         if (active == null) {

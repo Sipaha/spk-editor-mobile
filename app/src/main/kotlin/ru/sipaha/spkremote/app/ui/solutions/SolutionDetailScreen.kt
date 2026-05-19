@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -26,6 +27,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -175,6 +177,7 @@ fun SolutionDetailScreen(
                                 SessionRow(
                                     session = session,
                                     onClick = { onOpenSession(session) },
+                                    onDelete = { viewModel.closeSession(session.id) },
                                 )
                                 HorizontalDivider()
                             }
@@ -199,27 +202,62 @@ fun SolutionDetailScreen(
 }
 
 @Composable
-private fun SessionRow(session: SessionSummary, onClick: () -> Unit) {
+private fun SessionRow(
+    session: SessionSummary,
+    onClick: () -> Unit,
+    onDelete: () -> Unit,
+) {
     val display = parseDisplayState(session.state)
-    Column(
+    // Per-row confirmation toggle. Local-state — when the row is removed
+    // from the list (post-delete refresh) the state is discarded along
+    // with it, so there's no need to reset on success.
+    var confirmDelete by remember { mutableStateOf(false) }
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = !confirmDelete, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = session.title.ifBlank { "(untitled session)" },
-            style = MaterialTheme.typography.titleMedium,
-        )
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            StatePill(state = display, raw = session.state)
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
             Text(
-                text = relativeTime(session.lastActivityAt),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 8.dp),
+                text = session.title.ifBlank { "(untitled session)" },
+                style = MaterialTheme.typography.titleMedium,
             )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                StatePill(state = display, raw = session.state)
+                Text(
+                    text = relativeTime(session.lastActivityAt),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
+            }
+        }
+        if (confirmDelete) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Delete?",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                TextButton(onClick = {
+                    confirmDelete = false
+                    onDelete()
+                }) { Text("Yes") }
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            }
+        } else {
+            IconButton(onClick = { confirmDelete = true }) {
+                Icon(
+                    Icons.Filled.Delete,
+                    contentDescription = "Delete session",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

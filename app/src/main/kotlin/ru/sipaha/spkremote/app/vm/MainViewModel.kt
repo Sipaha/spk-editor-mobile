@@ -276,6 +276,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     fun clearSessions() = sessionList.clearSessions()
     fun openSession(sessionId: String) = sessionDetail.openSession(sessionId)
     fun closeSession() = sessionDetail.closeSession()
+    fun closeSession(sessionId: String) = sessionList.closeSession(sessionId)
     fun loadOlder(sessionId: String) = sessionDetail.loadOlder(sessionId)
     fun sendMessage(text: String) = sessionDetail.sendMessage(text)
     fun cancelTurn() = sessionDetail.cancelTurn()
