@@ -14,10 +14,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import ru.sipaha.spkremote.app.data.CachedSessionHistory
 import ru.sipaha.spkremote.app.data.DraftRepository
+import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.GetSessionResult
+import ru.sipaha.spkremote.core.MergeOutcome
 import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.QueueTtlException
 import ru.sipaha.spkremote.core.QueuedMessage
@@ -25,8 +28,10 @@ import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.RestartAgentResult
 import ru.sipaha.spkremote.core.StartCompactResult
 import ru.sipaha.spkremote.core.applyAppendedPlaceholder
+import ru.sipaha.spkremote.core.mergeSessionHistory
 import ru.sipaha.spkremote.core.parseExpiredSendMessage
 import ru.sipaha.spkremote.core.reconcileOptimisticContent
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
 
 /** Page size for [SessionDetailStore.openSession] / [SessionDetailStore.loadOlder]. */
@@ -67,7 +72,21 @@ internal class SessionDetailStore(
     private val draftRepository: DraftRepository,
     private val lastSeen: LastSeenIndex,
     private val sessionList: SessionListStore,
+    private val sessionHistoryRepository: SessionHistoryRepository,
 ) : DetailNotificationRouter {
+
+    /**
+     * Sessions whose `start_compact` returned `queued=true` and are
+     * waiting for the matching `agent_session_created` notification
+     * (with `parent_session_id` set to one of these) to arrive — at
+     * which point the parent's history cache is evicted.
+     *
+     * Thread-safe set wrapping a synchronised map; reads + mutations
+     * cross the notification observer thread + the RPC continuation
+     * thread.
+     */
+    private val pendingCompactSourceIds: MutableSet<String> =
+        Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
 
     private val _session = MutableStateFlow<UiData<GetSessionResult>>(UiData.Loading)
     val session: StateFlow<UiData<GetSessionResult>> = _session.asStateFlow()
@@ -167,16 +186,39 @@ internal class SessionDetailStore(
         // between them (audit Fix M). The mutex covers both reads inside
         // the observer (when it checks `openSessionId == sessionId`) and
         // writes here.
+        val cached = sessionHistoryRepository.load(sessionId)
         scope.launch {
             sessionMutex.withLock {
                 openSessionId = sessionId
-                _session.value = UiData.Loading
                 _isLoadingOlder.value = false
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
                 lastSeen.primeFromDisk(sessionId)
+                if (cached != null && cached.entries.isNotEmpty()) {
+                    // Render the cached transcript immediately so the
+                    // chat surface is interactive while the diff fetch
+                    // is in flight. We synthesise a minimal
+                    // GetSessionResult; missing fields (state, title,
+                    // timestamps) are overwritten by the first
+                    // successful diff / full fetch.
+                    _session.value = UiData.Loaded(
+                        GetSessionResult(
+                            id = cached.sessionId,
+                            solutionId = cached.solutionId,
+                            agentId = cached.agentId,
+                            title = "",
+                            state = "Idle",
+                            createdAt = 0L,
+                            lastActivityAt = 0L,
+                            entries = cached.entries,
+                            totalCount = cached.totalCountAtLastWrite,
+                        ),
+                    )
+                } else {
+                    _session.value = UiData.Loading
+                }
             }
-            fetchInitialPage(active, sessionId)
+            fetchInitialOrDiff(active, sessionId, cached)
         }
         sessionList.loadChildren(sessionId)
         sessionList.ensureNotificationsObserver()
@@ -199,6 +241,13 @@ internal class SessionDetailStore(
     // -------------------------------------------------------------------------
 
     override fun onChildSessionCreated(parentSessionId: String) {
+        // Compact two-phase eviction: if [parentSessionId] is one of our
+        // pending compact sources, the new child IS the compacted-into
+        // session; the old (parent) session is now closable and its
+        // cache should go. Idempotent eviction is fine.
+        if (pendingCompactSourceIds.remove(parentSessionId)) {
+            sessionHistoryRepository.evict(parentSessionId)
+        }
         val openSid = openSessionId ?: return
         if (parentSessionId == openSid) {
             sessionList.loadChildren(parentSessionId)
@@ -256,6 +305,7 @@ internal class SessionDetailStore(
             val result = runCatching {
                 active.getSessionEntry(sessionId, index, includeImages = true)
             }.getOrNull() ?: return@launch
+            var snapshotForCache: GetSessionResult? = null
             sessionMutex.withLock {
                 // stale-write barrier (see class kdoc invariant 1)
                 if (openSessionId != sessionId) return@withLock
@@ -272,8 +322,15 @@ internal class SessionDetailStore(
                         return@withLock
                     }
                 }
-                _session.value = UiData.Loaded(current.value.copy(entries = newEntries))
+                val updated = current.value.copy(entries = newEntries)
+                _session.value = UiData.Loaded(updated)
                 reconcileOptimisticLocked(newEntries)
+                snapshotForCache = updated
+            }
+            // Persist cache outside the mutex — repository write is
+            // already debounced + IO-dispatched.
+            snapshotForCache?.let {
+                persistCache(sessionId, it, it.entries, it.totalCount)
             }
         }
     }
@@ -293,35 +350,155 @@ internal class SessionDetailStore(
             _session.value = UiData.Loaded(result)
             reconcileOptimisticLocked(result.entries)
         }
+        persistCache(sessionId, result, result.entries, result.totalCount)
     }
 
     private suspend fun fetchInitialPage(active: RemoteClient, sessionId: String) {
+        fetchInitialOrDiff(active, sessionId, cached = null)
+    }
+
+    /**
+     * Pull either a full initial page (no cache, or `after_index` cursor
+     * absent) or a diff against [cached] via `after_index=cached.lastIndex`.
+     * Resolves the [MergeOutcome] in-place: [MergeOutcome.FullReplace] +
+     * [MergeOutcome.Appended] splice into `_session.value`;
+     * [MergeOutcome.GapDetected] retries WITHOUT `after_index` and full-
+     * replaces.
+     */
+    private suspend fun fetchInitialOrDiff(
+        active: RemoteClient,
+        sessionId: String,
+        cached: CachedSessionHistory?,
+    ) {
+        val afterIndex: Int? = cached
+            ?.takeIf { it.entries.isNotEmpty() }
+            ?.lastIndex
         val params = buildJsonObject {
             put("session_id", sessionId)
             put("include_full_content", true)
             put("include_images", true)
-            put("count", SESSION_PAGE_SIZE)
+            if (afterIndex != null) {
+                put("after_index", afterIndex)
+            } else {
+                put("count", SESSION_PAGE_SIZE)
+            }
         }
         val outcome = runCatching { active.call("remote.solution_agent.get_session", params) }
             .mapCatching { resp -> resp.decodeResultOrThrow(GetSessionResult.serializer()) }
+        outcome
+            .onSuccess { fetched ->
+                val merged = mergeSessionHistory(
+                    cachedEntries = cached?.entries.orEmpty(),
+                    cachedLastIndex = cached?.lastIndex,
+                    cachedTotalCount = cached?.totalCountAtLastWrite ?: -1,
+                    fetched = fetched,
+                    afterIndexHint = afterIndex,
+                )
+                when (merged) {
+                    is MergeOutcome.FullReplace ->
+                        applyFullReplace(sessionId, fetched, merged.entries, merged.newTotalCount)
+                    is MergeOutcome.Appended ->
+                        applyAppended(sessionId, fetched, cached, merged.mergedEntries, merged.newTotalCount)
+                    is MergeOutcome.GapDetected -> {
+                        // Fall back to a full fetch — drop the after_index cursor.
+                        val fullParams = buildJsonObject {
+                            put("session_id", sessionId)
+                            put("include_full_content", true)
+                            put("include_images", true)
+                            put("count", SESSION_PAGE_SIZE)
+                        }
+                        val fullOutcome = runCatching {
+                            active.call("remote.solution_agent.get_session", fullParams)
+                        }.mapCatching { resp ->
+                            resp.decodeResultOrThrow(GetSessionResult.serializer())
+                        }
+                        fullOutcome
+                            .onSuccess { full ->
+                                applyFullReplace(sessionId, full, full.entries, full.totalCount)
+                            }
+                            .onFailure { applyFetchFailure(sessionId, it) }
+                    }
+                }
+            }
+            .onFailure { applyFetchFailure(sessionId, it) }
+    }
+
+    private suspend fun applyFullReplace(
+        sessionId: String,
+        fetched: GetSessionResult,
+        entries: List<EntrySummary>,
+        newTotalCount: Int,
+    ) {
         sessionMutex.withLock {
-            // stale-write barrier (see class kdoc invariant 1)
             if (openSessionId != sessionId) return@withLock
-            outcome
-                .onSuccess { result ->
-                    _session.value = UiData.Loaded(result)
-                    _isLoadingOlder.value = false
-                    reconcileOptimisticLocked(result.entries)
-                    result.entries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
-                        lastSeen.recordIfNewer(sessionId, newest.index)
-                    }
-                }
-                .onFailure {
-                    if (_session.value !is UiData.Loaded) {
-                        _session.value = UiData.Error(it.message ?: "unknown error")
-                    }
-                }
+            val result = fetched.copy(entries = entries, totalCount = newTotalCount)
+            _session.value = UiData.Loaded(result)
+            _isLoadingOlder.value = false
+            reconcileOptimisticLocked(entries)
+            entries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
+                lastSeen.recordIfNewer(sessionId, newest.index)
+            }
         }
+        persistCache(sessionId, fetched, entries, newTotalCount)
+    }
+
+    private suspend fun applyAppended(
+        sessionId: String,
+        fetched: GetSessionResult,
+        cached: CachedSessionHistory?,
+        mergedEntries: List<EntrySummary>,
+        newTotalCount: Int,
+    ) {
+        sessionMutex.withLock {
+            if (openSessionId != sessionId) return@withLock
+            val result = fetched.copy(entries = mergedEntries, totalCount = newTotalCount)
+            _session.value = UiData.Loaded(result)
+            _isLoadingOlder.value = false
+            reconcileOptimisticLocked(mergedEntries)
+            mergedEntries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
+                lastSeen.recordIfNewer(sessionId, newest.index)
+            }
+        }
+        // Fall back to the cached solutionId when the server omits it
+        // (some legacy `after_index` responses leave it blank because the
+        // session id alone is canonical for the routing layer).
+        val solutionId = fetched.solutionId.ifEmpty { cached?.solutionId.orEmpty() }
+        persistCache(
+            sessionId,
+            fetched.copy(solutionId = solutionId),
+            mergedEntries,
+            newTotalCount,
+        )
+    }
+
+    private fun applyFetchFailure(sessionId: String, throwable: Throwable) {
+        scope.launch {
+            sessionMutex.withLock {
+                if (openSessionId != sessionId) return@withLock
+                if (_session.value !is UiData.Loaded) {
+                    _session.value = UiData.Error(throwable.message ?: "unknown error")
+                }
+            }
+        }
+    }
+
+    private fun persistCache(
+        sessionId: String,
+        fetched: GetSessionResult,
+        entries: List<EntrySummary>,
+        newTotalCount: Int,
+    ) {
+        val lastIdx = entries.mapNotNull { it.index.takeIf { i -> i >= 0 } }.maxOrNull()
+        sessionHistoryRepository.save(
+            CachedSessionHistory(
+                sessionId = sessionId,
+                solutionId = fetched.solutionId,
+                agentId = fetched.agentId,
+                entries = entries,
+                lastIndex = lastIdx,
+                totalCountAtLastWrite = newTotalCount,
+            ),
+        )
     }
 
     fun loadOlder(sessionId: String) {
@@ -400,6 +577,7 @@ internal class SessionDetailStore(
                 // totalCount (audit Fix R). The previous order compared
                 // pre-dedup, which could spuriously trigger a full
                 // refetch when the resume returned overlapping entries.
+                var snapshotForCache: GetSessionResult? = null
                 sessionMutex.withLock {
                     if (openSessionId != sessionId) return@withLock
                     val latest = _session.value as? UiData.Loaded ?: return@withLock
@@ -424,13 +602,16 @@ internal class SessionDetailStore(
                         }
                         return@withLock
                     }
-                    _session.value = UiData.Loaded(
-                        latest.value.copy(entries = merged, totalCount = mergedTotal),
-                    )
+                    val updated = latest.value.copy(entries = merged, totalCount = mergedTotal)
+                    _session.value = UiData.Loaded(updated)
                     reconcileOptimisticLocked(merged)
                     fresh.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
                         lastSeen.recordIfNewer(sessionId, newest.index)
                     }
+                    snapshotForCache = updated
+                }
+                snapshotForCache?.let {
+                    persistCache(sessionId, it, it.entries, it.totalCount)
                 }
             }
             // Failed resume is recoverable — silent.
@@ -447,6 +628,7 @@ internal class SessionDetailStore(
         scope.launch {
             val outcome = runCatching { active.call("remote.solution_agent.get_session", params) }
                 .mapCatching { resp -> resp.decodeResultOrThrow(GetSessionResult.serializer()) }
+            var snapshotForCache: GetSessionResult? = null
             sessionMutex.withLock {
                 // stale-write barrier (see class kdoc invariant 1)
                 if (openSessionId != sessionId) return@withLock
@@ -454,12 +636,16 @@ internal class SessionDetailStore(
                     .onSuccess { result ->
                         _session.value = UiData.Loaded(result)
                         reconcileOptimisticLocked(result.entries)
+                        snapshotForCache = result
                     }
                     .onFailure {
                         if (_session.value !is UiData.Loaded) {
                             _session.value = UiData.Error(it.message ?: "unknown error")
                         }
                     }
+            }
+            snapshotForCache?.let {
+                persistCache(sessionId, it, it.entries, it.totalCount)
             }
         }
     }
@@ -578,7 +764,13 @@ internal class SessionDetailStore(
         scope.launch {
             runCatching { active.call("remote.solution_agent.restart_agent", params) }
                 .mapCatching { resp -> resp.decodeResultOrThrow(RestartAgentResult.serializer()) }
-                .onSuccess { _resetSwitch.tryEmit(it.sessionId) }
+                .onSuccess {
+                    // Evict the OLD session's cache — the new id starts
+                    // with no transcript. Done after the RPC succeeds so
+                    // a failed restart leaves the cache intact.
+                    sessionHistoryRepository.evict(sessionId)
+                    _resetSwitch.tryEmit(it.sessionId)
+                }
                 .onFailure { context.emitError("Reset failed: ${it.message ?: "?"}") }
         }
     }
@@ -606,6 +798,14 @@ internal class SessionDetailStore(
                         val reason = outcome.message?.takeIf { it.isNotBlank() }
                             ?: "Compact declined"
                         context.emitError(reason)
+                    } else {
+                        // Two-phase eviction: compact doesn't mint the
+                        // new session id synchronously. Park the source
+                        // session id; when the matching
+                        // `agent_session_created` arrives carrying it as
+                        // parent_session_id, we evict the source cache
+                        // (see [onChildSessionCreated]).
+                        pendingCompactSourceIds.add(sessionId)
                     }
                 }
                 .onFailure { context.emitError("Compact failed: ${it.message ?: "?"}") }

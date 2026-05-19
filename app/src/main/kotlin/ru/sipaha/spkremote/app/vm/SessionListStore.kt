@@ -11,6 +11,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import ru.sipaha.spkremote.app.data.ListCacheRepository
+import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AgentSummary
 import ru.sipaha.spkremote.core.CreateSessionResult
 import ru.sipaha.spkremote.core.GetSessionChildrenResult
@@ -52,6 +53,7 @@ internal class SessionListStore(
     private val context: ConnectionContext,
     private val listCacheRepository: ListCacheRepository,
     private val lastSeen: LastSeenIndex,
+    private val sessionHistoryRepository: SessionHistoryRepository,
 ) {
     private val _sessions = MutableStateFlow<UiData<List<SessionSummary>>>(UiData.Loading)
     val sessions: StateFlow<UiData<List<SessionSummary>>> = _sessions.asStateFlow()
@@ -150,7 +152,16 @@ internal class SessionListStore(
                 val resp = active.call("remote.solution_agent.list_sessions", params)
                 resp.decodeResultOrThrow(ListSessionsResult.serializer()).sessions
             },
-            onSuccess = { listCacheRepository.saveSessions(solutionId, it) },
+            onSuccess = { sessions ->
+                listCacheRepository.saveSessions(solutionId, sessions)
+                // GC sweep — drop history-cache entries for sessions that
+                // no longer exist on the server, scoped to this solution
+                // so other solutions on the same server aren't touched.
+                sessionHistoryRepository.prune(
+                    keepSessionIds = sessions.map { it.id }.toHashSet(),
+                    scopeSolutionId = solutionId,
+                )
+            },
         )
     }
 
@@ -412,6 +423,7 @@ internal class SessionListStore(
                             _sessions.value = UiData.Loaded(filtered)
                         }
                     }
+                    sessionHistoryRepository.evict(sessionId)
                     val solutionId = observingSolutionId
                     if (solutionId != null) refreshSessions(solutionId)
                 }

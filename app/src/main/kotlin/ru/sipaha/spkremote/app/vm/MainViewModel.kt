@@ -15,6 +15,7 @@ import ru.sipaha.spkremote.app.data.LastSeenRepository
 import ru.sipaha.spkremote.app.data.ListCacheRepository
 import ru.sipaha.spkremote.app.data.NavStateRepository
 import ru.sipaha.spkremote.app.data.PairedServer
+import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AgentSummary
 import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.EntrySummary
@@ -104,6 +105,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     private val listCacheRepository: ListCacheRepository =
         ListCacheRepository.get(application) { connectionMgr.activeServerId.value }
 
+    private val sessionHistoryRepository: SessionHistoryRepository =
+        SessionHistoryRepository.get(application, viewModelScope) {
+            connectionMgr.activeServerId.value
+        }
+
     // ---- Collaborators (internal names suffixed with `Mgr` / `Store` so
     // they don't clash with the public state-flow names below). ----
 
@@ -129,6 +135,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         context = this,
         listCacheRepository = listCacheRepository,
         lastSeen = lastSeenIndex,
+        sessionHistoryRepository = sessionHistoryRepository,
     )
 
     private val sessionDetail: SessionDetailStore = SessionDetailStore(
@@ -137,6 +144,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         draftRepository = draftRepository,
         lastSeen = lastSeenIndex,
         sessionList = sessionList,
+        sessionHistoryRepository = sessionHistoryRepository,
     )
 
     init {
@@ -280,6 +288,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
             lastSeenRepository.clearAllFor(serverId)
             navStateRepository.clearFor(serverId)
             listCacheRepository.clearAllFor(serverId)
+            sessionHistoryRepository.evictAll(serverId)
             connectionMgr.removeServer(serverId)
         }
     }
