@@ -238,7 +238,12 @@ internal class SolutionStore(
         }
         scope.launch {
             runCatching { active.addEmptyMember(solutionId, name) }
-                .onSuccess { loadSolutionDetails(solutionId) }
+                .onSuccess {
+                    loadSolutionDetails(solutionId)
+                    // Now that the solution has a project, it can be opened
+                    // on the desktop — surface it there as a running solution.
+                    openOnDesktop(solutionId)
+                }
                 .onFailure { context.emitError("Couldn't create project: ${it.message ?: "?"}") }
         }
     }
@@ -292,11 +297,11 @@ internal class SolutionStore(
                 .onSuccess { solutionId ->
                     refreshSolutions()
                     onCreated(solutionId)
-                    // Open it on the desktop so a remote-created solution
-                    // actually shows up there as a running solution (the
-                    // store entry alone leaves it "closed"). No focus steal
-                    // — the user is on their phone.
-                    openOnDesktop(solutionId)
+                    // NOTE: don't open here — a brand-new solution has no
+                    // members yet and the desktop can only open a solution
+                    // that has at least one project. The open happens once
+                    // the first project is added (see [createEmptyMember] /
+                    // [onMemberAddCompleted]).
                     // Fan out the member-adds against the freshly-created
                     // solution. Catalog clones seed ghost rows; empty
                     // projects resolve synchronously and refresh detail.
@@ -351,6 +356,9 @@ internal class SolutionStore(
             // Success — drop the ghost row; the member now exists. The
             // accompanying `solution_changed` event refreshes the detail.
             _memberAdds.value = _memberAdds.value - key
+            // The solution now has a (cloned) project — openable on the
+            // desktop, so surface it there as a running solution.
+            openOnDesktop(payload.solutionId)
         } else {
             // Keep the row but mark it failed so the user sees why.
             _memberAdds.value = _memberAdds.value + (key to MemberAddProgress(
