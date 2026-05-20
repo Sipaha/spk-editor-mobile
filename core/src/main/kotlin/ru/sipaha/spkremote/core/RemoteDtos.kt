@@ -409,6 +409,20 @@ data class RestartAgentResult(
 )
 
 /**
+ * Result envelope for `remote.solution_agent.reset_context`.
+ *
+ * The server wipes the session's conversation transcript + pending
+ * queue + token meter while keeping the `SolutionSessionId` and the
+ * user-set title stable — so the returned `sessionId` is always equal
+ * to the input. Wired to the mobile's `Reset context` menu item; same
+ * code path the desktop's `/clear` slash command takes.
+ */
+@Serializable
+data class ResetContextResult(
+    @SerialName("session_id") val sessionId: String,
+)
+
+/**
  * Result envelope for `remote.solution_agent.start_compact`.
  *
  * The compact orchestration is asynchronous — the server returns
@@ -530,3 +544,25 @@ private val ROLE_HEADING_REGEX = Regex(
     pattern = """^\s*##\s+(?:User(?:\s+\(checkpoint\))?|Assistant|Plan|Tool|System)\s*\n+""",
     options = setOf(RegexOption.IGNORE_CASE),
 )
+
+/**
+ * Strip the leading queue marker that `solution_agent::store::queue` prepends
+ * on the FIRST enqueue into a busy session's `pending_messages`. The marker
+ * is for the agent — "the user typed this in advance, not in reply to your
+ * last question" — and clutters the user bubble with text the user didn't
+ * type. Mirrors the desktop's `conversation_render::strip_queue_marker`;
+ * keep the prefix + separator in sync if the upstream wording changes.
+ *
+ * Conservative: returns [text] unchanged unless BOTH the prefix and the
+ * closing `]\n\n` separator are present, so an unrelated `[...]` lead-in
+ * a user wrote themselves doesn't get eaten.
+ */
+fun stripQueueMarker(text: String): String {
+    if (!text.startsWith(QUEUE_MARKER_PREFIX)) return text
+    val sepIdx = text.indexOf(QUEUE_MARKER_BODY_SEP)
+    if (sepIdx < 0) return text
+    return text.substring(sepIdx + QUEUE_MARKER_BODY_SEP.length)
+}
+
+private const val QUEUE_MARKER_PREFIX = "[The user typed the following at "
+private const val QUEUE_MARKER_BODY_SEP = "]\n\n"

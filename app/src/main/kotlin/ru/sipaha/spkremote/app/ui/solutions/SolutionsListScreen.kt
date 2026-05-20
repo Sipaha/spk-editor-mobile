@@ -4,9 +4,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -18,6 +22,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -125,7 +130,16 @@ fun SolutionsListScreen(
                         body = "Tap \"New solution\" to create one, or open an existing solution in SPK Editor on your computer.",
                     )
                 } else {
-                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        // Clear the gesture nav bar + the FAB so the last
+                        // row stays tappable instead of sitting under them.
+                        contentPadding = PaddingValues(
+                            bottom = 88.dp +
+                                WindowInsets.navigationBars.asPaddingValues()
+                                    .calculateBottomPadding(),
+                        ),
+                    ) {
                         items(s.value, key = { it.id }) { solution ->
                             SolutionRow(
                                 solution = solution,
@@ -157,12 +171,16 @@ private fun SolutionRow(
     onClick: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    // Local-state confirmation toggle, mirrors SolutionDetailScreen.SessionRow.
+    // Confirm via a dialog (not an inline button swap): the old inline
+    // "Delete? Yes/Cancel" replaced the 48dp icon with a wider/taller Row,
+    // reflowing the whole row + the divider below it. A dialog keeps the
+    // row geometry stable and matches the destructive-confirm pattern used
+    // for server removal.
     var confirmDelete by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = !confirmDelete, onClick = onClick)
+            .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -187,28 +205,34 @@ private fun SolutionRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        if (confirmDelete) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "Delete?",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
-                TextButton(onClick = {
-                    confirmDelete = false
-                    onDelete()
-                }) { Text("Yes") }
-                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
-            }
-        } else {
-            IconButton(onClick = { confirmDelete = true }) {
-                Icon(
-                    Icons.Filled.Delete,
-                    contentDescription = "Delete solution",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+        IconButton(onClick = { confirmDelete = true }) {
+            Icon(
+                Icons.Filled.Delete,
+                contentDescription = "Delete solution",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete solution?") },
+            text = { Text("Remove \"${solution.name}\" from this device. The catalog projects and their files are not deleted.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 

@@ -2,14 +2,14 @@ package ru.sipaha.spkremote.app.vm
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -35,7 +35,7 @@ import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.QueueTtlException
 import ru.sipaha.spkremote.core.QueuedMessage
 import ru.sipaha.spkremote.core.RemoteClient
-import ru.sipaha.spkremote.core.RestartAgentResult
+import ru.sipaha.spkremote.core.ResetContextResult
 import ru.sipaha.spkremote.core.StartCompactResult
 import ru.sipaha.spkremote.core.applyAppendedPlaceholder
 import ru.sipaha.spkremote.core.mergeSessionHistory
@@ -281,12 +281,21 @@ internal class SessionDetailStore(
      * One-shot signal emitted after a successful Reset context. Carries the
      * new session id the server minted; the UI collector hops navigation
      * onto the fresh session so the open chat surface stops pointing at
-     * the now-closed source session. Replay = 0 (a missed emission while
-     * the screen is gone is fine — the user picks up the new session via
-     * the list).
+     * the now-closed source session.
+     *
+     * Channel-backed (not a replay-less SharedFlow): a `MutableSharedFlow`
+     * with `replay = 0` DROPS an emission that lands while no collector is
+     * subscribed — which happens whenever the user rotates / backgrounds
+     * the app while a `reset_context` / compact RPC is in flight. The
+     * dropped switch left the user stranded on the now-evicted source
+     * session. A `Channel` buffers the value until the next collector
+     * attaches and delivers it exactly once (no redelivery on
+     * recomposition, unlike `replay = 1`). Single-consumer by
+     * construction — the only collector is the chat screen's
+     * `LaunchedEffect`.
      */
-    private val _resetSwitch = MutableSharedFlow<String>(extraBufferCapacity = 1)
-    val resetSwitch: SharedFlow<String> = _resetSwitch.asSharedFlow()
+    private val _resetSwitch = Channel<String>(Channel.BUFFERED)
+    val resetSwitch: Flow<String> = _resetSwitch.receiveAsFlow()
 
     @Volatile
     var openSessionId: String? = null
@@ -395,6 +404,27 @@ internal class SessionDetailStore(
                             totalBytes = 1L,
                             status = PendingUploadProgress.Status.Uploading,
                         ))
+                }
+                // Re-materialise plain (no-attachment) text sends that are
+                // still in flight — `sendMessageBlocks` persisted a marker
+                // for each, removed only once the server received the
+                // message. These have no upload progress, so the status
+                // row computes to Sending/Queued. Skip ones already
+                // present (deferred loop above, or a still-live producer
+                // coroutine that re-added before we got the lock) and
+                // ones with attachments (owned by the deferred machinery).
+                for (p in pendingSendsRepository.list()) {
+                    if (p.sessionId != sessionId) continue
+                    if (p.attachments.isNotEmpty()) continue
+                    if (p.csid in optimisticClientSendIds) continue
+                    _optimisticEntries.value = _optimisticEntries.value +
+                        EntrySummary(
+                            role = "user",
+                            preview = p.text.orEmpty(),
+                            clientSendId = p.csid,
+                        )
+                    optimisticIds.add(p.localId)
+                    optimisticClientSendIds.add(p.csid)
                 }
                 if (cached != null && cached.entries.isNotEmpty()) {
                     // Render the cached transcript immediately so the
@@ -532,37 +562,38 @@ internal class SessionDetailStore(
             sessionMutex.withLock {
                 if (openSessionId != payload.sessionId) return@withLock
                 _serverQueuedBundles.value = payload.bundles
-                // Every csid that landed in a server-broadcast bundle
-                // is no longer a "client-only optimistic" — drop the
-                // matching local bubble so the server's bundle takes
-                // over the visual slot, matching the desktop's single-
-                // ghost-bubble UX even when the bundle absorbed multiple
-                // originating sends.
-                val csidsFromBundles: Set<Long> =
+                // The server's `pending_messages` is the single source of
+                // truth for queued state: it MERGES sends from every client
+                // into shared bundles (mobile + desktop typing into the same
+                // busy session collapse into one growing bundle, and a
+                // desktop EDIT rewrites that bundle's preview in place).
+                // So once a csid lands in a server bundle we drop the local
+                // optimistic and let the synthetic bundle bubble represent
+                // it — keeping the local optimistic instead would (a) show
+                // stale mobile-only text after a desktop edit and (b) make a
+                // cross-client merge render as two competing bubbles. The
+                // width-oscillation that originally motivated keeping the
+                // local bubble was a separate bug (the status row's
+                // fillMaxWidth) and is fixed independently, so the
+                // local→synthetic handoff is now seamless.
+                val csidsInBundles: Set<Long> =
                     payload.bundles.flatMap { it.csids }.toHashSet()
-                if (csidsFromBundles.isNotEmpty()) {
-                    val current = _optimisticEntries.value
-                    val filtered = current.filter { entry ->
-                        entry.clientSendId !in csidsFromBundles
-                    }
-                    if (filtered.size != current.size) {
-                        _optimisticEntries.value = filtered
-                        // Mirror the in-list shrink onto the parallel
-                        // bookkeeping arrays so a future
-                        // `reconcileOptimisticLocked` sees consistent
-                        // state. iterate by index since we want the
-                        // SAME positions we just dropped.
-                        val keptIndices: List<Int> = current.indices.filter {
-                            current[it].clientSendId !in csidsFromBundles
-                        }
-                        val keptIds = keptIndices.mapNotNull { optimisticIds.getOrNull(it) }
-                        val keptCsids = keptIndices.mapNotNull { optimisticClientSendIds.getOrNull(it) }
-                        optimisticIds.clear()
-                        optimisticIds.addAll(keptIds)
-                        optimisticClientSendIds.clear()
-                        optimisticClientSendIds.addAll(keptCsids)
-                    }
+                if (csidsInBundles.isEmpty()) return@withLock
+                val current = _optimisticEntries.value
+                val keptIndices = current.indices.filter { i ->
+                    current[i].clientSendId !in csidsInBundles
                 }
+                if (keptIndices.size == current.size) return@withLock
+                _optimisticEntries.value = keptIndices.map { current[it] }
+                val keptIds = keptIndices.mapNotNull { optimisticIds.getOrNull(it) }
+                val keptCsids = keptIndices.mapNotNull { optimisticClientSendIds.getOrNull(it) }
+                optimisticIds.clear()
+                optimisticIds.addAll(keptIds)
+                optimisticClientSendIds.clear()
+                optimisticClientSendIds.addAll(keptCsids)
+                // The disk marker (offline-send rehydrate) is no longer
+                // needed once the server has the message in a bundle.
+                for (csid in csidsInBundles) pendingSendsRepository.remove(csid)
             }
         }
     }
@@ -583,6 +614,18 @@ internal class SessionDetailStore(
                 if (openSessionId != sessionId) return@withLock
                 val current = _session.value as? UiData.Loaded ?: return@withLock
                 val entries = current.value.entries
+                // Dedup: if the freshly-fetched entry is structurally equal
+                // to the existing slot, skip the StateFlow write. The
+                // markdown widget's recomposition cycle is non-trivial
+                // (re-parses the AST, re-decodes inline images, rebuilds
+                // the SelectionContainer text layout) and produces a
+                // visible flicker on every update — emits where the
+                // content didn't actually change (server-side throttle
+                // sometimes refires a trailing-edge emit with the same
+                // body it already sent) shouldn't pay that cost.
+                if (index in entries.indices && entries[index] == result.entry) {
+                    return@withLock
+                }
                 val newEntries = when {
                     index < entries.size ->
                         entries.toMutableList().also { it[index] = result.entry }
@@ -956,6 +999,14 @@ internal class SessionDetailStore(
         optimisticIds.addAll(keptIds)
         optimisticClientSendIds.clear()
         optimisticClientSendIds.addAll(keptCsids)
+        // Drop disk markers for every csid that just reconciled away (its
+        // server entry landed). Mirrors the per-echo cleanup in
+        // [popOptimisticByClientSendIdLocked] for the bulk refresh path —
+        // otherwise a plain send delivered while the app was backgrounded
+        // (no live echo observed) would leave a stale marker that
+        // rehydrates a phantom bubble on the next open.
+        val droppedCsids = priorCsids.filterNotNull().toSet() - keptCsids.filterNotNull().toSet()
+        for (csid in droppedCsids) pendingSendsRepository.remove(csid)
     }
 
     fun sendMessage(text: String) {
@@ -1001,6 +1052,26 @@ internal class SessionDetailStore(
             clientSendId = clientSendId,
         )
         val stamped = stampClientSendId(blocks, clientSendId)
+        // Persist a marker so the optimistic bubble survives navigation
+        // away-and-back while the send is still in flight (e.g. the wire
+        // is down and `queueCall` is parked in the offline queue). Without
+        // this, [openSession] clears `_optimisticEntries` on re-entry and
+        // the in-memory-only bubble vanishes even though the message is
+        // still queued to send — the "message with the clock icon
+        // disappeared when I left and came back" bug. Empty `attachments`
+        // distinguishes a plain text send from a deferred-upload send;
+        // [openSession] rehydrates the former, [resumeDeferredSendsFromDisk]
+        // skips it (the offline queue already owns the actual RPC replay,
+        // so reviving a zero-upload deferred waiter would double-send).
+        pendingSendsRepository.saveOrUpdate(
+            PersistedPendingSend(
+                csid = clientSendId,
+                localId = localId,
+                sessionId = sessionId,
+                text = preview,
+                attachments = emptyList(),
+            ),
+        )
         scope.launch {
             sessionMutex.withLock {
                 _optimisticEntries.value = _optimisticEntries.value + optimistic
@@ -1024,8 +1095,7 @@ internal class SessionDetailStore(
             // everything as one merged user entry once the turn
             // settles. The mobile shows a Queued badge per optimistic
             // bubble while the session is Running, derived from the
-            // bubble being optimistic + the live session state — no
-            // client-side gate or persistence needed.
+            // bubble being optimistic + the live session state.
             runCatching {
                 active.queueCall("remote.solution_agent.send_message_blocks", params)
             }
@@ -1035,7 +1105,16 @@ internal class SessionDetailStore(
                     val toolErr = resp.toolError()
                     if (toolErr != null) error(toolErr)
                 }
+                .onSuccess {
+                    // The server received the message; the disk marker is
+                    // no longer needed (the optimistic itself is popped by
+                    // the server echo via `client_send_id`). Removing it
+                    // here keeps the repository scoped to genuinely-unsent
+                    // messages.
+                    pendingSendsRepository.remove(clientSendId)
+                }
                 .onFailure {
+                    pendingSendsRepository.remove(clientSendId)
                     removeOptimisticById(localId)
                     val msg = when (it) {
                         is QueueTtlException ->
@@ -1131,6 +1210,15 @@ internal class SessionDetailStore(
         val persisted = pendingSendsRepository.list()
         for (p in persisted) {
             if (inflightDeferred.containsKey(p.csid)) continue
+            // Plain text sends (no attachments) are NOT revived as
+            // deferred waiters: the offline queue (`queueCall` →
+            // EncryptedQueueStore) already owns their RPC replay on
+            // reconnect. Reviving a zero-upload deferred waiter would
+            // fire a SECOND queueCall → duplicate send. They're kept on
+            // disk only so [openSession] can re-show the optimistic
+            // bubble; the marker is cleared when the optimistic pops
+            // (echo / reconcile) or the send succeeds / fails.
+            if (p.attachments.isEmpty()) continue
             runDeferredSend(
                 send = InflightDeferredSend(
                     csid = p.csid,
@@ -1469,6 +1557,11 @@ internal class SessionDetailStore(
             list.removeAt(idx)
             _optimisticEntries.value = list
         }
+        // The server has echoed this csid → drop any disk marker so a
+        // later [openSession] doesn't rehydrate a phantom bubble for an
+        // already-delivered message. Idempotent (no-op if absent / if a
+        // deferred send already cleaned it up).
+        pendingSendsRepository.remove(clientSendId)
     }
 
     /**
@@ -1551,27 +1644,43 @@ internal class SessionDetailStore(
     }
 
     /**
-     * Reset the agent backing the currently-open session — drops the
-     * pooled subprocess, closes the source session, and opens a fresh
-     * one against the same `(solution, agent)` pair. The new session id
-     * comes back on the RPC result; we emit it via [resetSwitch] so the
-     * chat surface can navigate to the freshly-minted session (the
-     * current screen's `DisposableEffect` would otherwise re-open the
-     * closed source id on next composition).
+     * Wipe the conversation history of the currently-open session via
+     * the server's `solution_agent.reset_context` MCP tool — the same
+     * code path the desktop's `/clear` slash command takes. The
+     * `SolutionSessionId` and the user-set title are preserved; only
+     * the transcript + pending-message queue + token counter are
+     * cleared. The server returns the SAME session id; we re-emit it
+     * through [resetSwitch] so the chat surface re-attaches and reloads
+     * the now-empty transcript (mirrors the previous `restart_agent`
+     * flow's UI integration, just without minting a new id).
+     *
+     * History: prior to 2026-05-20 this called `restart_agent`, which
+     * minted a fresh session id (and therefore dropped the user-set
+     * title). `restart_agent` is the correct path when the agent process
+     * is broken; `reset_context` is the correct path when the user just
+     * wants a clean conversation — matching the desktop's
+     * `Reset context` menu item and the `/clear` slash command.
      */
     fun resetContext() {
-        val active = context.activeClient() ?: return
+        val active = context.activeClient() ?: run {
+            // Surface why nothing happened instead of silently swallowing
+            // the menu tap — reset needs a live wire.
+            context.emitError(context.notConnectedMessage())
+            return
+        }
         val sessionId = openSessionId ?: return
         val params = buildJsonObject { put("session_id", sessionId) }
         scope.launch {
-            runCatching { active.call("remote.solution_agent.restart_agent", params) }
-                .mapCatching { resp -> resp.decodeResultOrThrow(RestartAgentResult.serializer()) }
+            runCatching { active.call("remote.solution_agent.reset_context", params) }
+                .mapCatching { resp -> resp.decodeResultOrThrow(ResetContextResult.serializer()) }
                 .onSuccess {
-                    // Evict the OLD session's cache — the new id starts
-                    // with no transcript. Done after the RPC succeeds so
-                    // a failed restart leaves the cache intact.
+                    // Evict the on-disk cache so the next attach refetches the
+                    // (now-empty) transcript from the server rather than
+                    // resurrecting the pre-clear history from disk. Done
+                    // after the RPC succeeds so a failed reset leaves the
+                    // cache intact.
                     sessionHistoryRepository.evict(sessionId)
-                    _resetSwitch.tryEmit(it.sessionId)
+                    _resetSwitch.trySend(it.sessionId)
                 }
                 .onFailure { context.emitError("Reset failed: ${it.message ?: "?"}") }
         }
@@ -1589,7 +1698,10 @@ internal class SessionDetailStore(
      * `agent_session_created` notification path.
      */
     fun compactContext() {
-        val active = context.activeClient() ?: return
+        val active = context.activeClient() ?: run {
+            context.emitError(context.notConnectedMessage())
+            return
+        }
         val sessionId = openSessionId ?: return
         val params = buildJsonObject { put("session_id", sessionId) }
         scope.launch {

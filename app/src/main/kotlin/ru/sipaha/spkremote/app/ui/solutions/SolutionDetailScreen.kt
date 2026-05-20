@@ -5,9 +5,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -15,6 +19,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -85,8 +91,11 @@ fun SolutionDetailScreen(
     // Track the Disconnected→Connected edge explicitly. Without this,
     // every re-emission of `Connected` (config-change recomposition,
     // rotation, etc.) re-triggers a wire refetch — wasted RPC bandwidth
-    // and a brief Loading flicker.
-    val wasConnected = remember { mutableStateOf(false) }
+    // and a brief Loading flicker. MUST be rememberSaveable: a plain
+    // `remember` resets to false when the activity is recreated on
+    // rotation, so the edge re-fires on every rotation — the exact
+    // wasted-refetch + flicker this flag exists to prevent.
+    val wasConnected = rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(connectionState) {
         val nowConnected = connectionState is ConnectionState.Connected
         if (nowConnected && !wasConnected.value) {
@@ -172,7 +181,16 @@ fun SolutionDetailScreen(
                             body = "Start a Claude session for this solution from SPK Editor.",
                         )
                     } else {
-                        LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            // Clear the gesture nav bar + the FAB so the
+                            // last session row stays tappable.
+                            contentPadding = PaddingValues(
+                                bottom = 88.dp +
+                                    WindowInsets.navigationBars.asPaddingValues()
+                                        .calculateBottomPadding(),
+                            ),
+                        ) {
                             items(s.value, key = { it.id }) { session ->
                                 SessionRow(
                                     session = session,
@@ -215,7 +233,7 @@ private fun SessionRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = !confirmDelete, onClick = onClick)
+            .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -237,28 +255,37 @@ private fun SessionRow(
                 )
             }
         }
-        if (confirmDelete) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "Delete?",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
-                TextButton(onClick = {
-                    confirmDelete = false
-                    onDelete()
-                }) { Text("Yes") }
-                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
-            }
-        } else {
-            IconButton(onClick = { confirmDelete = true }) {
-                Icon(
-                    Icons.Filled.Delete,
-                    contentDescription = "Delete session",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+        IconButton(onClick = { confirmDelete = true }) {
+            Icon(
+                Icons.Filled.Delete,
+                contentDescription = "Delete session",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
+    }
+    // Confirm via dialog rather than an inline button swap — the inline
+    // "Delete? Yes/Cancel" reflowed the row + its divider. Dialog keeps
+    // the row geometry stable and matches the server-removal pattern.
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete session?") },
+            text = { Text("Close \"${session.title.ifBlank { "this session" }}\" and discard its conversation.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDelete = false
+                        onDelete()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("Cancel") }
+            },
+        )
     }
 }
 

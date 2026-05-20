@@ -5,8 +5,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -105,7 +109,16 @@ fun ServersListScreen(
                     body = "Tap + to scan a pairing QR.",
                 )
             } else {
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    // Clear the gesture nav bar AND the FAB so the last row's
+                    // tap / long-press target isn't hidden under either.
+                    contentPadding = PaddingValues(
+                        bottom = 88.dp +
+                            WindowInsets.navigationBars.asPaddingValues()
+                                .calculateBottomPadding(),
+                    ),
+                ) {
                     items(servers, key = { it.id }) { server ->
                         ServerRow(
                             server = server,

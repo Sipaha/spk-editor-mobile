@@ -10,7 +10,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -126,6 +129,14 @@ fun QrPairingScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                // Edge-to-edge (targetSdk 35+): make the content scrollable
+                // and lift it above the IME so the manual-entry field +
+                // Connect button stay reachable when the keyboard opens on a
+                // short device. Without this the pairing gate — the very
+                // first screen a new user hits — can hide its only Connect
+                // button behind the keyboard with no way to scroll to it.
+                .verticalScroll(rememberScrollState())
+                .imePadding()
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,

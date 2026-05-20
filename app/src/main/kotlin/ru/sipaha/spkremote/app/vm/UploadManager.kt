@@ -445,7 +445,7 @@ class UploadManager internal constructor(
         if (resumeFromDisk && meta.uploadId != null) {
             val existingId = meta.uploadId
             if (existingId == null) {
-                state.value = State.Failed("resume metadata corrupt")
+                state.value = State.Failed("couldn't resume upload — re-attach to retry")
                 cleanupOnTerminal(localKey)
                 return
             }
@@ -560,8 +560,10 @@ class UploadManager internal constructor(
                             "upload_init FAILED (non-retryable) for $localKey: ${it.message}",
                             it,
                         )
+                        // Human-facing reason (no `upload_init` RPC jargon);
+                        // the raw cause is in the Log line above.
                         state.value =
-                            State.Failed("upload_init failed: ${it.message ?: "?"}")
+                            State.Failed("couldn't start upload — tap to retry")
                         cleanupOnTerminal(localKey)
                         return
                     }
@@ -656,7 +658,7 @@ class UploadManager internal constructor(
             JsonRpc.json.decodeFromJsonElement(UploadFinishResult.serializer(), structured)
         }
         val finish = finishOutcome.getOrElse {
-            state.value = State.Failed("upload_finish failed: ${it.message ?: "?"}")
+            state.value = State.Failed("upload didn't complete — tap to retry")
             cleanupOnTerminal(localKey)
             return
         }

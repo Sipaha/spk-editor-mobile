@@ -8,29 +8,34 @@ import android.util.Base64
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.VectorConverter
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.ime
-import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
@@ -102,12 +107,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.composed
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -116,18 +125,14 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.mikepenz.markdown.m3.Markdown
-import com.mikepenz.markdown.m3.markdownColor
-import com.mikepenz.markdown.m3.markdownTypography
-import com.mikepenz.markdown.model.markdownPadding
-import com.mikepenz.markdown.model.ImageData
-import com.mikepenz.markdown.model.ImageTransformer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.debounce
@@ -151,6 +156,7 @@ import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.ToolCallSummary
 import ru.sipaha.spkremote.core.parseDisplayState
 import ru.sipaha.spkremote.core.parseEntryRole
+import ru.sipaha.spkremote.core.stripQueueMarker
 import ru.sipaha.spkremote.core.stripRoleHeading
 
 /**
@@ -346,18 +352,25 @@ fun SessionDetailScreen(
                 },
             )
         },
-        snackbarHost = { SnackbarHost(snackbarHostState) },
+        // No `snackbarHost` slot — Scaffold renders that slot pinned to
+        // the BOTTOM, where it sat over the chat tail and got clipped by
+        // the compose row / status panel. We render the host as a
+        // top-aligned overlay inside the content Box instead (below the
+        // top bar), so errors read clearly above the conversation.
         bottomBar = {
-            // Single-source inset on the bottomBar: lifts above the IME
-            // when the keyboard opens AND clears the system 3-button nav
-            // bar at rest. Without this, Android 15+'s implicit edge-to-
-            // edge mode renders the system nav bar over the compose row
-            // and the keyboard covers the input. Union (not sum) because
-            // when the IME is up it already includes the nav-bar
-            // region — summing would add it twice.
+            // Bottom + horizontal safe insets: lifts the compose row above
+            // the IME and the system nav bar (bottom, or a side bar in
+            // landscape) AND clears the landscape camera cutout. safeDrawing
+            // already unions ime / navigationBars / displayCutout, so a
+            // single `.only(Bottom + Horizontal)` covers all of them without
+            // the double-count an `ime + navigationBars` sum would risk.
             Column(
                 modifier = Modifier
-                    .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars)),
+                    .windowInsetsPadding(
+                        WindowInsets.safeDrawing.only(
+                            WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal,
+                        ),
+                    ),
             ) {
                 if (showChipRow) {
                     SubAgentChipRow(
@@ -429,7 +442,15 @@ fun SessionDetailScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding),
+                .padding(padding)
+                // Horizontal safe insets: in landscape the camera cutout
+                // (left) and the side 3-button nav bar would otherwise sit
+                // over the chat content — messages slid under the cutout.
+                // The Scaffold zeroes contentWindowInsets and handles
+                // vertical insets per-slot, so we only need horizontal here.
+                .windowInsetsPadding(
+                    WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal),
+                ),
         ) {
             when (val s = sessionState) {
                 is UiData.Loading -> Box(
@@ -452,6 +473,17 @@ fun SessionDetailScreen(
                     onRequestOlder = { viewModel.loadOlder(sessionId) },
                 )
             }
+
+            // Top-aligned error host. Sits just under the top bar (the
+            // content Box is already inset by `padding`), so a send /
+            // attachment error reads above the conversation instead of
+            // being clipped at the bottom behind the compose row.
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(8.dp),
+            )
         }
     }
 
@@ -557,11 +589,16 @@ private fun ChatList(
 ) {
     // Server-side `pending_messages` flattened into synthetic
     // EntrySummary rows so they slot into the same LazyColumn pass as
-    // server entries + local optimistic. `clientSendId = csids.first`
-    // when present so the LazyColumn key stays stable across
-    // broadcasts of the same bundle; null csid (desktop-typed
-    // bundle) falls back to the role+preview hash key. The bubble
-    // status row picks them up via [serverQueueIdentitySet] below.
+    // server entries. The server is the source of truth for queued
+    // state — it merges sends from every client into shared bundles and
+    // rewrites a bundle's preview in place on a desktop edit — so we
+    // render ALL bundles here. `SessionDetailStore.onSessionQueueChanged`
+    // drops any local optimistic whose csid landed in a bundle, so there
+    // is exactly one bubble per bundle (no local-vs-synthetic dupes).
+    //
+    // `clientSendId = csids.first` keys the bubble in the LazyColumn so a
+    // re-broadcast of the same bundle (e.g. a desktop edit changing only
+    // the preview) UPDATES the existing bubble instead of remounting it.
     val syntheticQueueEntries: List<EntrySummary> = remember(serverQueuedBundles) {
         serverQueuedBundles.map { bundle ->
             EntrySummary(
@@ -611,7 +648,21 @@ private fun ChatList(
     val isScrolling by remember {
         derivedStateOf { lazyState.isScrollInProgress }
     }
-    LaunchedEffect(combined.size) {
+    // Identity of the newest entry (= `combined.last()`; reverseLayout
+    // maps it to item 0). Keying the auto-scroll on this — not just on
+    // `combined.size` — catches the optimistic→server-echo swap, where a
+    // pending bubble is popped AND its confirmed server entry is appended
+    // in the same frame: size is unchanged, but the newest slot's
+    // identity flips (`csid:N` → `idx:M`). Without this the just-sent
+    // message landed below the fold and the user had to scroll down to
+    // it. Content-only updates to an existing entry (streaming markdown)
+    // keep the same key, so they don't trigger spurious scrolls.
+    val newestEntryKey: String? = combined.lastOrNull()?.let { entry ->
+        entry.clientSendId?.let { "csid:$it" }
+            ?: if (entry.index >= 0) "idx:${entry.index}"
+            else "role:${entry.role}#${entry.preview.hashCode()}"
+    }
+    LaunchedEffect(combined.size, newestEntryKey) {
         if (combined.isEmpty()) return@LaunchedEffect
         if (isScrolling) return@LaunchedEffect
         if (lazyState.firstVisibleItemIndex <= 1) {
@@ -696,9 +747,18 @@ private fun ChatList(
                 itemsIndexed(
                     items = combined.asReversed(),
                     key = { _, entry ->
-                        entry.clientSendId?.let { csid -> "csid:$csid" }
-                            ?: if (entry.index >= 0) "idx:${entry.index}"
-                            else "role:${entry.role}#${entry.preview.hashCode()}"
+                        when {
+                            // Synthetic server-queue bubble: namespace its key
+                            // so it can't collide with the REAL flushed user
+                            // entry that carries the same csid during the
+                            // queue-drain → message-appended handoff (a bare
+                            // `csid:N` collision would crash the LazyColumn).
+                            entry in serverQueueIdentitySet ->
+                                "queued:${entry.clientSendId ?: entry.preview.hashCode()}"
+                            entry.clientSendId != null -> "csid:${entry.clientSendId}"
+                            entry.index >= 0 -> "idx:${entry.index}"
+                            else -> "role:${entry.role}#${entry.preview.hashCode()}"
+                        }
                     },
                 ) { _, entry ->
                     val status = userBubbleStatusFor(
@@ -902,7 +962,7 @@ private fun ChatBubble(
 
 @Composable
 private fun UserBubble(entry: EntrySummary, status: UserBubbleStatus = UserBubbleStatus.None) {
-    val rawText = stripRoleHeading(entry.markdown ?: entry.preview)
+    val rawText = stripQueueMarker(stripRoleHeading(entry.markdown ?: entry.preview))
     val images = entry.images.orEmpty()
     var fullscreen by remember(entry.index) { mutableStateOf<EntryImage?>(null) }
     // Decode images once per entry so the [Image #N] tap target opens
@@ -1011,6 +1071,13 @@ private fun UserBubble(entry: EntrySummary, status: UserBubbleStatus = UserBubbl
 private const val IMAGE_LINK_TAG = "spk-image"
 private val IMAGE_PLACEHOLDER_REGEX = Regex("""\[image #(\d+)]""", RegexOption.IGNORE_CASE)
 
+// The server's ACP `to_markdown` reduces an image chunk to a literal
+// `` `Image` `` inline-code marker (acp_thread::ContentBlock::append). The
+// mobile surfaces images as its own `[image #N]` links appended at the end
+// of the bubble, so the raw marker is just noise mid-body — strip it. The
+// desktop does the equivalent in `clean_user_message_text`.
+private val IMAGE_CODE_MARKER_REGEX = Regex("""`Image`""")
+
 /**
  * Build the user-bubble body as an [AnnotatedString]:
  *
@@ -1040,7 +1107,9 @@ private fun buildUserBubbleAnnotatedText(
         color = linkColor,
         textDecoration = TextDecoration.Underline,
     )
-    val stripped = IMAGE_PLACEHOLDER_REGEX.replace(text, "").trim()
+    val stripped = IMAGE_CODE_MARKER_REGEX
+        .replace(IMAGE_PLACEHOLDER_REGEX.replace(text, ""), "")
+        .trim()
     if (stripped.isNotEmpty()) {
         append(stripped)
     }
@@ -1064,11 +1133,22 @@ private fun buildUserBubbleAnnotatedText(
  * doesn't bounce when scrolling through old conversations.
  */
 @Composable
-private fun UserBubbleStatusRow(status: UserBubbleStatus) {
+private fun ColumnScope.UserBubbleStatusRow(status: UserBubbleStatus) {
     if (status is UserBubbleStatus.None) return
     Row(
+        // Wrap-content width + align to End of the parent Column. We
+        // can NOT use Modifier.fillMaxWidth() here — that would force
+        // the enclosing Surface to grow to its `widthIn(max = 360.dp)`
+        // ceiling whenever a status badge is present, then collapse
+        // back to the body's intrinsic width the instant the badge
+        // disappears (e.g. the brief window between popping the local
+        // optimistic and `fetchAndReplaceEntry` repopulating the csid
+        // on the server entry → status flips Queued → None → Delivered
+        // and the bubble visibly oscillates wide → narrow → wide).
+        // With wrap-content the bubble width is determined by the body
+        // alone, which is stable across the send lifecycle.
         modifier = Modifier
-            .fillMaxWidth()
+            .align(Alignment.End)
             .padding(top = 4.dp),
         horizontalArrangement = Arrangement.End,
         verticalAlignment = Alignment.CenterVertically,
@@ -1142,6 +1222,54 @@ private fun UserBubbleStatusRow(status: UserBubbleStatus) {
     }
 }
 
+/**
+ * Animate ONLY the height of content-size changes; width settles to the
+ * measured value immediately, every frame.
+ *
+ * `Modifier.animateContentSize()` animates BOTH axes, so any bubble whose
+ * WIDTH changes between frames — a tool call whose first frame is icon-only
+ * then widens once its name/args populate, or a streamed line that widens
+ * the bubble — visibly "compresses then expands horizontally". On a chat
+ * bubble that horizontal squeeze is never wanted; we only want the smooth
+ * vertical grow as content streams in. This modifier animates the height
+ * dimension alone and passes width through untouched.
+ *
+ * First measure snaps (no animation from zero). `clipToBounds` keeps the
+ * mid-animation (shorter-than-content) frame from spilling over.
+ */
+private fun Modifier.animateHeightOnly(
+    durationMillis: Int = 150,
+): Modifier = composed {
+    val scope = rememberCoroutineScope()
+    val heightAnim = remember { Animatable(0, Int.VectorConverter) }
+    var initialized by remember { mutableStateOf(false) }
+    val spec = remember(durationMillis) {
+        tween<Int>(durationMillis = durationMillis, easing = LinearEasing)
+    }
+    this
+        .clipToBounds()
+        .layout { measurable, constraints ->
+            val placeable = measurable.measure(constraints)
+            val target = placeable.height
+            val renderHeight: Int = if (!initialized) {
+                // First real measure — snap, don't animate up from 0.
+                scope.launch {
+                    heightAnim.snapTo(target)
+                    initialized = true
+                }
+                target
+            } else {
+                if (heightAnim.targetValue != target) {
+                    scope.launch { heightAnim.animateTo(target, spec) }
+                }
+                heightAnim.value
+            }
+            layout(placeable.width, renderHeight) {
+                placeable.place(0, 0)
+            }
+        }
+}
+
 @Composable
 private fun AssistantBubble(entry: EntrySummary) {
     Row(
@@ -1152,24 +1280,13 @@ private fun AssistantBubble(entry: EntrySummary) {
             color = MaterialTheme.colorScheme.surfaceVariant,
             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
-            // Fast, linear animateContentSize for the streaming-grow
-            // case. The default `spring()` overshoots and stacks
-            // across the throttled update sequence (a fresh emit
-            // arriving while the previous spring is still settling
-            // produces compounding bounce — visible as the user-
-            // reported "compress/expand dozens of times" jitter).
-            // 80 ms linear tween is fast enough to complete between
-            // two emits at our 500 ms server-side debounce, slow
-            // enough to mask the discrete per-fetch reflow as a
-            // continuous grow.
+            // Smooth the streaming bubble's VERTICAL growth only. Plain
+            // `animateContentSize` animated both axes, so a streamed line
+            // that widened the bubble produced a horizontal squeeze too —
+            // `animateHeightOnly` keeps width instant and animates height.
             modifier = Modifier
                 .widthIn(max = 360.dp)
-                .animateContentSize(
-                    animationSpec = androidx.compose.animation.core.tween(
-                        durationMillis = 80,
-                        easing = androidx.compose.animation.core.LinearEasing,
-                    ),
-                ),
+                .animateHeightOnly(),
         ) {
             Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 // SelectionContainer wraps the assistant body so the rendered
@@ -1205,65 +1322,91 @@ private fun AssistantBubble(entry: EntrySummary) {
 }
 
 /**
- * Render an assistant entry's full markdown body, plumbing in a custom
- * `ImageTransformer` so `spk-image://N` URLs in the markdown resolve to the
- * matching base64 blob from `entry.images`. The `multiplatform-markdown-
- * renderer-m3` library handles paragraph / code / list / link layout and
- * lets us override only the image fetch step.
+ * Render an assistant entry's full markdown body via a block-level
+ * in-tree parser + per-block `Text(annotated)` rendering. Replaces the
+ * `multiplatform-markdown-renderer-m3` library because that library —
+ * even with `retainState = true` on its `MarkdownState` — produces a
+ * brief tree-swap artifact on every streaming content update (the old
+ * tree is held painted while the new tree starts rendering on top of
+ * it, so for a frame two snapshots overlap with subtle line-shift).
+ * Pure-Compose `Text(annotated)` widgets recompose inside one frame,
+ * with no Loading state and no overlap.
  *
- * Tapping an inline image opens a full-screen `Dialog` with the original
- * pixel dimensions; long markdown bodies wrap naturally inside the bubble.
+ * Supported markdown:
+ *   - Paragraphs (blank-line separated).
+ *   - `**bold**`, `*italic*` / `_italic_`.
+ *   - `` `inline code` `` — monospace + tinted background span.
+ *   - ``` ```fenced``` ``` — full-width code block with chrome.
+ *   - Bullet lists (`- `, `* `, `+ `) and ordered lists (`1. `).
+ *     Single-level only; nested indentation is currently rendered
+ *     by preserving the leading whitespace prefix in the item body.
+ *   - GFM tables: header row + separator + body rows, all `|`-delimited.
+ *   - `[label](url)` — clickable link. `spk-image://N` → fullscreen
+ *     Dialog; any other URL opens in the system browser.
+ *   - Soft line breaks preserved verbatim within paragraphs.
+ *
+ * Explicitly NOT supported (kept as raw text — readable, just unstyled):
+ *   - Headings (`## …`), blockquotes, horizontal rules.
+ *   - Nested inline formatting (e.g. bold inside italic).
+ *   - Markdown image embeds (`![alt](url)`) — these become text. Inline
+ *     images aren't a real concern: assistant `to_markdown` emits
+ *     `` `Image` `` literal markers, never embeds.
+ *
+ * Tapping a `spk-image://N` link opens the same fullscreen `Dialog` the
+ * user bubble uses (consistent interaction across bubble sides).
  */
 @Composable
 private fun AssistantMarkdownBody(markdown: String, images: List<EntryImage>) {
     var fullscreen by remember { mutableStateOf<EntryImage?>(null) }
-    // Decode all images up-front. Sessions with many images may want a
-    // lazier strategy, but in practice an assistant message rarely embeds
-    // more than 2-3 — and decoding here means the Markdown renderer's
-    // per-image transform() call is non-blocking + does no work on layout.
     val decoded: Map<Int, Painter> = remember(images) {
         images.associate { it.index to bitmapPainterFromBase64(it.dataBase64) }
     }
-    val transformer = remember(images) { SpkImageTransformer(decoded, images) { fullscreen = it } }
-
-    // Clamp markdown heading sizes. Library defaults map h1..h3 to
-    // M3 `displayLarge` / `displayMedium` / `displaySmall` (≥36 sp), which
-    // looks absurd inside a 360 dp chat bubble — and absolutely catastrophic
-    // when the server-side `acp_thread` emits a `## Assistant` heading at the
-    // top of every entry. Pin headings to the title/label scale so even
-    // model-generated headings stay readable in the bubble.
-    Markdown(
-        content = markdown,
-        // markdown-renderer 0.39.0 dropped the dedicated `codeText` param —
-        // inline code text now inherits from `text`. Visual regression is
-        // minor (code text loses its onSurface tint, picks up onSurfaceVariant
-        // alongside body text); revisit when the lib exposes a finer-grained
-        // theming API again.
-        colors = markdownColor(
-            text = MaterialTheme.colorScheme.onSurfaceVariant,
-            codeBackground = MaterialTheme.colorScheme.surface,
-        ),
-        typography = markdownTypography(
-            text = MaterialTheme.typography.bodyMedium,
-            paragraph = MaterialTheme.typography.bodyMedium,
-            code = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-            inlineCode = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-            h1 = MaterialTheme.typography.titleLarge,
-            h2 = MaterialTheme.typography.titleMedium,
-            h3 = MaterialTheme.typography.titleSmall,
-            h4 = MaterialTheme.typography.labelLarge,
-            h5 = MaterialTheme.typography.labelMedium,
-            h6 = MaterialTheme.typography.labelSmall,
-        ),
-        // Library default `block` padding adds top-padding to every
-        // markdown block including the first → noticeable empty-line gap
-        // above the first paragraph inside a chat bubble. Override to a
-        // smaller value: 6.dp still gives visible separation between
-        // paragraphs in multi-paragraph replies but doesn't push the
-        // first paragraph away from the bubble's top edge.
-        padding = markdownPadding(block = 6.dp),
-        imageTransformer = transformer,
+    val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
+    val codeBg = MaterialTheme.colorScheme.surface
+    val linkColor = MaterialTheme.colorScheme.primary
+    val divider = MaterialTheme.colorScheme.outlineVariant
+    val codeSpan = remember(codeBg, onSurfaceVariant) {
+        SpanStyle(
+            fontFamily = FontFamily.Monospace,
+            background = codeBg,
+            color = onSurfaceVariant,
+        )
+    }
+    val linkSpan = remember(linkColor) {
+        SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)
+    }
+    val blocks = remember(markdown, codeSpan, linkSpan) {
+        parseMarkdownBlocks(markdown, codeSpan, linkSpan)
+    }
+    val uriHandler = LocalUriHandler.current
+    val onLinkClick: (String) -> Unit = handler@{ url ->
+        if (url.startsWith("spk-image://")) {
+            val idx = url.removePrefix("spk-image://").toIntOrNull() ?: return@handler
+            fullscreen = images.firstOrNull { it.index == idx }
+            return@handler
+        }
+        // External link: open in the system browser. Previously these were
+        // styled as links but did nothing on tap — a dead affordance.
+        // `runCatching` guards a malformed URL / no-browser device.
+        runCatching { uriHandler.openUri(url) }
+    }
+    val textStyle = MaterialTheme.typography.bodyMedium.copy(color = onSurfaceVariant)
+    val monoStyle = MaterialTheme.typography.bodySmall.copy(
+        fontFamily = FontFamily.Monospace,
+        color = onSurfaceVariant,
     )
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        for (block in blocks) {
+            when (block) {
+                is MdBlock.Paragraph -> MdParagraph(block.text, textStyle, onLinkClick)
+                is MdBlock.UnorderedList -> MdUnorderedList(block, textStyle, onLinkClick)
+                is MdBlock.OrderedList -> MdOrderedList(block, textStyle, onLinkClick)
+                is MdBlock.CodeBlock -> MdCodeBlock(block.body, monoStyle, codeBg)
+                is MdBlock.Table -> MdTable(block, textStyle, divider, onLinkClick)
+            }
+        }
+    }
 
     val tappedImage = fullscreen
     if (tappedImage != null) {
@@ -1289,37 +1432,370 @@ private fun AssistantMarkdownBody(markdown: String, images: List<EntryImage>) {
     }
 }
 
-/**
- * Custom [ImageTransformer] that maps `spk-image://N` URLs to a decoded
- * base64 `Painter` carried in the [EntrySummary]. Unknown URLs return null
- * so the markdown renderer falls back to its own missing-image placeholder
- * (a blank box) — better than a hard crash on a missing image index.
- *
- * Only [transform] is overridden; `intrinsicSize` + `placeholderConfig`
- * inherit the library defaults.
- */
-private class SpkImageTransformer(
-    private val painters: Map<Int, Painter>,
-    private val rawImages: List<EntryImage>,
-    private val onClick: (EntryImage) -> Unit,
-) : ImageTransformer {
-    @Composable
-    override fun transform(link: String): ImageData? {
-        val index = link.removePrefix("spk-image://").toIntOrNull() ?: return null
-        val painter = painters[index] ?: return null
-        val image = rawImages.firstOrNull { it.index == index } ?: return null
-        // Cap the long edge at 240dp. Tap → caller-supplied dialog.
-        return ImageData(
-            painter = painter,
-            modifier = Modifier
-                .sizeIn(maxWidth = 240.dp, maxHeight = 240.dp)
-                .clickable { onClick(image) },
-            contentDescription = "Inline image #$index",
-            alignment = Alignment.Center,
-            contentScale = ContentScale.Fit,
-            alpha = 1f,
-            colorFilter = null,
+private const val ASSISTANT_LINK_TAG = "spk_assistant_link"
+
+private sealed interface MdBlock {
+    data class Paragraph(val text: AnnotatedString) : MdBlock
+    data class UnorderedList(val items: List<AnnotatedString>) : MdBlock
+    data class OrderedList(val items: List<AnnotatedString>, val startNumber: Int) : MdBlock
+    data class CodeBlock(val body: String) : MdBlock
+    data class Table(
+        val header: List<AnnotatedString>,
+        val rows: List<List<AnnotatedString>>,
+    ) : MdBlock
+}
+
+@Composable
+private fun MdParagraph(
+    text: AnnotatedString,
+    style: androidx.compose.ui.text.TextStyle,
+    onLinkClick: (String) -> Unit,
+) {
+    ClickableText(
+        text = text,
+        style = style,
+        onClick = { offset ->
+            text.getStringAnnotations(ASSISTANT_LINK_TAG, offset, offset)
+                .firstOrNull()
+                ?.let { onLinkClick(it.item) }
+        },
+    )
+}
+
+@Composable
+private fun MdUnorderedList(
+    block: MdBlock.UnorderedList,
+    style: androidx.compose.ui.text.TextStyle,
+    onLinkClick: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        for (item in block.items) {
+            Row {
+                Text(text = "•  ", style = style)
+                MdParagraph(item, style, onLinkClick)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MdOrderedList(
+    block: MdBlock.OrderedList,
+    style: androidx.compose.ui.text.TextStyle,
+    onLinkClick: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        for ((i, item) in block.items.withIndex()) {
+            Row {
+                Text(text = "${block.startNumber + i}. ", style = style)
+                MdParagraph(item, style, onLinkClick)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MdCodeBlock(
+    body: String,
+    style: androidx.compose.ui.text.TextStyle,
+    background: Color,
+) {
+    Surface(
+        color = background,
+        shape = RoundedCornerShape(6.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(
+            text = body,
+            style = style,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
         )
+    }
+}
+
+@Composable
+private fun MdTable(
+    block: MdBlock.Table,
+    style: androidx.compose.ui.text.TextStyle,
+    divider: Color,
+    onLinkClick: (String) -> Unit,
+) {
+    val columnCount = maxOf(
+        block.header.size,
+        block.rows.maxOfOrNull { it.size } ?: 0,
+    )
+    if (columnCount == 0) return
+    val headerStyle = style.copy(fontWeight = FontWeight.Bold)
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(
+                width = 1.dp,
+                color = divider,
+                shape = RoundedCornerShape(4.dp),
+            ),
+    ) {
+        MdTableRow(block.header, columnCount, headerStyle, divider, onLinkClick)
+        for (row in block.rows) {
+            androidx.compose.material3.HorizontalDivider(
+                thickness = 1.dp,
+                color = divider,
+            )
+            MdTableRow(row, columnCount, style, divider, onLinkClick)
+        }
+    }
+}
+
+@Composable
+private fun MdTableRow(
+    cells: List<AnnotatedString>,
+    columnCount: Int,
+    style: androidx.compose.ui.text.TextStyle,
+    divider: Color,
+    onLinkClick: (String) -> Unit,
+) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        for (col in 0 until columnCount) {
+            if (col > 0) {
+                androidx.compose.material3.VerticalDivider(
+                    modifier = Modifier.height(IntrinsicSize.Min),
+                    thickness = 1.dp,
+                    color = divider,
+                )
+            }
+            val cell = cells.getOrNull(col) ?: AnnotatedString("")
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+            ) {
+                MdParagraph(cell, style, onLinkClick)
+            }
+        }
+    }
+}
+
+/**
+ * Line-oriented walker that turns markdown source into [MdBlock]s. Each
+ * block boundary is detected on a single line of lookahead; unrecognised
+ * lines fall through into a Paragraph block. Inline structure (bold,
+ * italic, code, links) is delegated to [parseInlineMarkdown] for every
+ * paragraph / list item / table cell.
+ */
+private fun parseMarkdownBlocks(
+    text: String,
+    codeSpan: SpanStyle,
+    linkSpan: SpanStyle,
+): List<MdBlock> {
+    val lines = text.lines()
+    val out = mutableListOf<MdBlock>()
+    var i = 0
+    while (i < lines.size) {
+        val line = lines[i]
+        if (line.isBlank()) {
+            i++
+            continue
+        }
+        // Fenced code block — closing fence consumed; unclosed runs to EOF.
+        if (line.trimStart().startsWith("```")) {
+            val bodyLines = mutableListOf<String>()
+            var j = i + 1
+            while (j < lines.size && !lines[j].trimStart().startsWith("```")) {
+                bodyLines += lines[j]
+                j++
+            }
+            out += MdBlock.CodeBlock(bodyLines.joinToString("\n"))
+            i = if (j < lines.size) j + 1 else lines.size
+            continue
+        }
+        // GFM table: header row + separator (`---`-bearing) + zero-or-more body rows.
+        if (line.contains('|') && i + 1 < lines.size && isTableSeparator(lines[i + 1])) {
+            val header = parseTableRow(line, codeSpan, linkSpan)
+            val rows = mutableListOf<List<AnnotatedString>>()
+            var j = i + 2
+            while (j < lines.size && lines[j].contains('|') && lines[j].isNotBlank()) {
+                rows += parseTableRow(lines[j], codeSpan, linkSpan)
+                j++
+            }
+            out += MdBlock.Table(header, rows)
+            i = j
+            continue
+        }
+        // Bullet list — collect adjacent `- `/`* `/`+ ` lines.
+        if (isUnorderedListLine(line)) {
+            val items = mutableListOf<AnnotatedString>()
+            var j = i
+            while (j < lines.size && isUnorderedListLine(lines[j])) {
+                items += parseInlineMarkdown(stripListMarker(lines[j]), codeSpan, linkSpan)
+                j++
+            }
+            out += MdBlock.UnorderedList(items)
+            i = j
+            continue
+        }
+        // Ordered list — first item's number becomes the start; subsequent
+        // items keep contiguous numbering even if the source skipped values.
+        val orderedMatch = ORDERED_LIST_LINE.matchAt(line, 0)
+        if (orderedMatch != null) {
+            val items = mutableListOf<AnnotatedString>()
+            val startNumber = orderedMatch.groupValues[1].toIntOrNull() ?: 1
+            var j = i
+            while (j < lines.size && ORDERED_LIST_LINE.matchAt(lines[j], 0) != null) {
+                items += parseInlineMarkdown(
+                    ORDERED_LIST_LINE.replaceFirst(lines[j], ""),
+                    codeSpan,
+                    linkSpan,
+                )
+                j++
+            }
+            out += MdBlock.OrderedList(items, startNumber)
+            i = j
+            continue
+        }
+        // Paragraph: take lines up to the next blank or block-boundary line.
+        val sb = StringBuilder()
+        var j = i
+        while (j < lines.size && lines[j].isNotBlank() && !isBlockBoundary(lines, j)) {
+            if (sb.isNotEmpty()) sb.append('\n')
+            sb.append(lines[j])
+            j++
+        }
+        out += MdBlock.Paragraph(parseInlineMarkdown(sb.toString(), codeSpan, linkSpan))
+        i = j
+    }
+    return out
+}
+
+private val ORDERED_LIST_LINE = Regex("""^\s*(\d{1,9})\.\s+""")
+
+private fun isUnorderedListLine(line: String): Boolean {
+    val trimmed = line.trimStart()
+    return trimmed.startsWith("- ") || trimmed.startsWith("* ") || trimmed.startsWith("+ ")
+}
+
+private fun stripListMarker(line: String): String {
+    val trimmed = line.trimStart()
+    return if (trimmed.length >= 2 && trimmed[1] == ' ') trimmed.substring(2) else trimmed
+}
+
+private fun isTableSeparator(line: String): Boolean {
+    if (!line.contains("---")) return false
+    val cleaned = line.trim().trim('|').trim()
+    return cleaned.isNotEmpty() && cleaned.all { it == '-' || it == ':' || it == '|' || it.isWhitespace() }
+}
+
+private fun parseTableRow(
+    line: String,
+    codeSpan: SpanStyle,
+    linkSpan: SpanStyle,
+): List<AnnotatedString> {
+    val trimmed = line.trim().let {
+        var s = it
+        if (s.startsWith("|")) s = s.drop(1)
+        if (s.endsWith("|")) s = s.dropLast(1)
+        s
+    }
+    return trimmed.split('|').map { parseInlineMarkdown(it.trim(), codeSpan, linkSpan) }
+}
+
+private fun isBlockBoundary(lines: List<String>, j: Int): Boolean {
+    val line = lines[j]
+    if (line.trimStart().startsWith("```")) return true
+    if (isUnorderedListLine(line)) return true
+    if (ORDERED_LIST_LINE.matchAt(line, 0) != null) return true
+    if (line.contains('|') && j + 1 < lines.size && isTableSeparator(lines[j + 1])) return true
+    return false
+}
+
+/**
+ * Linear scanner that turns a SINGLE paragraph / list item / table cell
+ * into an `AnnotatedString`. Single pass over the input, no nested
+ * formatting — the inner content of each construct is taken verbatim.
+ *
+ * Match priority at every position:
+ *   1. Backtick inline code
+ *   2. `**bold**`
+ *   3. `*italic*` / `_italic_`
+ *   4. `[text](url)` link
+ *   5. plain character
+ *
+ * Fenced code blocks are detected at the block level — by the time we
+ * get here, a `\`\`\`` token would be inside a Paragraph block, treated
+ * as literal text. Unclosed inline openers fall through to "plain
+ * character" so the marker text is shown verbatim — never eats text
+ * waiting for a close that never arrives.
+ */
+private fun parseInlineMarkdown(
+    text: String,
+    codeSpan: SpanStyle,
+    linkSpan: SpanStyle,
+): AnnotatedString = buildAnnotatedString {
+    val boldSpan = SpanStyle(fontWeight = FontWeight.Bold)
+    val italicSpan = SpanStyle(fontStyle = FontStyle.Italic)
+    var i = 0
+    val len = text.length
+    while (i < len) {
+        val c = text[i]
+
+        if (c == '`') {
+            val close = text.indexOf('`', i + 1)
+            if (close in (i + 2)..(len - 1)) {
+                val inner = text.substring(i + 1, close)
+                if ('\n' !in inner) {
+                    withStyle(codeSpan) { append(inner) }
+                    i = close + 1
+                    continue
+                }
+            }
+        }
+
+        if (c == '*' && text.startsWith("**", i)) {
+            val close = text.indexOf("**", i + 2)
+            if (close in (i + 3)..(len - 2)) {
+                val inner = text.substring(i + 2, close)
+                if ('\n' !in inner) {
+                    withStyle(boldSpan) { append(inner) }
+                    i = close + 2
+                    continue
+                }
+            }
+        }
+
+        if (c == '*' || c == '_') {
+            val nextSame = i + 1 < len && text[i + 1] == c
+            if (!nextSame) {
+                val close = text.indexOf(c, i + 1)
+                if (close in (i + 2)..(len - 1)) {
+                    val inner = text.substring(i + 1, close)
+                    if ('\n' !in inner) {
+                        withStyle(italicSpan) { append(inner) }
+                        i = close + 1
+                        continue
+                    }
+                }
+            }
+        }
+
+        if (c == '[') {
+            val closeBracket = text.indexOf(']', i + 1)
+            if (closeBracket in (i + 2)..(len - 3) && text[closeBracket + 1] == '(') {
+                val closeParen = text.indexOf(')', closeBracket + 2)
+                if (closeParen in (closeBracket + 2)..(len - 1)) {
+                    val label = text.substring(i + 1, closeBracket)
+                    val url = text.substring(closeBracket + 2, closeParen)
+                    if ('\n' !in label && '\n' !in url) {
+                        pushStringAnnotation(tag = ASSISTANT_LINK_TAG, annotation = url)
+                        withStyle(linkSpan) { append(label) }
+                        pop()
+                        i = closeParen + 1
+                        continue
+                    }
+                }
+            }
+        }
+
+        append(c)
+        i++
     }
 }
 
@@ -1359,13 +1835,13 @@ private fun ToolCallBubble(call: ToolCallSummary, positionKey: Int) {
             color = MaterialTheme.colorScheme.tertiaryContainer,
             contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
             shape = RoundedCornerShape(12.dp),
-            // animateContentSize: tool-call args + status arrive
-            // through a stream of debounced EntryUpdated notifications
-            // (raw_input deltas, pending → running → done flips). Without
-            // it each notification snaps the bubble to a new size.
+            // Height-only animation: smooths the vertical growth as args /
+            // result text stream in, WITHOUT the horizontal squeeze that
+            // plain `animateContentSize` produced when the bubble widened
+            // from its icon-only first frame (the "compressed square" flash).
             modifier = Modifier
                 .widthIn(max = 360.dp)
-                .animateContentSize()
+                .animateHeightOnly()
                 .clickable { expanded = !expanded }
                 .semantics {
                     role = Role.Button
@@ -1648,7 +2124,14 @@ private fun SlimTopBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .statusBarsPadding()
+                // Top (status bar) + horizontal (landscape cutout / side
+                // nav bar) so the back button isn't hidden under the left
+                // camera notch in landscape.
+                .windowInsetsPadding(
+                    WindowInsets.safeDrawing.only(
+                        WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
+                    ),
+                )
                 .height(44.dp)
                 .padding(horizontal = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -2757,7 +3240,11 @@ private fun ContextFillMeter(totalTokens: Long?, maxTokens: Long?) {
             progress = { fraction },
             color = color,
             trackColor = MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier.width(64.dp),
+            // 48dp (was 64): trims the trailing cluster so the top-bar
+            // title + meter + pill + elapsed + overflow icon are less
+            // likely to overflow / clip the overflow button on narrow
+            // phones. Title already yields first via weight(1f).
+            modifier = Modifier.width(48.dp),
         )
         Text(
             text = "$percent%",

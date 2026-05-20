@@ -48,7 +48,21 @@ fun applyAppendedPlaceholder(
     current: List<EntrySummary>,
     payload: MessageAppendedPayload,
 ): AppendedPlaceholderOutcome {
-    val placeholder = EntrySummary(role = payload.role, preview = payload.preview)
+    // Propagate the csid(s) from the notification onto the placeholder.
+    // Without this, the user-bubble status row flips through `None` for
+    // the brief window between the placeholder landing and
+    // `fetchAndReplaceEntry` repopulating the real entry — the row's
+    // height pops in and out, producing a visible vertical jump in the
+    // bubble. The notification already carries the csid for user
+    // entries (server-side `event_sources::build_message_appended_payload`),
+    // so we can pre-stamp the placeholder and keep the status as
+    // `Delivered` from the moment the slot exists.
+    val placeholder = EntrySummary(
+        role = payload.role,
+        preview = payload.preview,
+        clientSendId = payload.clientSendId,
+        clientSendIds = payload.clientSendIds,
+    )
     return when {
         payload.entryIndex == current.size ->
             AppendedPlaceholderOutcome.Replaced(current + placeholder)

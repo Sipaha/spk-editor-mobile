@@ -1,10 +1,16 @@
 package ru.sipaha.spkremote.app.ui.nav
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -18,7 +24,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -134,7 +142,12 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        ConnectionStateBanner(banner)
+        ConnectionStateBanner(
+            banner = banner,
+            onRePair = {
+                navController.navigate("pairing") { launchSingleTop = true }
+            },
+        )
         NavHost(navController = navController, startDestination = startDestination) {
             composable("pairing") {
                 val s = uiState
@@ -289,32 +302,71 @@ private fun resolvedRoute(entry: NavBackStackEntry): String? {
  *     action required — re-pair").
  */
 @Composable
-private fun ConnectionStateBanner(banner: ConnectionBanner) {
-    val (background, text) = when (banner) {
+private fun ConnectionStateBanner(banner: ConnectionBanner, onRePair: () -> Unit) {
+    when (banner) {
         ConnectionBanner.Hidden -> return
         is ConnectionBanner.Reconnecting -> {
-            val seconds = (banner.nextRetryMs / 1000).coerceAtLeast(1)
+            // Live countdown. The previous version computed `next try in
+            // Xs` ONCE per emission, so it sat frozen at e.g. "30s" for the
+            // whole backoff and read as a hung connection. Capture a
+            // deadline when this attempt began and tick it down so the
+            // number actually moves.
+            val deadline = remember(banner.attempt, banner.nextRetryMs) {
+                System.currentTimeMillis() + banner.nextRetryMs
+            }
+            var remainingMs by remember(deadline) {
+                mutableStateOf((deadline - System.currentTimeMillis()).coerceAtLeast(0L))
+            }
+            LaunchedEffect(deadline) {
+                while (remainingMs > 0) {
+                    delay(500)
+                    remainingMs = (deadline - System.currentTimeMillis()).coerceAtLeast(0L)
+                }
+            }
+            val seconds = remainingMs / 1000
+            val tail = if (seconds > 0) "next try in ${seconds}s…" else "retrying…"
             val reason = banner.reason
             val text = if (reason != null) {
-                "$reason · Reconnecting (attempt ${banner.attempt}, next try in ${seconds}s)…"
+                "$reason · Reconnecting (attempt ${banner.attempt}, $tail)"
             } else {
-                "Reconnecting (attempt ${banner.attempt}, next try in ${seconds}s)…"
+                "Reconnecting (attempt ${banner.attempt}, $tail)"
             }
-            MaterialTheme.colorScheme.tertiaryContainer to text
+            BannerSurface(MaterialTheme.colorScheme.tertiaryContainer, text, onClick = null)
         }
         is ConnectionBanner.FailedTerminal -> {
-            MaterialTheme.colorScheme.errorContainer to
-                "${banner.reason} · Re-pair required."
+            // Terminal failure was previously a dead-end static line. Make
+            // it tappable so the user has a one-tap recovery into pairing
+            // instead of being stuck.
+            BannerSurface(
+                background = MaterialTheme.colorScheme.errorContainer,
+                text = "${banner.reason} · Tap to re-pair.",
+                onClick = onRePair,
+            )
         }
     }
+}
+
+@Composable
+private fun BannerSurface(background: Color, text: String, onClick: (() -> Unit)?) {
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
         color = background,
     ) {
         Text(
             text = text,
             modifier = Modifier
                 .fillMaxWidth()
+                // The banner is the top-most element (above the NavHost), so
+                // it must clear the system status bar itself — otherwise the
+                // text draws under the clock / battery icons. Horizontal too
+                // for the landscape camera cutout.
+                .windowInsetsPadding(
+                    WindowInsets.safeDrawing.only(
+                        WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
+                    ),
+                )
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             style = MaterialTheme.typography.bodyMedium,
         )

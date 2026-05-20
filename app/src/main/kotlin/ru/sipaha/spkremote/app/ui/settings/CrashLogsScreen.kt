@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -82,7 +85,12 @@ fun CrashLogsScreen(onBack: () -> Unit) {
             )
         },
     ) { padding ->
-        LazyColumn(modifier = Modifier.padding(padding)) {
+        LazyColumn(
+            modifier = Modifier.padding(padding),
+            // Clear the gesture nav bar so the last crash-log row isn't
+            // half-hidden at rest.
+            contentPadding = WindowInsets.navigationBars.asPaddingValues(),
+        ) {
             if (files.isEmpty()) {
                 item {
                     Text(
