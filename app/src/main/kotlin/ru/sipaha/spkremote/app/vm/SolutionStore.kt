@@ -177,9 +177,31 @@ internal class SolutionStore(
         scope.launch {
             runCatching { active.call("remote.solutions.get", params) }
                 .mapCatching { resp -> resp.decodeResultOrThrow(GetSolutionResult.serializer()) }
-                .onSuccess { _solutionDetails.value = UiData.Loaded(it) }
+                .onSuccess {
+                    _solutionDetails.value = UiData.Loaded(it)
+                    reconcileMemberAdds(solutionId, it.solution.members.map { m -> m.catalogId })
+                }
                 .onFailure { _solutionDetails.value = UiData.Error(it.message ?: "unknown error") }
         }
+    }
+
+    /**
+     * Drop in-flight/failed member-add ghost rows whose project has already
+     * landed as a member of [solutionId]. Self-heals a stuck ghost when the
+     * `solution_member_add_completed` event was missed (e.g. a transient
+     * disconnect or app-background mid-clone) — the member list is the
+     * authoritative "the add finished" signal. A catalog clone only becomes
+     * a member *after* the clone completes, so a landed catalog id always
+     * means its ghost is stale.
+     */
+    private fun reconcileMemberAdds(solutionId: String, landedCatalogIds: List<String>) {
+        if (landedCatalogIds.isEmpty()) return
+        val landed = landedCatalogIds.toSet()
+        val current = _memberAdds.value
+        val pruned = current.filterNot { (key, _) ->
+            key.first == solutionId && key.second in landed
+        }
+        if (pruned.size != current.size) _memberAdds.value = pruned
     }
 
     /**

@@ -93,6 +93,10 @@ fun SolutionDetailScreen(
     DisposableEffect(solutionId) {
         viewModel.clearSessions()
         viewModel.refreshSessions(solutionId)
+        // Load the member list too: it drives the self-heal that clears any
+        // stuck member-add ghost row (a clone whose `completed` event we
+        // missed) once the project has actually landed as a member.
+        viewModel.loadSolutionDetails(solutionId)
         viewModel.startObservingSessions(solutionId)
         onDispose { viewModel.stopObservingSessions() }
     }
@@ -116,6 +120,10 @@ fun SolutionDetailScreen(
         val nowConnected = connectionState is ConnectionState.Connected
         if (nowConnected && !wasConnected.value) {
             viewModel.refreshSessions(solutionId)
+            // Re-fetch members on reconnect so a clone that finished while we
+            // were offline clears its stuck ghost row (the `completed` event
+            // fired during the gap and isn't replayed on resubscribe).
+            viewModel.loadSolutionDetails(solutionId)
         }
         wasConnected.value = nowConnected
     }
