@@ -292,6 +292,11 @@ internal class SolutionStore(
                 .onSuccess { solutionId ->
                     refreshSolutions()
                     onCreated(solutionId)
+                    // Open it on the desktop so a remote-created solution
+                    // actually shows up there as a running solution (the
+                    // store entry alone leaves it "closed"). No focus steal
+                    // — the user is on their phone.
+                    openOnDesktop(solutionId)
                     // Fan out the member-adds against the freshly-created
                     // solution. Catalog clones seed ghost rows; empty
                     // projects resolve synchronously and refresh detail.
@@ -303,6 +308,24 @@ internal class SolutionStore(
                     }
                 }
                 .onFailure { context.emitError("Couldn't create solution: ${it.message ?: "?"}") }
+        }
+    }
+
+    /**
+     * Open [solutionId] on the desktop without requesting focus. Best-effort:
+     * failures (no active workspace, transient wire error) are non-critical
+     * — the solution still exists and can be opened from the desktop — so we
+     * surface them quietly rather than as a user-facing error.
+     */
+    private fun openOnDesktop(solutionId: String) {
+        val active = context.activeClient() ?: return
+        val params = buildJsonObject {
+            put("solution_id", solutionId)
+            put("focus", false)
+        }
+        scope.launch {
+            runCatching { active.call("remote.solutions.open", params) }
+                .onFailure { android.util.Log.w("SolutionStore", "open on desktop failed: ${it.message}") }
         }
     }
 
