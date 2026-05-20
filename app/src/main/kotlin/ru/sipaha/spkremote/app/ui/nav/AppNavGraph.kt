@@ -190,6 +190,9 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                     onOpenSolution = { sol ->
                         navController.navigate("solutions/${sol.id}")
                     },
+                    onOpenSolutionById = { solutionId ->
+                        navController.navigate("solutions/$solutionId")
+                    },
                     onOpenSettings = { navController.navigate("settings") },
                 )
             }

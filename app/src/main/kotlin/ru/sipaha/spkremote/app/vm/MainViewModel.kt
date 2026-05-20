@@ -375,10 +375,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     val solutions: StateFlow<UiData<List<SolutionSummary>>> get() = solutionStore.solutions
     val solutionDetails: StateFlow<UiData<GetSolutionResult>> get() = solutionStore.solutionDetails
 
+    val catalog: StateFlow<List<ru.sipaha.spkremote.core.CatalogProjectInfo>>
+        get() = solutionStore.catalog
+    val memberAdds: StateFlow<Map<Pair<String, String>, MemberAddProgress>>
+        get() = solutionStore.memberAdds
+
     fun refreshSolutions() = solutionStore.refreshSolutions()
     fun loadSolutionDetails(solutionId: String) = solutionStore.loadSolutionDetails(solutionId)
     fun createSolution(name: String) = solutionStore.createSolution(name)
     fun deleteSolution(solutionId: String) = solutionStore.deleteSolution(solutionId)
+    fun refreshCatalog() = solutionStore.refreshCatalog()
+    fun createSolutionWith(
+        name: String,
+        catalogIds: List<String>,
+        emptyNames: List<String>,
+        onCreated: (solutionId: String) -> Unit = {},
+    ) = solutionStore.createSolutionWith(name, catalogIds, emptyNames, onCreated)
+    fun addMemberFromCatalog(solutionId: String, catalogId: String) =
+        solutionStore.addMemberFromCatalog(solutionId, catalogId)
+    fun createEmptyMember(solutionId: String, name: String) =
+        solutionStore.createEmptyMember(solutionId, name)
 
     // ---- Sessions surface ----
 

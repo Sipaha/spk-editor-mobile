@@ -333,7 +333,7 @@ internal class SolutionStore(
  * [percent] is null for the indeterminate phase or before the first
  * progress tick; [error] is non-null only on a failed add.
  */
-internal data class MemberAddProgress(
+data class MemberAddProgress(
     val solutionId: String,
     val catalogId: String,
     val percent: Int? = null,
