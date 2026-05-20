@@ -244,6 +244,27 @@ internal class SolutionStore(
     }
 
     /**
+     * Remove a member from [solutionId] (config-only on the server — the
+     * worktree directory is left on disk). Refreshes the open solution
+     * detail + the list so the member count and rows update.
+     */
+    fun removeMember(solutionId: String, catalogId: String) {
+        val active = context.activeClient()
+        if (active == null) {
+            context.emitError(context.notConnectedMessage())
+            return
+        }
+        scope.launch {
+            runCatching { active.removeMember(solutionId, catalogId) }
+                .onSuccess {
+                    loadSolutionDetails(solutionId)
+                    refreshSolutions()
+                }
+                .onFailure { context.emitError("Couldn't remove project: ${it.message ?: "?"}") }
+        }
+    }
+
+    /**
      * Create a Solution named [name], then populate it: clone each catalog
      * project in [catalogIds] (async, surfaced as ghost rows) and create an
      * empty project for each name in [emptyNames] (synchronous). All

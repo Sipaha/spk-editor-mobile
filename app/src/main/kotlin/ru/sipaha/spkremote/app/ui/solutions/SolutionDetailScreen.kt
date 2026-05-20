@@ -11,18 +11,14 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
@@ -68,6 +64,7 @@ fun SolutionDetailScreen(
     solutionId: String,
     onOpenSession: (SessionSummary) -> Unit,
     onOpenSessionById: (sessionId: String) -> Unit,
+    onOpenProjects: (solutionId: String) -> Unit,
     onBack: () -> Unit,
 ) {
     val solutionsState by viewModel.solutions.collectAsState()
@@ -76,15 +73,17 @@ fun SolutionDetailScreen(
     val memberAdds by viewModel.memberAdds.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     var showNewSessionDialog by rememberSaveable { mutableStateOf(false) }
-    var showAddProjectDialog by rememberSaveable { mutableStateOf(false) }
 
     // In-flight / failed catalog member-adds for THIS solution, rendered as
     // ghost rows under the header until the clone completes (success drops
-    // the row; failure keeps it with an error).
+    // the row; failure keeps it with an error). The full project list +
+    // add/remove lives on the Projects panel ([onOpenProjects]); here we
+    // only surface progress so the create-with-projects flow shows work.
     val pendingAdds = memberAdds.values.filter { it.solutionId == solutionId }
 
-    LaunchedEffect(showAddProjectDialog) {
-        if (showAddProjectDialog) viewModel.refreshCatalog()
+    // Catalog feeds the ghost-row name lookup below.
+    LaunchedEffect(pendingAdds.isNotEmpty()) {
+        if (pendingAdds.isNotEmpty() && catalog.isEmpty()) viewModel.refreshCatalog()
     }
 
     val solution: SolutionSummary? = (solutionsState as? UiData.Loaded)
@@ -146,16 +145,6 @@ fun SolutionDetailScreen(
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
-                actions = {
-                    TextButton(onClick = { showAddProjectDialog = true }) {
-                        Icon(
-                            Icons.Filled.Add,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Text(text = "Add project", modifier = Modifier.padding(start = 4.dp))
-                    }
-                },
             )
         },
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -173,29 +162,53 @@ fun SolutionDetailScreen(
                 .padding(padding),
         ) {
             if (solution != null) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
                     val memberLabel = "${solution.memberCount} " +
                         if (solution.memberCount == 1) "member" else "members"
-                    // Drop the `at <solution.root>` server path — meaningless
-                    // on the phone; the member count is the useful summary.
-                    // "Add project" lives in the top-bar actions, so this
-                    // header strip stays compact.
-                    Text(
-                        text = memberLabel,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    for (add in pendingAdds) {
-                        MemberAddGhostRow(
-                            add = add,
-                            displayName = catalog.firstOrNull { it.catalogId == add.catalogId }?.name
-                                ?: add.catalogId,
+                    // Tapping the member count opens the Projects panel
+                    // (list + add + remove). The chevron signals it's
+                    // navigable. Drop the `at <solution.root>` server path —
+                    // meaningless on the phone.
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenProjects(solutionId) }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = memberLabel,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
                         )
+                        Text(
+                            text = "Projects",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Icon(
+                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (pendingAdds.isNotEmpty()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp)
+                                .padding(bottom = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            for (add in pendingAdds) {
+                                MemberAddGhostRow(
+                                    add = add,
+                                    displayName = catalog.firstOrNull {
+                                        it.catalogId == add.catalogId
+                                    }?.name ?: add.catalogId,
+                                )
+                            }
+                        }
                     }
                 }
                 HorizontalDivider()
@@ -254,124 +267,7 @@ fun SolutionDetailScreen(
                 },
             )
         }
-
-        if (showAddProjectDialog) {
-            AddProjectDialog(
-                catalog = catalog,
-                onAdd = { catalogIds, emptyNames ->
-                    showAddProjectDialog = false
-                    catalogIds.forEach { viewModel.addMemberFromCatalog(solutionId, it) }
-                    emptyNames.forEach { viewModel.createEmptyMember(solutionId, it) }
-                },
-                onDismiss = { showAddProjectDialog = false },
-            )
-        }
     }
-}
-
-@Composable
-private fun MemberAddGhostRow(
-    add: ru.sipaha.spkremote.app.vm.MemberAddProgress,
-    displayName: String,
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (add.error == null) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(16.dp),
-                strokeWidth = 2.dp,
-            )
-        } else {
-            Icon(
-                Icons.Filled.Add,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.error,
-            )
-        }
-        Column(modifier = Modifier.padding(start = 8.dp)) {
-            Text(
-                text = displayName,
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            val sub = when {
-                add.error != null -> add.error
-                add.percent != null -> "${add.stage ?: "Cloning"}… ${add.percent}%"
-                else -> "${add.stage ?: "Cloning"}…"
-            }
-            Text(
-                text = sub,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (add.error != null) {
-                    MaterialTheme.colorScheme.error
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                },
-            )
-        }
-    }
-}
-
-@Composable
-private fun AddProjectDialog(
-    catalog: List<ru.sipaha.spkremote.core.CatalogProjectInfo>,
-    onAdd: (catalogIds: List<String>, emptyNames: List<String>) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    var selected by remember { mutableStateOf(emptySet<String>()) }
-    var emptyNames by remember { mutableStateOf(emptyList<String>()) }
-    val hasSelection = selected.isNotEmpty() || emptyNames.isNotEmpty()
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Add project") },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 420.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                for (pending in emptyNames) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "New: $pending",
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.weight(1f),
-                        )
-                        IconButton(onClick = { emptyNames = emptyNames - pending }) {
-                            Icon(Icons.Filled.Close, contentDescription = "Remove $pending")
-                        }
-                    }
-                }
-                ProjectPicker(
-                    catalog = catalog,
-                    selected = selected,
-                    onToggle = { id ->
-                        selected = if (id in selected) selected - id else selected + id
-                    },
-                    onCreateEmpty = { newName ->
-                        if (newName !in emptyNames) emptyNames = emptyNames + newName
-                    },
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onAdd(selected.toList(), emptyNames) },
-                enabled = hasSelection,
-            ) { Text("Add") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
 }
 
 @Composable

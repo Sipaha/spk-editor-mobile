@@ -39,6 +39,7 @@ import ru.sipaha.spkremote.app.ui.settings.CrashLogsScreen
 import ru.sipaha.spkremote.app.ui.settings.SettingsScreen
 import ru.sipaha.spkremote.app.ui.solutions.SessionDetailScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionDetailScreen
+import ru.sipaha.spkremote.app.ui.solutions.SolutionProjectsScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionsListScreen
 import ru.sipaha.spkremote.app.vm.ConnectionBanner
 import ru.sipaha.spkremote.app.vm.MainViewModel
@@ -238,6 +239,20 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                     onOpenSessionById = { sessionId ->
                         navController.navigate("solutions/$solutionId/sessions/$sessionId")
                     },
+                    onOpenProjects = { sid ->
+                        navController.navigate("solutions/$sid/projects")
+                    },
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable(
+                route = "solutions/{solutionId}/projects",
+                arguments = listOf(navArgument("solutionId") { type = NavType.StringType }),
+            ) { entry ->
+                val solutionId = entry.arguments?.getString("solutionId").orEmpty()
+                SolutionProjectsScreen(
+                    viewModel = viewModel,
+                    solutionId = solutionId,
                     onBack = { navController.popBackStack() },
                 )
             }

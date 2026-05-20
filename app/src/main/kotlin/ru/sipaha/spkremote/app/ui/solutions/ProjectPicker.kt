@@ -5,13 +5,21 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -26,6 +34,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import ru.sipaha.spkremote.app.vm.MemberAddProgress
 import ru.sipaha.spkremote.core.CatalogProjectInfo
 
 /**
@@ -138,4 +147,112 @@ private fun CreateEmptyProjectRow(onCreateEmpty: (String) -> Unit) {
             TextButton(onClick = confirm, enabled = name.isNotBlank()) { Text("Add") }
         }
     }
+}
+
+/**
+ * One in-flight / failed member-add rendered as a ghost row: a small
+ * spinner + the project name + a progress/stage line, or an error. Shared
+ * by the Solution detail header (create-with-projects progress) and the
+ * Projects panel.
+ */
+@Composable
+fun MemberAddGhostRow(add: MemberAddProgress, displayName: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (add.error == null) {
+            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+        } else {
+            Icon(
+                Icons.Filled.Close,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.error,
+            )
+        }
+        Column(modifier = Modifier.padding(start = 8.dp)) {
+            Text(text = displayName, style = MaterialTheme.typography.bodyMedium)
+            val sub = when {
+                add.error != null -> add.error
+                add.percent != null -> "${add.stage ?: "Cloning"}… ${add.percent}%"
+                else -> "${add.stage ?: "Cloning"}…"
+            }
+            Text(
+                text = sub,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (add.error != null) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+    }
+}
+
+/**
+ * "Add project" dialog hosting [ProjectPicker] — accumulates selected
+ * registry projects + queued new empty-project names, then fires
+ * [onAdd] once on confirm. Shared between the New Solution flow and the
+ * Projects panel.
+ */
+@Composable
+fun AddProjectDialog(
+    catalog: List<CatalogProjectInfo>,
+    onAdd: (catalogIds: List<String>, emptyNames: List<String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var selected by remember { mutableStateOf(emptySet<String>()) }
+    var emptyNames by remember { mutableStateOf(emptyList<String>()) }
+    val hasSelection = selected.isNotEmpty() || emptyNames.isNotEmpty()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add project") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (pending in emptyNames) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "New: $pending",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        IconButton(onClick = { emptyNames = emptyNames - pending }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Remove $pending")
+                        }
+                    }
+                }
+                ProjectPicker(
+                    catalog = catalog,
+                    selected = selected,
+                    onToggle = { id ->
+                        selected = if (id in selected) selected - id else selected + id
+                    },
+                    onCreateEmpty = { newName ->
+                        if (newName !in emptyNames) emptyNames = emptyNames + newName
+                    },
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onAdd(selected.toList(), emptyNames) },
+                enabled = hasSelection,
+            ) { Text("Add") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
