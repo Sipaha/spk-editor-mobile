@@ -86,14 +86,24 @@ fun NewSessionDialog(
     var initialMessage by rememberSaveable { mutableStateOf("") }
     var sessionTitle by rememberSaveable { mutableStateOf("") }
     var selectedCwd by rememberSaveable { mutableStateOf<String?>(null) }
-    val members: List<SolutionMember> = (solutionDetailsState as? UiData.Loaded)
-        ?.value?.solution?.members.orEmpty()
-    // Auto-pick the first member as the default cwd, so single-member
-    // solutions don't show a redundant dropdown. The picker UI itself is
-    // hidden below when members.size < 2.
-    LaunchedEffect(members) {
-        if (selectedCwd == null && members.isNotEmpty()) {
-            selectedCwd = members.first().localPath
+    val loadedSolution = (solutionDetailsState as? UiData.Loaded)?.value?.solution
+    val members: List<SolutionMember> = loadedSolution?.members.orEmpty()
+    val solutionRoot: String? = loadedSolution?.root
+    // Working-directory choices: the solution root (sees all member
+    // projects) followed by each member project. The root is offered first
+    // so an agent can be started across the whole solution, not just inside
+    // one project.
+    val cwdOptions: List<CwdOption> = remember(solutionRoot, members) {
+        buildList {
+            if (solutionRoot != null) add(CwdOption("Solution root", solutionRoot))
+            members.forEach { add(CwdOption(it.catalogId, it.localPath)) }
+        }
+    }
+    // Default cwd: the first member if any (focused on a project), else the
+    // solution root. The picker UI is hidden when there's only one choice.
+    LaunchedEffect(members, solutionRoot) {
+        if (selectedCwd == null) {
+            selectedCwd = members.firstOrNull()?.localPath ?: solutionRoot
         }
     }
 
@@ -137,13 +147,13 @@ fun NewSessionDialog(
                     onSelected = { selectedAgentId = it },
                 )
 
-                if (members.size >= 2) {
+                if (cwdOptions.size >= 2) {
                     Text(
                         text = "Working directory",
                         style = MaterialTheme.typography.labelLarge,
                     )
                     CwdPicker(
-                        members = members,
+                        options = cwdOptions,
                         selectedPath = selectedCwd,
                         enabled = !inFlight,
                         onSelected = { selectedCwd = it },
@@ -300,40 +310,34 @@ private fun AgentPicker(
     Box(modifier = Modifier.padding(top = 4.dp))
 }
 
+/** One working-directory choice: a human [label] and the [path] sent as `cwd`. */
+private data class CwdOption(val label: String, val path: String)
+
 /**
- * Dropdown for selecting which solution member's local path the new
- * session should run inside. Only rendered when the solution has 2+
- * members — for single-member solutions the auto-selected first
- * member is already the only option.
+ * Dropdown for selecting the new session's working directory. Options are
+ * the solution root ("Solution root") plus each member project; only
+ * rendered when there's more than one choice.
  *
- * Visual: trigger looks like an OutlinedTextField with a trailing
- * chevron; tapping opens the DropdownMenu with one item per member,
- * showing the catalog name + a truncated path under it.
- */
-/**
- * Dropdown for selecting which solution member's local path the new
- * session should run inside. Only rendered when the solution has 2+
- * members.
- *
- * Implementation note: I tried OutlinedTextField(readOnly=true) with
- * a .selectable overlay first — but the TextField consumes touch
- * events internally even when read-only, so the overlay never sees
- * the tap. Using a clickable Surface styled like a field surface is
- * the simplest robust approach (and matches what M3
- * ExposedDropdownMenuBox builds under the hood, without dragging in
- * its trigger-anchor machinery for a single-screen dialog).
+ * Implementation note: I tried OutlinedTextField(readOnly=true) with a
+ * .selectable overlay first — but the TextField consumes touch events
+ * internally even when read-only, so the overlay never sees the tap. Using
+ * a clickable Surface styled like a field surface is the simplest robust
+ * approach (and matches what M3 ExposedDropdownMenuBox builds under the
+ * hood, without dragging in its trigger-anchor machinery for a
+ * single-screen dialog). The full server-side path is never shown — it's
+ * meaningless on the phone and only the label identifies the choice.
  */
 @Composable
 private fun CwdPicker(
-    members: List<SolutionMember>,
+    options: List<CwdOption>,
     selectedPath: String?,
     enabled: Boolean,
     onSelected: (String) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
-    val selectedMember by remember(selectedPath, members) {
+    val selectedOption by remember(selectedPath, options) {
         derivedStateOf {
-            members.firstOrNull { it.localPath == selectedPath } ?: members.firstOrNull()
+            options.firstOrNull { it.path == selectedPath } ?: options.firstOrNull()
         }
     }
     Box(modifier = Modifier.fillMaxWidth()) {
@@ -353,23 +357,18 @@ private fun CwdPicker(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Member",
+                        text = "Directory",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    // Show only the catalog id (project name). The full
-                    // server-side filesystem path is meaningless to the
-                    // phone user and just clutters the picker — the path is
-                    // still the value passed to `onSelected` as the cwd.
                     Text(
-                        text = selectedMember?.catalogId
-                            ?: "(no members)",
+                        text = selectedOption?.label ?: "(none)",
                         style = MaterialTheme.typography.bodyLarge,
                     )
                 }
                 Icon(
                     imageVector = Icons.Filled.KeyboardArrowDown,
-                    contentDescription = "Open member picker",
+                    contentDescription = "Open directory picker",
                 )
             }
         }
@@ -378,14 +377,14 @@ private fun CwdPicker(
             onDismissRequest = { expanded = false },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            for (m in members) {
+            for (option in options) {
                 DropdownMenuItem(
                     text = {
-                        Text(m.catalogId, style = MaterialTheme.typography.bodyLarge)
+                        Text(option.label, style = MaterialTheme.typography.bodyLarge)
                     },
                     onClick = {
                         expanded = false
-                        onSelected(m.localPath)
+                        onSelected(option.path)
                     },
                 )
             }
