@@ -627,7 +627,30 @@ private fun ChatList(
             for (e in syntheticQueueEntries) map[e] = Unit
         }
     }
-    val combined: List<EntrySummary> = server.entries + optimistic + syntheticQueueEntries
+    // Set of every csid the server has already echoed — either as a fully
+    // appended server entry or as a still-queued bundle. Used to hide an
+    // optimistic bubble the instant its echo surfaces, so the
+    // optimistic→echo swap is driven by a SINGLE observable change (the echo
+    // appearing) instead of two independent StateFlow emits (optimistic pop
+    // + server append). That removes the one-frame gap that caused the
+    // send-flicker, and guarantees an optimistic entry and its echo never
+    // coexist in `combined` (which would collide on the `csid:N` LazyColumn
+    // key and crash).
+    val echoedCsids: Set<Long> = remember(server.entries, syntheticQueueEntries) {
+        buildSet {
+            for (e in server.entries) {
+                e.clientSendId?.let { add(it) }
+                addAll(e.clientSendIds)
+            }
+            for (e in syntheticQueueEntries) {
+                e.clientSendId?.let { add(it) }
+            }
+        }
+    }
+    val visibleOptimistic = remember(optimistic, echoedCsids) {
+        ru.sipaha.spkremote.core.visibleOptimistic(optimistic, echoedCsids)
+    }
+    val combined: List<EntrySummary> = server.entries + visibleOptimistic + syntheticQueueEntries
     // Identity of every optimistic entry is referential — they are the
     // same objects the store published — so we can use `===` to flip
     // the per-bubble status icon without touching server entries.
