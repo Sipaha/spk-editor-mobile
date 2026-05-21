@@ -62,6 +62,7 @@ fun applyAppendedPlaceholder(
         preview = payload.preview,
         clientSendId = payload.clientSendId,
         clientSendIds = payload.clientSendIds,
+        createdMs = payload.createdMs,
     )
     return when {
         payload.entryIndex == current.size ->

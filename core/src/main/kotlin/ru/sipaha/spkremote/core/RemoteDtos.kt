@@ -286,6 +286,13 @@ data class EntrySummary(
      * bubbles orphaned.
      */
     @SerialName("client_send_ids") val clientSendIds: List<Long> = emptyList(),
+    /**
+     * Unix-millis creation time captured server-side at first append. Null
+     * for entries that predate the feature (UI shows no time, never a
+     * fabricated one). Also delivered on the `agent_session_message_appended`
+     * notification so a streamed entry shows its time without a refetch.
+     */
+    @SerialName("created_ms") val createdMs: Long? = null,
 )
 
 /**
@@ -425,6 +432,14 @@ data class MessageAppendedPayload(
      * [clientSendId] singular for old-server compatibility.
      */
     @SerialName("client_send_ids") val clientSendIds: List<Long> = emptyList(),
+    /**
+     * Unix-millis creation time for the appended entry. Mirrors
+     * [EntrySummary.createdMs] — carried here so the placeholder
+     * [EntrySummary] built in [applyAppendedPlaceholder] already has the
+     * time before `fetchAndReplaceEntry` returns the full entry. Null for
+     * entries that predate the feature or for old servers.
+     */
+    @SerialName("created_ms") val createdMs: Long? = null,
 )
 
 /**
