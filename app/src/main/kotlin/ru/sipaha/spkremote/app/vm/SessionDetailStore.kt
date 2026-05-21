@@ -974,17 +974,21 @@ internal class SessionDetailStore(
                 }
                 snapshotForCache?.let {
                     persistCache(sessionId, it, it.entries, it.totalCount)
+                    // Heal stuck placeholders only on a clean merge (i.e. when
+                    // no full refetch was launched). `resumeSession` only MERGES
+                    // entries the local view is missing (by index); it never
+                    // re-fetches an already-present slot. A placeholder that
+                    // got stuck on its truncated preview during an outage
+                    // (its `fetchAndReplaceEntry` retries all failed) keeps
+                    // its index, so the resume merge above skips it. Re-fetch
+                    // any still-incomplete tool_call slots now that we're back
+                    // online. `fetchAndReplaceEntry` is dedup-guarded, so a
+                    // slot that was already complete is a cheap no-op.
+                    // When a full refetch was triggered (snapshotForCache == null)
+                    // the refetch already retrieves complete entries — heal there
+                    // would spawn redundant coroutines racing the refetch.
+                    healIncompletePlaceholders(sessionId)
                 }
-                // Heal stuck placeholders. `resumeSession` only MERGES
-                // entries the local view is missing (by index); it never
-                // re-fetches an already-present slot. A placeholder that
-                // got stuck on its truncated preview during an outage
-                // (its `fetchAndReplaceEntry` retries all failed) keeps
-                // its index, so the resume merge above skips it. Re-fetch
-                // any still-incomplete tool_call slots now that we're back
-                // online. `fetchAndReplaceEntry` is dedup-guarded, so a
-                // slot that was already complete is a cheap no-op.
-                healIncompletePlaceholders(sessionId)
             }
             // Failed resume is recoverable — silent.
         }
@@ -997,6 +1001,13 @@ internal class SessionDetailStore(
      * Called from the reconnect resume path so prolonged-outage entries
      * self-heal once the socket is back. Bounded by the (small) number of
      * stuck slots; each fetch is itself retry- and dedup-guarded.
+     *
+     * **Index precondition:** relies on the store-wide invariant that list
+     * position == server index (the same assumption `onMessageAppended`'s
+     * `fetchAndReplaceEntry(payload.entryIndex)` already makes). This is safe
+     * because stuck tool-call placeholders only arise during active streaming
+     * sessions that have not been paginated backward via loadOlder, so
+     * list position 0 always corresponds to server index 0.
      */
     private fun healIncompletePlaceholders(sessionId: String) {
         if (openSessionId != sessionId) return
