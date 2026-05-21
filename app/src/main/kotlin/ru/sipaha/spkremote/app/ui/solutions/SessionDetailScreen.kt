@@ -751,15 +751,14 @@ private fun ChatList(
             // separator of the newest day would chronologically come
             // BEFORE the newest message, i.e. AFTER it post-reversal, so
             // index 0 is always a Message when a newest message exists).
-            val timeline = remember(combined) {
-                ru.sipaha.spkremote.core.withDateSeparators(
+            val (timeline, lastMessageReversedIndex) = remember(combined) {
+                val t = ru.sipaha.spkremote.core.withDateSeparators(
                     combined,
                     java.time.ZoneId.systemDefault(),
                 ).asReversed()
+                t to t.indexOfFirst { it is ru.sipaha.spkremote.core.ChatItem.Message }
             }
-            val lastMessageReversedIndex = remember(timeline) {
-                timeline.indexOfFirst { it is ru.sipaha.spkremote.core.ChatItem.Message }
-            }
+            val today = remember(combined) { java.time.LocalDate.now() }
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 state = lazyState,
@@ -817,7 +816,7 @@ private fun ChatList(
                 ) { listIndex, item ->
                     when (item) {
                         is ru.sipaha.spkremote.core.ChatItem.DateSeparator ->
-                            DateSeparatorRow(label = formatDateSeparator(item.epochDay))
+                            DateSeparatorRow(label = formatDateSeparator(item.epochDay, today))
                         is ru.sipaha.spkremote.core.ChatItem.Message -> {
                             val entry = item.entry
                             val status = userBubbleStatusFor(
@@ -3292,9 +3291,8 @@ internal fun formatHm(epochMs: Long): String {
 }
 
 /** C3: "Today" / "Yesterday" / localized medium date for a separator row. */
-internal fun formatDateSeparator(epochDay: Long): String {
+internal fun formatDateSeparator(epochDay: Long, today: java.time.LocalDate): String {
     val date = java.time.LocalDate.ofEpochDay(epochDay)
-    val today = java.time.LocalDate.now()
     return when (date) {
         today -> "Today"
         today.minusDays(1) -> "Yesterday"
