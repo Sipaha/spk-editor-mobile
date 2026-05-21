@@ -636,21 +636,21 @@ private fun ChatList(
     // send-flicker, and guarantees an optimistic entry and its echo never
     // coexist in `combined` (which would collide on the `csid:N` LazyColumn
     // key and crash).
-    val echoedCsids: Set<Long> = remember(server.entries, syntheticQueueEntries) {
+    val echoedCsids: Set<Long> = remember(server.entries, serverQueuedBundles) {
         buildSet {
             for (e in server.entries) {
                 e.clientSendId?.let { add(it) }
                 addAll(e.clientSendIds)
             }
-            for (e in syntheticQueueEntries) {
-                e.clientSendId?.let { add(it) }
+            for (bundle in serverQueuedBundles) {
+                addAll(bundle.csids)
             }
         }
     }
-    val visibleOptimistic = remember(optimistic, echoedCsids) {
+    val visibleOptimisticEntries = remember(optimistic, echoedCsids) {
         ru.sipaha.spkremote.core.visibleOptimistic(optimistic, echoedCsids)
     }
-    val combined: List<EntrySummary> = server.entries + visibleOptimistic + syntheticQueueEntries
+    val combined: List<EntrySummary> = server.entries + visibleOptimisticEntries + syntheticQueueEntries
     // Identity of every optimistic entry is referential — they are the
     // same objects the store published — so we can use `===` to flip
     // the per-bubble status icon without touching server entries.
