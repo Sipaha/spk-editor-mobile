@@ -3413,6 +3413,7 @@ internal fun LastActivityLabel(lastActivityMs: Long?) {
         lastActivityMs,
         now,
         android.text.format.DateUtils.MINUTE_IN_MILLIS,
+        android.text.format.DateUtils.FORMAT_ABBREV_RELATIVE,
     ).toString()
     val absolute = java.text.DateFormat.getDateTimeInstance()
         .format(java.util.Date(lastActivityMs))
@@ -3429,6 +3430,7 @@ internal fun LastActivityLabel(lastActivityMs: Long?) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 88.dp),
         )
     }
 }
