@@ -90,11 +90,15 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.PlainTooltip
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -291,6 +295,13 @@ fun SessionDetailScreen(
     val activeTotalTokens: Long? = activeSummary?.totalTokens
     val activeMaxTokens: Long? = activeSummary?.maxTokens
     val activeStateStartedAtMs: Long? = activeSummary?.stateStartedAtMs
+    // "Last activity" anchor for the status bar: the newest chat entry's
+    // wall-clock timestamp, filtered to a real value (> 0). This mirrors
+    // `combined.lastOrNull()?.createdMs` from [ChatList] — optimistic and
+    // synthetic queue rows carry no real `createdMs`, so the chronologically
+    // newest *real-time* entry is the last server entry. Null → the status
+    // bar shows nothing extra (looks exactly as before).
+    val lastActivityMs: Long? = loadedSession?.entries?.lastOrNull()?.createdMs?.takeIf { it > 0 }
     Scaffold(
         // Android 15+ (targetSdk 35+) forces edge-to-edge; Scaffold's
         // default contentWindowInsets = systemBars would then double-
@@ -314,6 +325,7 @@ fun SessionDetailScreen(
                             displayState = displayState,
                             stateStartedAtMs = activeStateStartedAtMs,
                         )
+                        LastActivityLabel(lastActivityMs = lastActivityMs)
                         // Overflow menu — Reset / Compact context. The
                         // anchor's `Box` wrapping is what lets DropdownMenu
                         // compute its caret position; placing the menu
@@ -774,12 +786,11 @@ private fun ChatList(
             // separator of the newest day would chronologically come
             // BEFORE the newest message, i.e. AFTER it post-reversal, so
             // index 0 is always a Message when a newest message exists).
-            val (timeline, lastMessageReversedIndex) = remember(combined) {
-                val t = ru.sipaha.spkremote.core.withDateSeparators(
+            val timeline = remember(combined) {
+                ru.sipaha.spkremote.core.withDateSeparators(
                     combined,
                     java.time.ZoneId.systemDefault(),
                 ).asReversed()
-                t to t.indexOfFirst { it is ru.sipaha.spkremote.core.ChatItem.Message }
             }
             val today = remember(combined) { java.time.LocalDate.now() }
             LazyColumn(
@@ -836,7 +847,7 @@ private fun ChatList(
                             }
                         }
                     },
-                ) { listIndex, item ->
+                ) { _, item ->
                     when (item) {
                         is ru.sipaha.spkremote.core.ChatItem.DateSeparator ->
                             DateSeparatorRow(label = formatDateSeparator(item.epochDay, today))
@@ -852,7 +863,6 @@ private fun ChatList(
                             ChatBubble(
                                 entry = entry,
                                 userStatus = status,
-                                isLast = listIndex == lastMessageReversedIndex,
                             )
                         }
                     }
@@ -991,20 +1001,20 @@ private fun formatBytes(b: Long): String = when {
 private fun ChatBubble(
     entry: EntrySummary,
     userStatus: UserBubbleStatus = UserBubbleStatus.None,
-    isLast: Boolean = false,
 ) {
     val role = parseEntryRole(entry.role)
-    // C3: per-message HH:MM. The newest bubble (`isLast`) always shows the
-    // time; any other timestamped bubble reveals it on a SHORT tap. The
-    // footer line sits OUTSIDE the colored Surface so the tap toggle never
-    // competes with the inner SelectionContainer long-press (text selection)
-    // or the user-bubble image-link taps.
+    // C3: per-message HH:MM, revealed ONLY on a SHORT tap. The always-on
+    // "last message time" now lives in the status bar (LastActivityLabel),
+    // so no bubble shows its time unprompted. The footer line sits OUTSIDE
+    // the colored Surface so the tap toggle never competes with the inner
+    // SelectionContainer long-press (text selection) or the user-bubble
+    // image-link taps.
     var revealed by rememberSaveable(entry.index, entry.clientSendId) { mutableStateOf(false) }
     val timeText = entry.createdMs?.takeIf { it > 0 }?.let { formatHm(it) }
     Column(modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier.fillMaxWidth().then(
-                if (timeText != null && !isLast) {
+                if (timeText != null) {
                     Modifier.clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -1067,7 +1077,7 @@ private fun ChatBubble(
                 )
             }
         }
-        if (timeText != null && (isLast || revealed)) {
+        if (timeText != null && revealed) {
             Text(
                 text = timeText,
                 style = MaterialTheme.typography.labelSmall,
@@ -3368,6 +3378,59 @@ internal fun RunningElapsed(displayState: DisplayState, stateStartedAtMs: Long?)
         text = formatElapsed(elapsedSeconds),
         style = MaterialTheme.typography.labelSmall,
     )
+}
+
+/**
+ * "Last activity" relative-time label in the [SlimTopBar], next to the
+ * [StatePill] / [RunningElapsed]. Shows e.g. `8 мин назад` (device locale)
+ * for the newest chat entry's wall-clock time, so a stalled agent
+ * (Running but no recent activity) is obvious at a glance.
+ *
+ * - Relative formatting is delegated to Android's localized
+ *   [DateUtils.getRelativeTimeSpanString] (minute granularity).
+ * - A `now` state ticks every ~15s so the label stays current without a
+ *   per-second redraw; the coroutine rekeys on [lastActivityMs] so a
+ *   fresh entry restarts the clock cleanly.
+ * - Long-press shows a [TooltipBox] with the ABSOLUTE localized date-time,
+ *   built from [java.text.DateFormat.getDateTimeInstance] (matches the
+ *   formatting style already used in CrashLogsScreen).
+ *
+ * Renders nothing when [lastActivityMs] is null (no real timestamp /
+ * empty session) so the bar looks exactly as before.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun LastActivityLabel(lastActivityMs: Long?) {
+    if (lastActivityMs == null) return
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(lastActivityMs) {
+        while (true) {
+            delay(15_000L)
+            now = System.currentTimeMillis()
+        }
+    }
+    val relative = android.text.format.DateUtils.getRelativeTimeSpanString(
+        lastActivityMs,
+        now,
+        android.text.format.DateUtils.MINUTE_IN_MILLIS,
+    ).toString()
+    val absolute = java.text.DateFormat.getDateTimeInstance()
+        .format(java.util.Date(lastActivityMs))
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberTooltipPositionProvider(
+            androidx.compose.material3.TooltipAnchorPosition.Above,
+        ),
+        tooltip = { PlainTooltip { Text(absolute) } },
+        state = rememberTooltipState(),
+    ) {
+        Text(
+            text = relative,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
 }
 
 /**
