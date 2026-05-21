@@ -19,6 +19,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -648,16 +649,9 @@ private fun ChatList(
             lazyState.firstVisibleItemIndex == 0 && lazyState.firstVisibleItemScrollOffset == 0
         }
     }
-    // Auto-scroll on growth. Subtle: when a new entry lands, the
-    // LazyColumn (reverseLayout = true) keeps the PREVIOUS bottom
-    // pinned visually, so the user's `firstVisibleItemIndex` bumps
-    // from 0 to 1 and the strict `atBottom` check above would
-    // immediately read false — the entry that just arrived would
-    // sit one item below the visible region with no auto-scroll.
-    // Threshold `<= 1` captures the post-grow "previous bottom shifted
-    // up by one" state and still considers the user pinned. We also
-    // suppress while [isScrollInProgress] so a user mid-drag to read
-    // history doesn't get yanked back by a freshly-arrived turn.
+    // Auto-scroll on growth. We suppress while [isScrollInProgress] so a
+    // user mid-drag to read history doesn't get yanked back by a
+    // freshly-arrived turn.
     val isScrolling by remember {
         derivedStateOf { lazyState.isScrollInProgress }
     }
@@ -675,10 +669,29 @@ private fun ChatList(
             ?: if (entry.index >= 0) "idx:${entry.index}"
             else "role:${entry.role}#${entry.preview.hashCode()}"
     }
+    // Was the user pinned to the newest entry IMMEDIATELY BEFORE this
+    // growth? Computed in `remember(...)` so it runs during the
+    // composition that brings the new entry in — at that point `lazyState`
+    // still reports last frame's layout (relayout happens in the layout
+    // phase, AFTER composition), so the index/offset reflect where the
+    // user actually was before the new item shifted the indices.
+    //
+    // Crucially this checks `firstVisibleItemScrollOffset == 0`, NOT just
+    // the old offset-blind `firstVisibleItemIndex <= 1`. The newest reply
+    // renders as a single tall AssistantBubble (item 0 under
+    // reverseLayout); scrolling UP inside it to read keeps
+    // `firstVisibleItemIndex == 0` while only the offset grows. The
+    // offset-blind guard mistook "reading the reply" for "pinned" and
+    // yanked the viewport to the bottom on every streamed block. The
+    // `<= 1` index tolerance is retained for the case where a fresh entry
+    // already bumped the previous (flush) bottom from slot 0 to slot 1.
+    val wasPinnedToNewest = remember(combined.size, newestEntryKey) {
+        lazyState.firstVisibleItemIndex <= 1 && lazyState.firstVisibleItemScrollOffset == 0
+    }
     LaunchedEffect(combined.size, newestEntryKey) {
         if (combined.isEmpty()) return@LaunchedEffect
         if (isScrolling) return@LaunchedEffect
-        if (lazyState.firstVisibleItemIndex <= 1) {
+        if (wasPinnedToNewest) {
             lazyState.animateScrollToItem(0)
         }
     }
@@ -726,6 +739,27 @@ private fun ChatList(
                 body = "Send a message to start the conversation.",
             )
         } else {
+            // C3: weave date-separator rows into the timeline. The pure
+            // helper produces a CHRONOLOGICAL list (separator BEFORE its
+            // day's messages); `.asReversed()` flips it for reverseLayout
+            // so the newest message stays at reversed index 0 (flush at the
+            // bottom) and a day's separator sits ABOVE that day's messages.
+            // This preserves the auto-scroll invariant: `combined.last()`
+            // is still the newest entry and maps to the FIRST Message in
+            // `timeline` — `animateScrollToItem(0)` reaches it as long as
+            // no separator precedes it in reversed order (the trailing
+            // separator of the newest day would chronologically come
+            // BEFORE the newest message, i.e. AFTER it post-reversal, so
+            // index 0 is always a Message when a newest message exists).
+            val timeline = remember(combined) {
+                ru.sipaha.spkremote.core.withDateSeparators(
+                    combined,
+                    java.time.ZoneId.systemDefault(),
+                ).asReversed()
+            }
+            val lastMessageReversedIndex = remember(timeline) {
+                timeline.indexOfFirst { it is ru.sipaha.spkremote.core.ChatItem.Message }
+            }
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 state = lazyState,
@@ -758,30 +792,48 @@ private fun ChatList(
                 //      happen — see [[csid-required-on-every-optimistic-entry]]
                 //      — but defensive).
                 itemsIndexed(
-                    items = combined.asReversed(),
-                    key = { _, entry ->
-                        when {
-                            // Synthetic server-queue bubble: namespace its key
-                            // so it can't collide with the REAL flushed user
-                            // entry that carries the same csid during the
-                            // queue-drain → message-appended handoff (a bare
-                            // `csid:N` collision would crash the LazyColumn).
-                            entry in serverQueueIdentitySet ->
-                                "queued:${entry.clientSendId ?: entry.preview.hashCode()}"
-                            entry.clientSendId != null -> "csid:${entry.clientSendId}"
-                            entry.index >= 0 -> "idx:${entry.index}"
-                            else -> "role:${entry.role}#${entry.preview.hashCode()}"
+                    items = timeline,
+                    key = { _, item ->
+                        when (item) {
+                            is ru.sipaha.spkremote.core.ChatItem.DateSeparator ->
+                                "date:${item.epochDay}"
+                            is ru.sipaha.spkremote.core.ChatItem.Message -> {
+                                val entry = item.entry
+                                when {
+                                    // Synthetic server-queue bubble: namespace its key
+                                    // so it can't collide with the REAL flushed user
+                                    // entry that carries the same csid during the
+                                    // queue-drain → message-appended handoff (a bare
+                                    // `csid:N` collision would crash the LazyColumn).
+                                    entry in serverQueueIdentitySet ->
+                                        "queued:${entry.clientSendId ?: entry.preview.hashCode()}"
+                                    entry.clientSendId != null -> "csid:${entry.clientSendId}"
+                                    entry.index >= 0 -> "idx:${entry.index}"
+                                    else -> "role:${entry.role}#${entry.preview.hashCode()}"
+                                }
+                            }
                         }
                     },
-                ) { _, entry ->
-                    val status = userBubbleStatusFor(
-                        entry = entry,
-                        isOptimistic = entry in optimisticIdentitySet,
-                        isServerQueued = entry in serverQueueIdentitySet,
-                        pendingUploads = pendingUploads,
-                        sessionDisplayState = sessionDisplayState,
-                    )
-                    ChatBubble(entry = entry, userStatus = status)
+                ) { listIndex, item ->
+                    when (item) {
+                        is ru.sipaha.spkremote.core.ChatItem.DateSeparator ->
+                            DateSeparatorRow(label = formatDateSeparator(item.epochDay))
+                        is ru.sipaha.spkremote.core.ChatItem.Message -> {
+                            val entry = item.entry
+                            val status = userBubbleStatusFor(
+                                entry = entry,
+                                isOptimistic = entry in optimisticIdentitySet,
+                                isServerQueued = entry in serverQueueIdentitySet,
+                                pendingUploads = pendingUploads,
+                                sessionDisplayState = sessionDisplayState,
+                            )
+                            ChatBubble(
+                                entry = entry,
+                                userStatus = status,
+                                isLast = listIndex == lastMessageReversedIndex,
+                            )
+                        }
+                    }
                 }
                 // R-6e: history-edge affordance. Sits at the LOGICAL TOP
                 // of the visible list (= last item in the reverse-layout
@@ -917,59 +969,115 @@ private fun formatBytes(b: Long): String = when {
 private fun ChatBubble(
     entry: EntrySummary,
     userStatus: UserBubbleStatus = UserBubbleStatus.None,
+    isLast: Boolean = false,
 ) {
     val role = parseEntryRole(entry.role)
-    when (role) {
-        EntryRole.User -> UserBubble(entry = entry, status = userStatus)
-        EntryRole.Assistant -> {
-            // Skip assistant turns whose body is effectively invisible:
-            //  - tool-call-only turns produce `## Assistant\n\n\n\n` (no
-            //    chunks at all);
-            //  - thought-only turns produce `## Assistant\n\n<thinking>…
-            //    </thinking>\n\n` and our markdown widget silently
-            //    swallows the unknown HTML tag, drawing a padded gray
-            //    rectangle with nothing in it.
-            // Strip the role banner, strip `<thinking>…</thinking>`
-            // blocks, then check what's left.
-            if (hasVisibleAssistantBody(entry.markdown ?: entry.preview)) {
-                AssistantBubble(entry = entry)
-            }
-        }
-        EntryRole.ToolCall -> {
-            val tc = entry.toolCall
-            if (tc != null) {
-                ToolCallBubble(call = tc, positionKey = entry.index)
-            } else {
-                CenteredAnnotatedBubble(
+    // C3: per-message HH:MM. The newest bubble (`isLast`) always shows the
+    // time; any other timestamped bubble reveals it on a SHORT tap. The
+    // footer line sits OUTSIDE the colored Surface so the tap toggle never
+    // competes with the inner SelectionContainer long-press (text selection)
+    // or the user-bubble image-link taps.
+    var revealed by rememberSaveable(entry.index, entry.clientSendId) { mutableStateOf(false) }
+    val timeText = entry.createdMs?.takeIf { it > 0 }?.let { formatHm(it) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Box(
+            modifier = Modifier.fillMaxWidth().then(
+                if (timeText != null && !isLast) {
+                    Modifier.clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { revealed = !revealed }
+                } else {
+                    Modifier
+                },
+            ),
+        ) {
+            when (role) {
+                EntryRole.User -> UserBubble(entry = entry, status = userStatus)
+                EntryRole.Assistant -> {
+                    // Skip assistant turns whose body is effectively invisible:
+                    //  - tool-call-only turns produce `## Assistant\n\n\n\n` (no
+                    //    chunks at all);
+                    //  - thought-only turns produce `## Assistant\n\n<thinking>…
+                    //    </thinking>\n\n` and our markdown widget silently
+                    //    swallows the unknown HTML tag, drawing a padded gray
+                    //    rectangle with nothing in it.
+                    // Strip the role banner, strip `<thinking>…</thinking>`
+                    // blocks, then check what's left.
+                    if (hasVisibleAssistantBody(entry.markdown ?: entry.preview)) {
+                        AssistantBubble(entry = entry)
+                    }
+                }
+                EntryRole.ToolCall -> {
+                    val tc = entry.toolCall
+                    if (tc != null) {
+                        ToolCallBubble(call = tc, positionKey = entry.index)
+                    } else {
+                        CenteredAnnotatedBubble(
+                            text = entry.preview,
+                            icon = Icons.Filled.Build,
+                            bg = MaterialTheme.colorScheme.tertiaryContainer,
+                            fg = MaterialTheme.colorScheme.onTertiaryContainer,
+                            label = "tool",
+                        )
+                    }
+                }
+                EntryRole.Plan -> {
+                    val plan = entry.plan
+                    if (plan != null) {
+                        PlanBubble(plan = plan)
+                    } else {
+                        CenteredAnnotatedBubble(
+                            text = entry.preview,
+                            icon = Icons.AutoMirrored.Filled.List,
+                            bg = MaterialTheme.colorScheme.secondaryContainer,
+                            fg = MaterialTheme.colorScheme.onSecondaryContainer,
+                            label = "plan",
+                        )
+                    }
+                }
+                EntryRole.Unknown -> CenteredAnnotatedBubble(
                     text = entry.preview,
                     icon = Icons.Filled.Build,
-                    bg = MaterialTheme.colorScheme.tertiaryContainer,
-                    fg = MaterialTheme.colorScheme.onTertiaryContainer,
-                    label = "tool",
+                    bg = MaterialTheme.colorScheme.surfaceVariant,
+                    fg = MaterialTheme.colorScheme.onSurfaceVariant,
+                    label = entry.role,
                 )
             }
         }
-        EntryRole.Plan -> {
-            val plan = entry.plan
-            if (plan != null) {
-                PlanBubble(plan = plan)
-            } else {
-                CenteredAnnotatedBubble(
-                    text = entry.preview,
-                    icon = Icons.AutoMirrored.Filled.List,
-                    bg = MaterialTheme.colorScheme.secondaryContainer,
-                    fg = MaterialTheme.colorScheme.onSecondaryContainer,
-                    label = "plan",
-                )
-            }
+        if (timeText != null && (isLast || revealed)) {
+            Text(
+                text = timeText,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, top = 1.dp),
+                textAlign = when (role) {
+                    EntryRole.User -> TextAlign.End
+                    else -> TextAlign.Start
+                },
+            )
         }
-        EntryRole.Unknown -> CenteredAnnotatedBubble(
-            text = entry.preview,
-            icon = Icons.Filled.Build,
-            bg = MaterialTheme.colorScheme.surfaceVariant,
-            fg = MaterialTheme.colorScheme.onSurfaceVariant,
-            label = entry.role,
-        )
+    }
+}
+
+/** C3: localized centered date-separator chip between day boundaries. */
+@Composable
+private fun DateSeparatorRow(label: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            shape = RoundedCornerShape(8.dp),
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
+            )
+        }
     }
 }
 
@@ -3175,6 +3283,28 @@ private fun stateIconAndTint(state: DisplayState): Pair<androidx.compose.ui.grap
  * integer specifier, but the locale choice is still good hygiene for a
  * compact technical readout).
  */
+/** C3: wall-clock `HH:MM` for a message's `created_ms`, device-local zone. */
+internal fun formatHm(epochMs: Long): String {
+    val time = java.time.Instant.ofEpochMilli(epochMs)
+        .atZone(java.time.ZoneId.systemDefault())
+        .toLocalTime()
+    return String.format(java.util.Locale.ROOT, "%02d:%02d", time.hour, time.minute)
+}
+
+/** C3: "Today" / "Yesterday" / localized medium date for a separator row. */
+internal fun formatDateSeparator(epochDay: Long): String {
+    val date = java.time.LocalDate.ofEpochDay(epochDay)
+    val today = java.time.LocalDate.now()
+    return when (date) {
+        today -> "Today"
+        today.minusDays(1) -> "Yesterday"
+        else -> java.time.format.DateTimeFormatter
+            .ofLocalizedDate(java.time.format.FormatStyle.MEDIUM)
+            .withLocale(java.util.Locale.getDefault())
+            .format(date)
+    }
+}
+
 internal fun formatElapsed(secs: Long): String {
     val s = if (secs < 0L) 0L else secs
     return when {
