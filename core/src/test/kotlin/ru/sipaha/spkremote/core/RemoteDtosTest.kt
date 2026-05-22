@@ -1,11 +1,35 @@
 package ru.sipaha.spkremote.core
 
+import kotlinx.serialization.json.Json
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class RemoteDtosTest {
+
+    @Test
+    fun parsesStructuredSessionState() {
+        val json = Json { ignoreUnknownKeys = true }
+        fun decode(s: String) = json.decodeFromString(SessionStateDto.serializer(), s)
+        assertEquals(SessionStateDto.Idle, decode("""{"kind":"idle"}"""))
+        assertEquals(SessionStateDto.Stopping, decode("""{"kind":"stopping"}"""))
+        assertEquals(SessionStateDto.AwaitingInput, decode("""{"kind":"awaiting_input"}"""))
+        assertEquals(SessionStateDto.Running(1779L), decode("""{"kind":"running","started_at_ms":1779}"""))
+        assertEquals(SessionStateDto.Errored("boom"), decode("""{"kind":"errored","message":"boom"}"""))
+        assertEquals(DisplayState.Stopping, decode("""{"kind":"stopping"}""").displayState())
+    }
+
+    @Test
+    fun parsesStructuredRoleAndStatus() {
+        val json = Json { ignoreUnknownKeys = true }
+        assertEquals(EntryRoleDto.ToolCall, json.decodeFromString(EntryRoleDto.serializer(), "\"tool_call\""))
+        assertEquals(
+            ToolCallStatusDto.WaitingForConfirmation,
+            json.decodeFromString(ToolCallStatusDto.serializer(), "\"waiting_for_confirmation\""),
+        )
+        assertEquals(ToolCallStatusDto.Running, json.decodeFromString(ToolCallStatusDto.serializer(), "\"running\""))
+    }
 
     @Test
     fun `SolutionSummary round-trips with all optional fields present`() {
@@ -90,7 +114,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Refactor auth",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 1715800000000,
               "last_activity_at": 1715800100000
             }
@@ -99,32 +123,31 @@ class RemoteDtosTest {
         assertEquals("ses-1", parsed.id)
         assertEquals("sol-1", parsed.solutionId)
         assertEquals("claude", parsed.agentId)
-        assertEquals("Idle", parsed.state)
+        assertEquals(SessionStateDto.Idle, parsed.state)
         assertEquals(1715800000000L, parsed.createdAt)
         assertEquals(1715800100000L, parsed.lastActivityAt)
-        assertEquals(DisplayState.Idle, parsedDisplayStateOf(parsed))
+        assertEquals(DisplayState.Idle, parsed.state.displayState())
     }
 
     @Test
-    fun `SessionSummary preserves a Running-with-Instant debug payload verbatim`() {
-        // Regression: the `Running` variant has been seen to embed an
-        // `Instant { tv_sec, tv_nsec }`. The classifier MUST still recognise
-        // it via the prefix; we also assert the raw string survives a JSON
-        // round-trip so debugging future regressions stays cheap.
-        val rawState = "Running { started_at: Instant { tv_sec: 0, tv_nsec: 0 }, notified: false }"
+    fun `SessionSummary round-trips a structured Running state with start anchor`() {
+        // Running carries the wall-clock start anchor as a typed Long so the
+        // chat header can tick "Running for Xs" without re-parsing a Debug
+        // string. Assert it survives a decode + re-encode + decode cycle.
         val seed = SessionSummary(
             id = "ses-2",
             solutionId = "sol-1",
             agentId = "claude",
             title = "Long-running",
-            state = rawState,
+            state = SessionStateDto.Running(1715900201500L),
             createdAt = 1L,
             lastActivityAt = 2L,
         )
         val encoded = JsonRpc.json.encodeToString(SessionSummary.serializer(), seed)
         val parsed = JsonRpc.json.decodeFromString(SessionSummary.serializer(), encoded)
-        assertEquals(rawState, parsed.state)
-        assertEquals(DisplayState.Running, parseDisplayState(parsed.state))
+        assertEquals(SessionStateDto.Running(1715900201500L), parsed.state)
+        assertEquals(1715900201500L, parsed.state.startedAtMs())
+        assertEquals(DisplayState.Running, parsed.state.displayState())
     }
 
     @Test
@@ -137,7 +160,7 @@ class RemoteDtosTest {
                   "solution_id": "sol",
                   "agent_id": "claude",
                   "title": "T",
-                  "state": "AwaitingInput",
+                  "state": {"kind":"awaiting_input"},
                   "created_at": 10,
                   "last_activity_at": 20
                 }
@@ -146,69 +169,36 @@ class RemoteDtosTest {
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(ListSessionsResult.serializer(), text)
         assertEquals(1, parsed.sessions.size)
-        assertEquals("AwaitingInput", parsed.sessions[0].state)
-    }
-
-    @Test
-    fun `parseDisplayState classifies Idle`() {
-        assertEquals(DisplayState.Idle, parseDisplayState("Idle"))
-    }
-
-    @Test
-    fun `parseDisplayState classifies Running with payload`() {
-        assertEquals(
-            DisplayState.Running,
-            parseDisplayState("Running { started_at: Instant { tv_sec: 0, tv_nsec: 0 }, notified: false }"),
-        )
-        assertEquals(DisplayState.Running, parseDisplayState("Running"))
-    }
-
-    @Test
-    fun `parseDisplayState classifies AwaitingInput`() {
-        assertEquals(DisplayState.AwaitingInput, parseDisplayState("AwaitingInput"))
-    }
-
-    @Test
-    fun `parseDisplayState classifies Errored with payload`() {
-        assertEquals(DisplayState.Errored, parseDisplayState("Errored(\"boom\")"))
-        assertEquals(DisplayState.Errored, parseDisplayState("Errored"))
-    }
-
-    @Test
-    fun `parseDisplayState falls back to Unknown for surprises`() {
-        assertEquals(DisplayState.Unknown, parseDisplayState("FuturePhase"))
-        assertEquals(DisplayState.Unknown, parseDisplayState(""))
+        assertEquals(SessionStateDto.AwaitingInput, parsed.sessions[0].state)
     }
 
     @Test
     fun `EntrySummary round-trips with each known role`() {
-        // Sanity-check every role we map in parseEntryRole survives both
-        // decode and encode unchanged, including the truncated preview.
+        // Sanity-check every structured role survives both decode and encode
+        // unchanged, including the truncated preview.
         val text = """
             {
               "id": "s",
               "solution_id": "sol",
               "agent_id": "claude",
               "title": "T",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 0,
               "last_activity_at": 0,
               "entries": [
                 {"role": "user",        "preview": "hi"},
                 {"role": "assistant",   "preview": "hello world"},
                 {"role": "tool_call",   "preview": "Read(file.kt)"},
-                {"role": "plan",        "preview": "1. step\n2. step"},
-                {"role": "future_kind", "preview": "..."}
+                {"role": "plan",        "preview": "1. step\n2. step"}
               ]
             }
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(GetSessionResult.serializer(), text)
-        assertEquals(5, parsed.entries.size)
-        assertEquals(EntryRole.User, parseEntryRole(parsed.entries[0].role))
-        assertEquals(EntryRole.Assistant, parseEntryRole(parsed.entries[1].role))
-        assertEquals(EntryRole.ToolCall, parseEntryRole(parsed.entries[2].role))
-        assertEquals(EntryRole.Plan, parseEntryRole(parsed.entries[3].role))
-        assertEquals(EntryRole.Unknown, parseEntryRole(parsed.entries[4].role))
+        assertEquals(4, parsed.entries.size)
+        assertEquals(EntryRoleDto.User, parsed.entries[0].role)
+        assertEquals(EntryRoleDto.Assistant, parsed.entries[1].role)
+        assertEquals(EntryRoleDto.ToolCall, parsed.entries[2].role)
+        assertEquals(EntryRoleDto.Plan, parsed.entries[3].role)
 
         // Re-encode preserves verbatim — preview field is a black box on the
         // wire and we don't want to accidentally re-flow newlines or escape
@@ -226,7 +216,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Just opened",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 1,
               "last_activity_at": 1,
               "entries": []
@@ -236,7 +226,7 @@ class RemoteDtosTest {
         assertEquals("ses-empty", parsed.id)
         assertEquals("sol-1", parsed.solutionId)
         assertTrue(parsed.entries.isEmpty())
-        assertEquals(DisplayState.Idle, parseDisplayState(parsed.state))
+        assertEquals(DisplayState.Idle, parsed.state.displayState())
     }
 
     @Test
@@ -247,7 +237,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Mid-turn",
-              "state": "Running { started_at: Instant { tv_sec: 0, tv_nsec: 0 }, notified: false }",
+              "state": {"kind":"running","started_at_ms":1715900201500},
               "created_at": 10,
               "last_activity_at": 20,
               "entries": [
@@ -259,18 +249,16 @@ class RemoteDtosTest {
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(GetSessionResult.serializer(), text)
         assertEquals(3, parsed.entries.size)
-        assertEquals(DisplayState.Running, parseDisplayState(parsed.state))
+        assertEquals(DisplayState.Running, parsed.state.displayState())
         assertEquals("Write a haiku.", parsed.entries[0].preview)
     }
 
     @Test
-    fun `parseEntryRole maps all known roles and falls back to Unknown`() {
-        assertEquals(EntryRole.User, parseEntryRole("user"))
-        assertEquals(EntryRole.Assistant, parseEntryRole("assistant"))
-        assertEquals(EntryRole.ToolCall, parseEntryRole("tool_call"))
-        assertEquals(EntryRole.Plan, parseEntryRole("plan"))
-        assertEquals(EntryRole.Unknown, parseEntryRole("system"))
-        assertEquals(EntryRole.Unknown, parseEntryRole(""))
+    fun `EntryRoleDto bridges to the legacy EntryRole enum`() {
+        assertEquals(EntryRole.User, EntryRoleDto.User.toEntryRole())
+        assertEquals(EntryRole.Assistant, EntryRoleDto.Assistant.toEntryRole())
+        assertEquals(EntryRole.ToolCall, EntryRoleDto.ToolCall.toEntryRole())
+        assertEquals(EntryRole.Plan, EntryRoleDto.Plan.toEntryRole())
     }
 
     @Test
@@ -288,7 +276,7 @@ class RemoteDtosTest {
             }
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
-        assertEquals("assistant", parsed.role)
+        assertEquals(EntryRoleDto.Assistant, parsed.role)
         assertEquals(
             "Here is an image: ![image #0](spk-image://0)\n\nAnd more text after.",
             parsed.markdown,
@@ -310,7 +298,7 @@ class RemoteDtosTest {
         // Must decode cleanly with every optional field defaulting to null.
         val text = """{"role":"user","preview":"hello"}"""
         val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
-        assertEquals("user", parsed.role)
+        assertEquals(EntryRoleDto.User, parsed.role)
         assertEquals("hello", parsed.preview)
         assertNull(parsed.markdown)
         assertNull(parsed.images)
@@ -335,29 +323,29 @@ class RemoteDtosTest {
 
     @Test
     fun `ToolCallSummary round-trips every documented status string`() {
-        // The seven server-side status phrases are part of the wire contract;
-        // any client that wants to colour-code them MUST tolerate all of
-        // these verbatim (with spaces, not underscores).
-        val statuses = listOf(
-            "pending",
-            "waiting for confirmation",
-            "running",
-            "done",
-            "failed",
-            "rejected",
-            "canceled",
+        // The seven server-side statuses are part of the wire contract — now
+        // structured snake_case enum strings. All must decode to the matching
+        // [ToolCallStatusDto] and survive a re-encode + decode cycle.
+        val statuses = mapOf(
+            "pending" to ToolCallStatusDto.Pending,
+            "waiting_for_confirmation" to ToolCallStatusDto.WaitingForConfirmation,
+            "running" to ToolCallStatusDto.Running,
+            "done" to ToolCallStatusDto.Done,
+            "failed" to ToolCallStatusDto.Failed,
+            "rejected" to ToolCallStatusDto.Rejected,
+            "canceled" to ToolCallStatusDto.Canceled,
         )
-        for (status in statuses) {
+        for ((wire, expected) in statuses) {
             val text = """
                 {
                   "name": "Read",
-                  "status": "$status",
+                  "status": "$wire",
                   "args_preview": "{ \"path\": \"foo.kt\" }",
                   "result_preview": "ok"
                 }
             """.trimIndent()
             val parsed = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), text)
-            assertEquals(status, parsed.status)
+            assertEquals(expected, parsed.status)
             assertEquals("Read", parsed.name)
             assertEquals("{ \"path\": \"foo.kt\" }", parsed.argsPreview)
             assertEquals("ok", parsed.resultPreview)
@@ -385,7 +373,7 @@ class RemoteDtosTest {
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), text)
         assertEquals(1_715_900_123_456L, parsed.toolStatusStartedAtMs)
-        assertEquals("running", parsed.status)
+        assertEquals(ToolCallStatusDto.Running, parsed.status)
 
         val reencoded = JsonRpc.json.encodeToString(ToolCallSummary.serializer(), parsed)
         val again = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), reencoded)
@@ -436,7 +424,7 @@ class RemoteDtosTest {
             {
               "tool_call_id": "call-abc",
               "name": "Bash",
-              "status": "waiting for confirmation",
+              "status": "waiting_for_confirmation",
               "args_preview": "{\"command\":\"rm -rf build\"}",
               "options": [
                 {"option_id": "opt-allow", "label": "Allow", "kind": "allow_once", "is_allow": true},
@@ -447,7 +435,7 @@ class RemoteDtosTest {
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(ToolCallSummary.serializer(), text)
         assertEquals("call-abc", parsed.toolCallId)
-        assertEquals("waiting for confirmation", parsed.status)
+        assertEquals(ToolCallStatusDto.WaitingForConfirmation, parsed.status)
         assertEquals(3, parsed.options.size)
         assertEquals("opt-allow", parsed.options[0].optionId)
         assertEquals("Allow", parsed.options[0].label)
@@ -527,9 +515,9 @@ class RemoteDtosTest {
             }
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(GetSessionEntryResult.serializer(), text)
-        assertEquals("tool_call", parsed.entry.role)
+        assertEquals(EntryRoleDto.ToolCall, parsed.entry.role)
         assertEquals("Read", parsed.entry.toolCall?.name)
-        assertEquals("done", parsed.entry.toolCall?.status)
+        assertEquals(ToolCallStatusDto.Done, parsed.entry.toolCall?.status)
 
         val reencoded = JsonRpc.json.encodeToString(GetSessionEntryResult.serializer(), parsed)
         val again = JsonRpc.json.decodeFromString(GetSessionEntryResult.serializer(), reencoded)
@@ -679,7 +667,7 @@ class RemoteDtosTest {
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
         assertEquals(42, parsed.index)
-        assertEquals("assistant", parsed.role)
+        assertEquals(EntryRoleDto.Assistant, parsed.role)
         assertEquals("hi", parsed.markdown)
 
         val reencoded = JsonRpc.json.encodeToString(EntrySummary.serializer(), parsed)
@@ -696,7 +684,7 @@ class RemoteDtosTest {
         val text = """{"role":"user","preview":"hello"}"""
         val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
         assertEquals(-1, parsed.index)
-        assertEquals("user", parsed.role)
+        assertEquals(EntryRoleDto.User, parsed.role)
         assertEquals("hello", parsed.preview)
     }
 
@@ -708,7 +696,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Paginated",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 1,
               "last_activity_at": 2,
               "entries": [
@@ -742,7 +730,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Legacy",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 1,
               "last_activity_at": 1,
               "entries": [{"role": "user", "preview": "hi"}]
@@ -764,7 +752,7 @@ class RemoteDtosTest {
         val withCount = """
             {
               "sessions": [
-                {"id":"s1","solution_id":"sol","agent_id":"claude","title":"T","state":"Idle","created_at":0,"last_activity_at":0}
+                {"id":"s1","solution_id":"sol","agent_id":"claude","title":"T","state":{"kind":"idle"},"created_at":0,"last_activity_at":0}
               ],
               "total_count": 5
             }
@@ -773,7 +761,7 @@ class RemoteDtosTest {
         assertEquals(5, parsedWith.totalCount)
 
         val without = """
-            {"sessions": [{"id":"s2","solution_id":"sol","agent_id":"c","title":"T","state":"Idle","created_at":0,"last_activity_at":0}]}
+            {"sessions": [{"id":"s2","solution_id":"sol","agent_id":"c","title":"T","state":{"kind":"idle"},"created_at":0,"last_activity_at":0}]}
         """.trimIndent()
         val parsedWithout = JsonRpc.json.decodeFromString(ListSessionsResult.serializer(), without)
         assertEquals(-1, parsedWithout.totalCount)
@@ -790,7 +778,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Sub-agent dispatch",
-              "state": "Running",
+              "state": {"kind":"running","started_at_ms":1715900201500},
               "created_at": 1715900000000,
               "last_activity_at": 1715900200000,
               "total_tokens": 138342,
@@ -823,7 +811,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Big context",
-              "state": "Running",
+              "state": {"kind":"running","started_at_ms":1715900201500},
               "created_at": 1715900000000,
               "last_activity_at": 1715900200000,
               "total_tokens": 245000,
@@ -852,7 +840,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Pre-meter",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 0,
               "last_activity_at": 0,
               "total_tokens": 138000
@@ -864,47 +852,39 @@ class RemoteDtosTest {
     }
 
     @Test
-    fun `SessionSummary round-trips with state_started_at_ms populated`() {
-        // Mobile R-running-elapsed: server-side serialises the wall-clock
-        // anchor when SessionState::Running is active so the chat header
-        // can tick "Running for Xs" without polling. DTO must round-trip.
-        val text = """
+    fun `SessionSummary carries the running start anchor inside the structured state`() {
+        // R-running-elapsed: the wall-clock anchor that used to be a flat
+        // `state_started_at_ms` field now lives inside the structured
+        // `state` object as `running.started_at_ms`. The chat header reads
+        // it via [SessionStateDto.startedAtMs]; non-Running states surface
+        // null so the "Running for Xs" badge stays hidden.
+        val running = """
             {
               "id": "ses-running",
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "In flight",
-              "state": "Running",
+              "state": {"kind":"running","started_at_ms":1715900201500},
               "created_at": 1715900000000,
-              "last_activity_at": 1715900200000,
-              "state_started_at_ms": 1715900201500
+              "last_activity_at": 1715900200000
             }
         """.trimIndent()
-        val parsed = JsonRpc.json.decodeFromString(SessionSummary.serializer(), text)
-        assertEquals(1715900201500L, parsed.stateStartedAtMs)
+        val parsed = JsonRpc.json.decodeFromString(SessionSummary.serializer(), running)
+        assertEquals(1715900201500L, parsed.state.startedAtMs())
 
-        val reencoded = JsonRpc.json.encodeToString(SessionSummary.serializer(), parsed)
-        val again = JsonRpc.json.decodeFromString(SessionSummary.serializer(), reencoded)
-        assertEquals(parsed, again)
-    }
-
-    @Test
-    fun `SessionSummary defaults state_started_at_ms to null when omitted by Idle session`() {
-        // Server skips the field when state != Running, and on pre-anchor
-        // builds it's never sent. DTO must decode to null in both cases.
-        val text = """
+        val idle = """
             {
               "id": "ses-idle",
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Quiet",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 0,
               "last_activity_at": 0
             }
         """.trimIndent()
-        val parsed = JsonRpc.json.decodeFromString(SessionSummary.serializer(), text)
-        assertNull(parsed.stateStartedAtMs)
+        val parsedIdle = JsonRpc.json.decodeFromString(SessionSummary.serializer(), idle)
+        assertNull(parsedIdle.state.startedAtMs())
     }
 
     @Test
@@ -918,7 +898,7 @@ class RemoteDtosTest {
               "solution_id": "sol-1",
               "agent_id": "claude",
               "title": "Pre-F",
-              "state": "Idle",
+              "state": {"kind":"idle"},
               "created_at": 0,
               "last_activity_at": 0
             }
@@ -947,7 +927,7 @@ class RemoteDtosTest {
                   "solution_id": "sol-1",
                   "agent_id": "claude",
                   "title": "First child",
-                  "state": "Idle",
+                  "state": {"kind":"idle"},
                   "created_at": 100,
                   "last_activity_at": 200,
                   "total_tokens": 5000,
@@ -958,7 +938,7 @@ class RemoteDtosTest {
                   "solution_id": "sol-1",
                   "agent_id": "claude",
                   "title": "Second child",
-                  "state": "Running",
+                  "state": {"kind":"running","started_at_ms":300},
                   "created_at": 300,
                   "last_activity_at": 400,
                   "parent_session_id": "ses-parent"
@@ -1141,7 +1121,7 @@ class RemoteDtosTest {
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(EntrySummary.serializer(), text)
         assertEquals(1715900201500L, parsed.clientSendId)
-        assertEquals("user", parsed.role)
+        assertEquals(EntryRoleDto.User, parsed.role)
 
         val reencoded = JsonRpc.json.encodeToString(EntrySummary.serializer(), parsed)
         val again = JsonRpc.json.decodeFromString(EntrySummary.serializer(), reencoded)
@@ -1332,5 +1312,4 @@ class RemoteDtosTest {
         assertEquals("clone failed: timeout", failed.error)
     }
 
-    private fun parsedDisplayStateOf(s: SessionSummary): DisplayState = parseDisplayState(s.state)
 }

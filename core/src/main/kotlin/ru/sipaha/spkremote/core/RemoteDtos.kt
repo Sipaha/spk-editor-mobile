@@ -1,16 +1,18 @@
 package ru.sipaha.spkremote.core
 
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonClassDiscriminator
 
 /**
  * Server-shaped DTOs for the `remote.solutions.*` and
  * `remote.solution_agent.*` JSON-RPC namespaces.
  *
  * These mirror the spk-editor MCP tool catalog's response shapes verbatim,
- * including snake_case field names and the "state is a Rust Debug string"
- * quirk on [SessionSummary]. See [parseDisplayState] for the classifier the
- * UI uses to map that raw debug payload onto a small enum.
+ * including snake_case field names. Session `state` is a structured tagged
+ * object ([SessionStateDto]); map it to the UI classifier via
+ * [SessionStateDto.displayState].
  */
 
 @Serializable
@@ -127,12 +129,12 @@ data class SessionSummary(
     @SerialName("agent_id") val agentId: String,
     val title: String,
     /**
-     * Raw `format!("{:?}", state)` dump from the server side. Stable prefixes:
-     * `Idle`, `Running`, `AwaitingInput`, `Errored`. Use [parseDisplayState]
-     * to classify — do NOT try to parse the parenthesised payload, it is
-     * a Rust Debug rendering and shape varies (e.g. embedded `Instant`).
+     * Structured session state — a tagged object discriminated on `kind`.
+     * Map to the UI's [DisplayState] via [SessionStateDto.displayState]; the
+     * `Running` start anchor and `Errored` message are reachable via
+     * [SessionStateDto.startedAtMs] / [SessionStateDto.erroredMessage].
      */
-    val state: String,
+    val state: SessionStateDto,
     @SerialName("created_at") val createdAt: Long,
     @SerialName("last_activity_at") val lastActivityAt: Long,
     /**
@@ -150,16 +152,6 @@ data class SessionSummary(
      * top bar stays clean.
      */
     @SerialName("max_tokens") val maxTokens: Long? = null,
-    /**
-     * Wall-clock ms when [state] last flipped to `Running` (server-side
-     * derived from the monotonic `Instant` payload inside the Rust
-     * `SessionState::Running` variant). `null` when state isn't
-     * currently Running, or when the server omits the field (pre-
-     * `state_started_at_ms` build). Lets the chat header tick a
-     * "Running for Xs" badge from a local clock without polling the
-     * server for elapsed updates.
-     */
-    @SerialName("state_started_at_ms") val stateStartedAtMs: Long? = null,
     /**
      * Parent session id when this session was spawned by another agent
      * (Claude Code Task dispatch, etc.). Null at the top of the tree.
@@ -232,8 +224,8 @@ data class ListSessionsResult(
  */
 @Serializable
 data class EntrySummary(
-    /** Role tag: `user`, `assistant`, `tool_call`, or `plan`. Use [parseEntryRole]. */
-    val role: String,
+    /** Role tag — structured enum (`user`, `assistant`, `tool_call`, `plan`). */
+    val role: EntryRoleDto,
     /** Truncated markdown rendering of the entry (≤200 chars, ellipsised). */
     val preview: String,
     /**
@@ -311,17 +303,15 @@ data class EntryImage(
 /**
  * Server-side `EntrySummary.tool_call` payload for `role=tool_call` rows.
  *
- * [status] is a human-readable phrase: one of `"pending"`,
- * `"waiting for confirmation"`, `"running"`, `"done"`, `"failed"`,
- * `"rejected"`, `"canceled"`. Note the spaces (not underscores) and that
- * we DO NOT classify these into an enum — UI surfaces just render the
- * raw string with role-coloured pills.
+ * [status] is a structured enum — one of `pending`,
+ * `waiting_for_confirmation`, `running`, `done`, `failed`, `rejected`,
+ * `canceled` (snake_case on the wire).
  */
 @Serializable
 data class ToolCallSummary(
     @SerialName("tool_call_id") val toolCallId: String = "",
     val name: String,
-    val status: String,
+    val status: ToolCallStatusDto,
     @SerialName("args_preview") val argsPreview: String,
     @SerialName("result_preview") val resultPreview: String = "",
     /**
@@ -550,8 +540,8 @@ data class GetSessionResult(
     @SerialName("solution_id") val solutionId: String,
     @SerialName("agent_id") val agentId: String,
     val title: String,
-    /** Raw Rust `Debug` string — see [SessionSummary.state]. Classify via [parseDisplayState]. */
-    val state: String,
+    /** Structured session state — see [SessionSummary.state]. */
+    val state: SessionStateDto,
     @SerialName("created_at") val createdAt: Long,
     @SerialName("last_activity_at") val lastActivityAt: Long,
     /**
@@ -587,38 +577,98 @@ data class GetSessionResult(
     @SerialName("pending_bundles") val pendingBundles: List<QueuedBundleSummary> = emptyList(),
 )
 
-enum class DisplayState { Idle, Running, AwaitingInput, Errored, Unknown }
+enum class DisplayState { Idle, Running, Stopping, AwaitingInput, Errored, Unknown }
 
 enum class EntryRole { User, Assistant, ToolCall, Plan, Unknown }
 
 /**
- * Classify a server-side entry `role` string. Unknown roles fall through
- * to [EntryRole.Unknown] rather than throwing — older clients should
- * survive a future role expansion without crashing.
+ * Structured session state as emitted by the editor — a tagged object
+ * discriminated on the `kind` field (NOT kotlinx's default `type`).
+ *
+ *   `{"kind":"idle"}`
+ *   `{"kind":"running","started_at_ms":N}`
+ *   `{"kind":"stopping"}`
+ *   `{"kind":"awaiting_input"}`
+ *   `{"kind":"errored","message":"…"}`
  */
-fun parseEntryRole(raw: String): EntryRole = when (raw) {
-    "user" -> EntryRole.User
-    "assistant" -> EntryRole.Assistant
-    "tool_call" -> EntryRole.ToolCall
-    "plan" -> EntryRole.Plan
-    else -> EntryRole.Unknown
+@Serializable
+@OptIn(ExperimentalSerializationApi::class)
+@JsonClassDiscriminator("kind")
+sealed interface SessionStateDto {
+    @Serializable @SerialName("idle") data object Idle : SessionStateDto
+
+    @Serializable @SerialName("running") data class Running(
+        @SerialName("started_at_ms") val startedAtMs: Long,
+    ) : SessionStateDto
+
+    @Serializable @SerialName("stopping") data object Stopping : SessionStateDto
+
+    @Serializable @SerialName("awaiting_input") data object AwaitingInput : SessionStateDto
+
+    @Serializable @SerialName("errored") data class Errored(val message: String) : SessionStateDto
+}
+
+/** Map structured state onto the small UI classifier enum. */
+fun SessionStateDto.displayState(): DisplayState = when (this) {
+    SessionStateDto.Idle -> DisplayState.Idle
+    is SessionStateDto.Running -> DisplayState.Running
+    SessionStateDto.Stopping -> DisplayState.Stopping
+    SessionStateDto.AwaitingInput -> DisplayState.AwaitingInput
+    is SessionStateDto.Errored -> DisplayState.Errored
+}
+
+/** Wall-clock ms when state flipped to `Running`, else null. */
+fun SessionStateDto.startedAtMs(): Long? = (this as? SessionStateDto.Running)?.startedAtMs
+
+/** The error message when state is `Errored`, else null. */
+fun SessionStateDto.erroredMessage(): String? = (this as? SessionStateDto.Errored)?.message
+
+/** Structured entry role — snake_case enum on the wire. */
+@Serializable
+enum class EntryRoleDto {
+    @SerialName("user") User,
+    @SerialName("assistant") Assistant,
+    @SerialName("tool_call") ToolCall,
+    @SerialName("plan") Plan,
 }
 
 /**
- * Classify a raw debug-formatted state string (see [SessionSummary.state]).
- *
- * The server emits Rust `Debug` format. Variants without payload come out as
- * the bare variant name (`"Idle"`); variants with payload come out as
- * `"VariantName { ... }"` or `"VariantName(...)"`. Prefix-match is the only
- * stable thing across server versions because the payload shape can change
- * (the `Running` variant has already been seen to embed an `Instant`).
+ * Bridge to the legacy [EntryRole] enum the app UI still consumes. The app
+ * migration to [EntryRoleDto] is a separate task; this mapper keeps that
+ * churn out of the core DTO change.
  */
-fun parseDisplayState(raw: String): DisplayState = when {
-    raw.startsWith("Idle") -> DisplayState.Idle
-    raw.startsWith("Running") -> DisplayState.Running
-    raw.startsWith("AwaitingInput") -> DisplayState.AwaitingInput
-    raw.startsWith("Errored") -> DisplayState.Errored
-    else -> DisplayState.Unknown
+fun EntryRoleDto.toEntryRole(): EntryRole = when (this) {
+    EntryRoleDto.User -> EntryRole.User
+    EntryRoleDto.Assistant -> EntryRole.Assistant
+    EntryRoleDto.ToolCall -> EntryRole.ToolCall
+    EntryRoleDto.Plan -> EntryRole.Plan
+}
+
+/**
+ * Tolerant wire-string → [EntryRoleDto] mapper for notification payloads
+ * (e.g. [MessageAppendedPayload.role]) that still carry the role as a raw
+ * snake_case string. Unknown roles fall back to [EntryRoleDto.Assistant]
+ * (the neutral, non-optimistic-dedupe role) so a future role expansion
+ * doesn't crash the placeholder path.
+ */
+fun entryRoleDtoFromWire(raw: String): EntryRoleDto = when (raw) {
+    "user" -> EntryRoleDto.User
+    "assistant" -> EntryRoleDto.Assistant
+    "tool_call" -> EntryRoleDto.ToolCall
+    "plan" -> EntryRoleDto.Plan
+    else -> EntryRoleDto.Assistant
+}
+
+/** Structured tool-call status — snake_case enum on the wire. */
+@Serializable
+enum class ToolCallStatusDto {
+    @SerialName("pending") Pending,
+    @SerialName("waiting_for_confirmation") WaitingForConfirmation,
+    @SerialName("running") Running,
+    @SerialName("done") Done,
+    @SerialName("failed") Failed,
+    @SerialName("rejected") Rejected,
+    @SerialName("canceled") Canceled,
 }
 
 /**

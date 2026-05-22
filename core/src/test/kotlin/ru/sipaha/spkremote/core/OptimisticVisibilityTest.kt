@@ -5,7 +5,7 @@ import kotlin.test.assertEquals
 
 class OptimisticVisibilityTest {
     private fun opt(csid: Long?) =
-        EntrySummary(role = "user", preview = "p", clientSendId = csid)
+        EntrySummary(role = EntryRoleDto.User, preview = "p", clientSendId = csid)
 
     @Test
     fun `optimistic with echoed csid is filtered out`() {

@@ -58,7 +58,7 @@ fun applyAppendedPlaceholder(
     // so we can pre-stamp the placeholder and keep the status as
     // `Delivered` from the moment the slot exists.
     val placeholder = EntrySummary(
-        role = payload.role,
+        role = entryRoleDtoFromWire(payload.role),
         preview = payload.preview,
         clientSendId = payload.clientSendId,
         clientSendIds = payload.clientSendIds,
@@ -97,7 +97,7 @@ fun applyAppendedPlaceholder(
  *                                out).
  * @param serverEntries           The newly-received transcript slice
  *                                (any role — the function filters for
- *                                `role == "user"` internally).
+ *                                `role == EntryRoleDto.User` internally).
  *
  * @return `(remainingOptimistic, remainingIds, remainingClientSendIds)`
  *   — all three lists are freshly-allocated, ready to overwrite the
@@ -112,7 +112,7 @@ fun reconcileOptimistic(
     if (optimistic.isEmpty()) {
         return Triple(emptyList(), emptyList(), emptyList())
     }
-    val serverUser = serverEntries.filter { it.role == "user" }
+    val serverUser = serverEntries.filter { it.role == EntryRoleDto.User }
     // Modern servers expose every csid the queue-merge rolled into a
     // single user entry via [EntrySummary.clientSendIds]; fall back to
     // the singular [EntrySummary.clientSendId] for old servers that

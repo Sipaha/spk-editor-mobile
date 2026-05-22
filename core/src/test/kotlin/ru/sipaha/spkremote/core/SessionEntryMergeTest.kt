@@ -26,7 +26,7 @@ class SessionEntryMergeTest {
         clientSendId: Long? = null,
     ): EntrySummary =
         EntrySummary(
-            role = role,
+            role = entryRoleDtoFromWire(role),
             preview = preview,
             index = index,
             clientSendId = clientSendId,
@@ -58,7 +58,7 @@ class SessionEntryMergeTest {
         assertTrue(out is AppendedPlaceholderOutcome.Replaced)
         val entries = (out as AppendedPlaceholderOutcome.Replaced).entries
         assertEquals(1, entries.size)
-        assertEquals("user", entries[0].role)
+        assertEquals(EntryRoleDto.User, entries[0].role)
         assertEquals("hi", entries[0].preview)
     }
 

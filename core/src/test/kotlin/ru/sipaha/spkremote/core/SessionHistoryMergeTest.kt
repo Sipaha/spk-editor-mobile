@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test
  */
 class SessionHistoryMergeTest {
 
-    private fun entry(index: Int, role: String = "assistant", preview: String = "p$index"): EntrySummary =
+    private fun entry(index: Int, role: EntryRoleDto = EntryRoleDto.Assistant, preview: String = "p$index"): EntrySummary =
         EntrySummary(role = role, preview = preview, index = index)
 
     private fun result(
@@ -22,7 +22,7 @@ class SessionHistoryMergeTest {
         solutionId = "sol",
         agentId = "agent",
         title = "t",
-        state = "Idle",
+        state = SessionStateDto.Idle,
         createdAt = 0L,
         lastActivityAt = 0L,
         entries = entries,

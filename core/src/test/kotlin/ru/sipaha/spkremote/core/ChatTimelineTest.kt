@@ -8,7 +8,7 @@ import kotlin.test.assertTrue
 class ChatTimelineTest {
     private val utc = ZoneId.of("UTC")
     private fun entry(idx: Int, ms: Long?) =
-        EntrySummary(role = "user", preview = "p$idx", index = idx, createdMs = ms)
+        EntrySummary(role = EntryRoleDto.User, preview = "p$idx", index = idx, createdMs = ms)
 
     // 2024-05-20 10:00 and 12:00 UTC (same day); 2024-05-21 09:00 UTC (next day)
     private val day1a = 1716199200000L
