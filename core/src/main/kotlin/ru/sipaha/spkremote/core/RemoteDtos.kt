@@ -591,6 +591,15 @@ data class GetSessionResult(
     @SerialName("pending_bundles") val pendingBundles: List<QueuedBundleSummary> = emptyList(),
 )
 
+/**
+ * Pure mutation used by mobile when the user taps Stop: flip the visible
+ * session state to [SessionStateDto.Stopping] without touching entries or
+ * any other field. The server's real `Stopping` (then `Idle`) push
+ * reconciles whichever subsequent `GetSessionResult` lands.
+ */
+fun GetSessionResult.withOptimisticStopping(): GetSessionResult =
+    copy(state = SessionStateDto.Stopping)
+
 enum class DisplayState { Idle, Running, Stopping, AwaitingInput, Errored, Unknown }
 
 enum class EntryRole { User, Assistant, ToolCall, Plan, Unknown }

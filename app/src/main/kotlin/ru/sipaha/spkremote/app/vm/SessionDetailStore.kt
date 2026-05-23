@@ -46,6 +46,7 @@ import ru.sipaha.spkremote.core.mergeSessionHistory
 import ru.sipaha.spkremote.core.parseExpiredSendMessage
 import ru.sipaha.spkremote.core.reconcileOptimistic
 import ru.sipaha.spkremote.core.stampClientSendId
+import ru.sipaha.spkremote.core.withOptimisticStopping
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
 
@@ -272,6 +273,22 @@ internal class SessionDetailStore(
 
     private val _cancelInFlight = MutableStateFlow(false)
     val cancelInFlight: StateFlow<Boolean> = _cancelInFlight.asStateFlow()
+
+    /**
+     * Session id we owe a `cancel_turn` to, or `null` if no cancel is
+     * pending. Set by [cancelTurn] when the user taps Stop; cleared by
+     * [flushPendingCancel] once the RPC settles successfully. While set,
+     * any reconnect-resume path re-fires the RPC — the server-side
+     * `cancel_turn` is idempotent (a repeat in `Stopping`/`Idle` is a
+     * safe no-op, see commit f5fb202892), so resend is safe.
+     *
+     * We hold the TARGET session id rather than a bare `Boolean` so a
+     * navigation away from the originating session before the cancel
+     * lands doesn't accidentally cancel the NEW session's turn on
+     * reconnect.
+     */
+    private val _pendingCancel = MutableStateFlow<String?>(null)
+    val pendingCancel: StateFlow<String?> = _pendingCancel.asStateFlow()
 
     /**
      * Server-broadcast `pending_messages` view for the open session.
@@ -920,6 +937,11 @@ internal class SessionDetailStore(
     fun resumeSession(sessionId: String) {
         val active = context.activeClient() ?: return
         if (openSessionId != sessionId) return
+        // Reconnect resume is the natural place to flush a deferred cancel
+        // queued while we were offline. cancel_turn is idempotent on the
+        // server, so a flush against an already-Stopping/Idle session is
+        // a safe no-op.
+        flushPendingCancel()
         val current = _session.value
         val lastSeenIdx = lastSeen.getCached(sessionId) ?: lastSeen.readFromDisk(sessionId)
         if (lastSeenIdx == null || current !is UiData.Loaded) {
@@ -1679,8 +1701,34 @@ internal class SessionDetailStore(
     }
 
     fun cancelTurn() {
-        val active = context.activeClient() ?: return
         val sessionId = openSessionId ?: return
+        // 1. Optimistic: flip the visible state to Stopping immediately,
+        //    even if offline. The server's real Stopping/Idle push
+        //    reconciles whichever GetSessionResult lands next.
+        (_session.value as? UiData.Loaded)?.let { loaded ->
+            _session.value = UiData.Loaded(loaded.value.withOptimisticStopping())
+        }
+        // 2. Mark pending and try to send now. Server-side cancel_turn is
+        //    idempotent (a repeat in Stopping/Idle is a safe no-op), so a
+        //    resend on reconnect is safe; [resumeSession] re-fires us.
+        _pendingCancel.value = sessionId
+        flushPendingCancel()
+    }
+
+    /**
+     * Send the queued cancel RPC if one is pending AND we currently have
+     * a live client AND no other cancel is already in flight. Early-
+     * returns (idempotently) on any of those conditions; safe to call
+     * from both [cancelTurn] and the reconnect-resume path.
+     *
+     * The pending flag carries the TARGET session id; if the user has
+     * since navigated away to a DIFFERENT session, we stay pending and
+     * leave the visible session untouched.
+     */
+    private fun flushPendingCancel() {
+        val sessionId = _pendingCancel.value ?: return
+        if (openSessionId != sessionId) return
+        val active = context.activeClient() ?: return
         if (_cancelInFlight.value) return
         _cancelInFlight.value = true
         val params = buildJsonObject { put("session_id", sessionId) }
@@ -1691,6 +1739,12 @@ internal class SessionDetailStore(
                     if (err != null) error(err.message)
                     val toolErr = resp.toolError()
                     if (toolErr != null) error(toolErr)
+                }
+                .onSuccess {
+                    // Only clear the pending flag if it still names the
+                    // same session — guards against a fresh tap landing
+                    // between the launch and the response.
+                    if (_pendingCancel.value == sessionId) _pendingCancel.value = null
                 }
                 .onFailure { context.emitError("cancel failed: ${it.message ?: "?"}") }
             _cancelInFlight.value = false

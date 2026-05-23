@@ -1360,4 +1360,33 @@ class RemoteDtosTest {
         assertEquals("clone failed: timeout", failed.error)
     }
 
+    @Test
+    fun optimisticStoppingOverridesStateButKeepsEntries() {
+        val loaded = GetSessionResult(
+            id = "ses-opt",
+            solutionId = "sol-1",
+            agentId = "claude",
+            title = "Mixed",
+            state = SessionStateDto.Running(1779L),
+            createdAt = 1L,
+            lastActivityAt = 2L,
+            entries = listOf(
+                EntrySummary(role = EntryRoleDto.User, preview = "hi", index = 0),
+                EntrySummary(role = EntryRoleDto.Assistant, preview = "hello", index = 1),
+                EntrySummary(role = EntryRoleDto.User, preview = "stop?", index = 2),
+            ),
+        )
+
+        val stopping = loaded.withOptimisticStopping()
+
+        assertEquals(SessionStateDto.Stopping, stopping.state)
+        assertEquals(loaded.entries, stopping.entries)
+        assertEquals(loaded.title, stopping.title)
+        assertEquals(loaded.id, stopping.id)
+        assertEquals(loaded.solutionId, stopping.solutionId)
+        assertEquals(loaded.agentId, stopping.agentId)
+        assertEquals(loaded.createdAt, stopping.createdAt)
+        assertEquals(loaded.lastActivityAt, stopping.lastActivityAt)
+    }
+
 }
