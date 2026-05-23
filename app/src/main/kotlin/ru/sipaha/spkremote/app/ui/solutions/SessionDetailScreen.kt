@@ -71,6 +71,7 @@ import androidx.compose.material.icons.filled.HourglassBottom
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.HourglassEmpty
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -157,15 +158,18 @@ import ru.sipaha.spkremote.core.ContentBlockDto
 import ru.sipaha.spkremote.core.DisplayState
 import ru.sipaha.spkremote.core.connectionBannerLabel
 import ru.sipaha.spkremote.core.EntryImage
-import ru.sipaha.spkremote.core.EntryRole
+import ru.sipaha.spkremote.core.EntryRoleDto
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.GetSessionResult
 import kotlinx.coroutines.flow.StateFlow
 import ru.sipaha.spkremote.core.PlanSummary
+import ru.sipaha.spkremote.core.SessionStateDto
 import ru.sipaha.spkremote.core.SessionSummary
+import ru.sipaha.spkremote.core.ToolCallStatusDto
 import ru.sipaha.spkremote.core.ToolCallSummary
-import ru.sipaha.spkremote.core.parseDisplayState
-import ru.sipaha.spkremote.core.parseEntryRole
+import ru.sipaha.spkremote.core.displayState
+import ru.sipaha.spkremote.core.erroredMessage
+import ru.sipaha.spkremote.core.startedAtMs
 import ru.sipaha.spkremote.core.stripQueueMarker
 import ru.sipaha.spkremote.core.stripRoleHeading
 
@@ -285,9 +289,8 @@ fun SessionDetailScreen(
 
     val displayTitle: String = (sessionState as? UiData.Loaded)?.value?.title?.ifBlank { "Session" }
         ?: "Session"
-    val displayState: DisplayState = (sessionState as? UiData.Loaded)?.value
-        ?.let { parseDisplayState(it.state) } ?: DisplayState.Unknown
-    val rawState: String = (sessionState as? UiData.Loaded)?.value?.state ?: ""
+    val sessionStateDto: SessionStateDto? = (sessionState as? UiData.Loaded)?.value?.state
+    val displayState: DisplayState = sessionStateDto?.displayState() ?: DisplayState.Unknown
 
     // F-phone chip row inputs.
     //
@@ -325,7 +328,11 @@ fun SessionDetailScreen(
     val activeSummary: SessionSummary? = sessionsCache.firstOrNull { it.id == sessionId }
     val activeTotalTokens: Long? = activeSummary?.totalTokens
     val activeMaxTokens: Long? = activeSummary?.maxTokens
-    val activeStateStartedAtMs: Long? = activeSummary?.stateStartedAtMs
+    // `state_started_at_ms` now lives inside the structured
+    // [SessionStateDto.Running] variant (post-DTO migration). The list-side
+    // cache is still authoritative for the chat header anchor — the
+    // active session's `SessionSummary` is freshest re: state transitions.
+    val activeStateStartedAtMs: Long? = activeSummary?.state?.startedAtMs()
     // "Last activity" anchor for the status bar: the newest chat entry's
     // wall-clock timestamp, filtered to a real value (> 0). This mirrors
     // `combined.lastOrNull()?.createdMs` from [ChatList] — optimistic and
@@ -351,7 +358,10 @@ fun SessionDetailScreen(
                             totalTokens = activeTotalTokens,
                             maxTokens = activeMaxTokens,
                         )
-                        StatePill(state = displayState, raw = rawState)
+                        // `raw` only matters for [DisplayState.Unknown]; the
+                        // structured DTO carries no payload there, so an
+                        // empty string is fine — the pill renders "?".
+                        StatePill(state = displayState, raw = "")
                         RunningElapsed(
                             displayState = displayState,
                             stateStartedAtMs = activeStateStartedAtMs,
@@ -465,7 +475,7 @@ fun SessionDetailScreen(
                         scope.launch { snackbarHostState.showSnackbar(reason) }
                     },
                     onCancel = viewModel::cancelTurn,
-                    rawState = rawState,
+                    sessionStateDto = sessionStateDto,
                     sessionId = sessionId,
                     initialDraft = seedText,
                     seedLoaded = seedLoaded,
@@ -671,7 +681,7 @@ private fun ChatList(
                 ""
             }
             EntrySummary(
-                role = "user",
+                role = EntryRoleDto.User,
                 preview = bundle.preview + attachmentNote,
                 clientSendId = bundle.csids.firstOrNull(),
             )
@@ -995,7 +1005,7 @@ private fun userBubbleStatusFor(
     pendingUploads: Map<Long, PendingUploadProgress>,
     sessionDisplayState: DisplayState,
 ): UserBubbleStatus {
-    if (entry.role != "user") return UserBubbleStatus.None
+    if (entry.role != EntryRoleDto.User) return UserBubbleStatus.None
     // Server-broadcast queue bundle: ALWAYS Queued regardless of
     // local optimistic state or session display state. The server
     // is the source of truth — if the bundle is still in
@@ -1022,8 +1032,13 @@ private fun userBubbleStatusFor(
         // server-side queue and will flush when the turn ends, render
         // as Queued (hourglass) so the user can tell from a glance
         // which presses are pending agent-busy vs awaiting wire ack.
+        // `Stopping` also counts as busy: the agent is mid-cancel but the
+        // server-side `pending_messages` queue is still gated, so a fresh
+        // send placed during the transition has to wait for the next Idle
+        // window before flushing — same Queued affordance as Running.
         val busy = sessionDisplayState == DisplayState.Running ||
-            sessionDisplayState == DisplayState.AwaitingInput
+            sessionDisplayState == DisplayState.AwaitingInput ||
+            sessionDisplayState == DisplayState.Stopping
         return if (busy) UserBubbleStatus.Queued else UserBubbleStatus.Sending
     }
     // Server-echoed user entry — if it carries a client_send_id (every
@@ -1047,7 +1062,7 @@ private fun ChatBubble(
     userStatus: UserBubbleStatus = UserBubbleStatus.None,
     onAuthorizeToolCall: (toolCallId: String, optionId: String) -> Unit = { _, _ -> },
 ) {
-    val role = parseEntryRole(entry.role)
+    val role = entry.role
     // C3: per-message HH:MM, revealed ONLY on a SHORT tap. The always-on
     // "last message time" now lives in the status bar (LastActivityLabel),
     // so no bubble shows its time unprompted. The footer line sits OUTSIDE
@@ -1070,8 +1085,8 @@ private fun ChatBubble(
             ),
         ) {
             when (role) {
-                EntryRole.User -> UserBubble(entry = entry, status = userStatus)
-                EntryRole.Assistant -> {
+                EntryRoleDto.User -> UserBubble(entry = entry, status = userStatus)
+                EntryRoleDto.Assistant -> {
                     // Skip assistant turns whose body is effectively invisible:
                     //  - tool-call-only turns produce `## Assistant\n\n\n\n` (no
                     //    chunks at all);
@@ -1085,7 +1100,7 @@ private fun ChatBubble(
                         AssistantBubble(entry = entry)
                     }
                 }
-                EntryRole.ToolCall -> {
+                EntryRoleDto.ToolCall -> {
                     val tc = entry.toolCall
                     if (tc != null) {
                         ToolCallBubble(
@@ -1103,7 +1118,7 @@ private fun ChatBubble(
                         )
                     }
                 }
-                EntryRole.Plan -> {
+                EntryRoleDto.Plan -> {
                     val plan = entry.plan
                     if (plan != null) {
                         PlanBubble(plan = plan)
@@ -1117,12 +1132,16 @@ private fun ChatBubble(
                         )
                     }
                 }
-                EntryRole.Unknown -> CenteredAnnotatedBubble(
+                EntryRoleDto.Unknown -> CenteredAnnotatedBubble(
                     text = entry.preview,
                     icon = Icons.Filled.Build,
                     bg = MaterialTheme.colorScheme.surfaceVariant,
                     fg = MaterialTheme.colorScheme.onSurfaceVariant,
-                    label = entry.role,
+                    // Best-effort label for the tolerant-fallback case —
+                    // the structured DTO collapses unknown wire roles into
+                    // `Unknown` (no raw string carried), so render the enum
+                    // name verbatim.
+                    label = entry.role.name,
                 )
             }
         }
@@ -1133,7 +1152,7 @@ private fun ChatBubble(
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                 modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, top = 1.dp),
                 textAlign = when (role) {
-                    EntryRole.User -> TextAlign.End
+                    EntryRoleDto.User -> TextAlign.End
                     else -> TextAlign.Start
                 },
             )
@@ -2090,12 +2109,12 @@ private fun ToolCallBubble(
                     // re-keyed effect, seeing a non-running status,
                     // returns immediately without scheduling more delays).
                     val startedAt: Long? = call.toolStatusStartedAtMs
-                    if (startedAt != null && call.status == "running") {
+                    if (startedAt != null && call.status == ToolCallStatusDto.Running) {
                         var elapsedSeconds by remember(startedAt) {
                             mutableStateOf(((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(0L))
                         }
                         LaunchedEffect(startedAt, call.status) {
-                            if (call.status != "running") return@LaunchedEffect
+                            if (call.status != ToolCallStatusDto.Running) return@LaunchedEffect
                             while (true) {
                                 delay(1000L)
                                 elapsedSeconds = ((System.currentTimeMillis() - startedAt) / 1000L)
@@ -2189,18 +2208,30 @@ private fun ToolCallBubble(
  * the same phrase the editor logged.
  */
 @Composable
-private fun ToolStatusPill(status: String) {
+private fun ToolStatusPill(status: ToolCallStatusDto) {
     val (bg, fg) = when (status) {
-        "done" -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
-        "failed", "rejected" -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
-        "running", "pending", "waiting for confirmation" ->
+        ToolCallStatusDto.Done -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        ToolCallStatusDto.Failed, ToolCallStatusDto.Rejected ->
+            MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+        ToolCallStatusDto.Running,
+        ToolCallStatusDto.Pending,
+        ToolCallStatusDto.WaitingForConfirmation ->
             MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
-        "canceled" -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
-        else -> MaterialTheme.colorScheme.surface to MaterialTheme.colorScheme.onSurface
+        ToolCallStatusDto.Canceled ->
+            MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+        ToolCallStatusDto.Unknown ->
+            MaterialTheme.colorScheme.surface to MaterialTheme.colorScheme.onSurface
+    }
+    // Render the wire vocabulary verbatim — matches the desktop status log.
+    // `WaitingForConfirmation` flattens to the spaced "waiting for confirmation"
+    // phrase the editor used; everything else maps to the lowercased variant.
+    val label = when (status) {
+        ToolCallStatusDto.WaitingForConfirmation -> "waiting for confirmation"
+        else -> status.name.lowercase()
     }
     Surface(color = bg, contentColor = fg, shape = MaterialTheme.shapes.small) {
         Text(
-            text = status,
+            text = label,
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
         )
@@ -2433,7 +2464,13 @@ private fun ComposeBar(
      */
     onAttachmentError: (reason: String) -> Unit,
     onCancel: () -> Unit,
-    rawState: String,
+    /**
+     * Structured session state. Used to render the Errored banner message
+     * (via [SessionStateDto.erroredMessage]); the [DisplayState] classifier
+     * for everything else is already plumbed via [state]. Null until the
+     * session detail loads.
+     */
+    sessionStateDto: SessionStateDto?,
     sessionId: String,
     initialDraft: String,
     seedLoaded: Boolean,
@@ -2581,6 +2618,12 @@ private fun ComposeBar(
             .collect { text -> onDraftChanged(text) }
     }
     val isRunning = state == DisplayState.Running
+    // Stopping is the post-cancel transient state — the server is settling
+    // the agent before flipping to Idle/Errored. Render a non-interactive
+    // "Stopping…" affordance INSTEAD of the active Stop button: a second
+    // press would do nothing useful (the backend already escalates the
+    // wedged stop after 30 s on its own).
+    val isStopping = state == DisplayState.Stopping
     // Snapshot each attachment's upload state so the Send button reacts
     // to Done / Failed transitions as they happen. collectAsState() is
     // the standard Compose-side flow subscription primitive.
@@ -2645,10 +2688,11 @@ private fun ComposeBar(
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Text(
-                        // Trim the leading "Errored" prefix from the raw
-                        // Rust Debug string; if there's no payload, show
-                        // a clean fallback so this banner doesn't go blank.
-                        text = "Session errored: ${rawState.removePrefix("Errored").ifBlank { "see logs" }}",
+                        // Pull the structured Errored message (post-DTO
+                        // migration); fall back to "see logs" when the
+                        // server reported the state with no payload OR
+                        // the session DTO hasn't loaded yet.
+                        text = "Session errored: ${sessionStateDto?.erroredMessage()?.ifBlank { null } ?: "see logs"}",
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                     )
@@ -2781,6 +2825,29 @@ private fun ComposeBar(
                         } else {
                             Icon(Icons.Filled.Clear, contentDescription = "Cancel turn")
                         }
+                    }
+                } else if (isStopping) {
+                    // Non-interactive "Stopping…" affordance. NO onClick wired —
+                    // the cancel has been accepted server-side and the backend's
+                    // 30 s escalation handles wedged stops, so a second press
+                    // would be cargo-cult. Spinner + label mirrors the inflight
+                    // Stop button's "we're working on it" feel without granting
+                    // the user a button to mash.
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "Stopping…",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
                 FilledIconButton(
@@ -3340,7 +3407,7 @@ private fun SubAgentChipRow(
 
 @Composable
 private fun ChildChip(child: SessionSummary, onClick: () -> Unit) {
-    val displayState = parseDisplayState(child.state)
+    val displayState = child.state.displayState()
     val (icon, tint) = stateIconAndTint(displayState)
     AssistChip(
         onClick = onClick,
@@ -3379,6 +3446,10 @@ private fun stateIconAndTint(state: DisplayState): Pair<androidx.compose.ui.grap
     return when (state) {
         DisplayState.Idle -> Icons.Outlined.CheckCircle to MaterialTheme.colorScheme.onSurfaceVariant
         DisplayState.Running -> Icons.Filled.PlayArrow to MaterialTheme.colorScheme.primary
+        // Stopping: still busy from the UI's perspective; hourglass cues the
+        // transient "settling the cancel" state without reusing the play
+        // icon (which would read as "still running").
+        DisplayState.Stopping -> Icons.Outlined.HourglassEmpty to MaterialTheme.colorScheme.primary
         DisplayState.AwaitingInput -> Icons.Filled.Warning to MaterialTheme.colorScheme.tertiary
         DisplayState.Errored -> Icons.Filled.Clear to MaterialTheme.colorScheme.error
         DisplayState.Unknown -> Icons.Filled.CheckCircle to MaterialTheme.colorScheme.onSurfaceVariant

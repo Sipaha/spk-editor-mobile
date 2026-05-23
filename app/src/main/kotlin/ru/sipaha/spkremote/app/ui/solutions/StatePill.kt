@@ -34,6 +34,14 @@ internal fun StatePill(state: DisplayState, raw: String) {
             MaterialTheme.colorScheme.onPrimary,
             MaterialTheme.colorScheme.primary,
         )
+        DisplayState.Stopping -> Triple(
+            // Mirror Running styling — both read as "busy". An ellipsis on
+            // the label cues that the state is mid-transition (server is
+            // settling the cancel before flipping to Idle/Errored).
+            "Stopping…",
+            MaterialTheme.colorScheme.onPrimary,
+            MaterialTheme.colorScheme.primary,
+        )
         DisplayState.AwaitingInput -> Triple(
             "Awaiting input",
             MaterialTheme.colorScheme.onTertiaryContainer,

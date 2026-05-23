@@ -55,7 +55,7 @@ import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.DisplayState
 import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.SolutionSummary
-import ru.sipaha.spkremote.core.parseDisplayState
+import ru.sipaha.spkremote.core.displayState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -284,7 +284,7 @@ private fun SessionRow(
     onClick: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    val display = parseDisplayState(session.state)
+    val display = session.state.displayState()
     // Per-row confirmation toggle. Local-state — when the row is removed
     // from the list (post-delete refresh) the state is discarded along
     // with it, so there's no need to reset on success.
@@ -305,7 +305,10 @@ private fun SessionRow(
                 style = MaterialTheme.typography.titleMedium,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
-                StatePill(state = display, raw = session.state)
+                // `raw` only matters for [DisplayState.Unknown]; the tolerant
+                // structured DTO carries no payload on Unknown, so an empty
+                // string is fine — StatePill falls back to "?".
+                StatePill(state = display, raw = "")
                 Text(
                     text = relativeTime(session.lastActivityAt),
                     style = MaterialTheme.typography.labelSmall,

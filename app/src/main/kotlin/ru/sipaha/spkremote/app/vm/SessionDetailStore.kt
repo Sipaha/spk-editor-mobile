@@ -26,9 +26,11 @@ import ru.sipaha.spkremote.app.data.PersistedPendingSend
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.ContentBlockDto
+import ru.sipaha.spkremote.core.EntryRoleDto
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.QueuedBundleSummary
 import ru.sipaha.spkremote.core.SessionQueueChangedPayload
+import ru.sipaha.spkremote.core.SessionStateDto
 import ru.sipaha.spkremote.core.JsonRpc
 import ru.sipaha.spkremote.core.GetSessionEntryResult
 import ru.sipaha.spkremote.core.GetSessionResult
@@ -403,7 +405,7 @@ internal class SessionDetailStore(
                     if (s.csid in optimisticClientSendIds) continue
                     val preview = buildDeferredPreview(s)
                     _optimisticEntries.value = _optimisticEntries.value +
-                        EntrySummary(role = "user", preview = preview, clientSendId = s.csid)
+                        EntrySummary(role = EntryRoleDto.User, preview = preview, clientSendId = s.csid)
                     optimisticIds.add(s.localId)
                     optimisticClientSendIds.add(s.csid)
                     // Initial render: zero bytes, unknown total.
@@ -432,7 +434,7 @@ internal class SessionDetailStore(
                     if (p.csid in optimisticClientSendIds) continue
                     _optimisticEntries.value = _optimisticEntries.value +
                         EntrySummary(
-                            role = "user",
+                            role = EntryRoleDto.User,
                             preview = p.text.orEmpty(),
                             clientSendId = p.csid,
                         )
@@ -452,7 +454,7 @@ internal class SessionDetailStore(
                             solutionId = cached.solutionId,
                             agentId = cached.agentId,
                             title = "",
-                            state = "Idle",
+                            state = SessionStateDto.Idle,
                             createdAt = 0L,
                             lastActivityAt = 0L,
                             entries = cached.entries,
@@ -521,7 +523,7 @@ internal class SessionDetailStore(
                 // arrangement made `pop` and `applyPlaceholder` race —
                 // when the apply landed before the pop the chat
                 // briefly showed both the local + server bubble).
-                if (payload.role == "user" && csids.isNotEmpty()) {
+                if (payload.role == EntryRoleDto.User && csids.isNotEmpty()) {
                     for (c in csids) popOptimisticByClientSendIdLocked(c)
                 }
                 // Apply the placeholder ONLY for new entries (slot
@@ -1017,7 +1019,7 @@ internal class SessionDetailStore(
         // notification doesn't echo a server index), and `fetchAnd
         // ReplaceEntry` itself addresses entries by list position.
         loaded.value.entries.forEachIndexed { position, entry ->
-            if (entry.role == "tool_call" && entry.toolCall == null) {
+            if (entry.role == EntryRoleDto.ToolCall && entry.toolCall == null) {
                 fetchAndReplaceEntry(sessionId, position)
             }
         }
@@ -1134,7 +1136,7 @@ internal class SessionDetailStore(
         val localId = optimisticIdGen.incrementAndGet()
         val clientSendId = clientSendIdGen.incrementAndGet()
         val optimistic = EntrySummary(
-            role = "user",
+            role = EntryRoleDto.User,
             preview = preview,
             clientSendId = clientSendId,
         )
@@ -1521,7 +1523,7 @@ internal class SessionDetailStore(
         // "Uploading …" badge off `entry.clientSendId == send.csid`
         // — without it userBubbleStatusFor falls through to "Sending"
         // and the whole upload-progress UI silently dies.
-        val optimistic = EntrySummary(role = "user", preview = preview, clientSendId = send.csid)
+        val optimistic = EntrySummary(role = EntryRoleDto.User, preview = preview, clientSendId = send.csid)
         sessionMutex.withLock {
             // Defensive: don't re-seed if the bubble is already present
             // (shouldn't happen — runDeferredSend is the only producer
