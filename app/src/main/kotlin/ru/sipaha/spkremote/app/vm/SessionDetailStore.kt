@@ -639,14 +639,14 @@ internal class SessionDetailStore(
     override fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload) {
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
-        _activeSubagents.value = payload.activeSubagents
-        // Auto-snap if the currently-selected tab disappeared from the
-        // new active set. First remaining (preserving server insertion
-        // order) is the natural fallback; null = "Main" when the set
-        // drained entirely.
-        val current = _selectedSubagent.value
-        if (current != null && payload.activeSubagents.none { it.id == current }) {
-            _selectedSubagent.value = payload.activeSubagents.firstOrNull()?.id
+        // Cross the mutex so the read-then-conditional-write snap in
+        // applyActiveSubagentsLocked cannot race a concurrent
+        // fetchFullSession / applyAppended path on the same flow.
+        scope.launch {
+            sessionMutex.withLock {
+                if (openSessionId != payload.sessionId) return@withLock
+                applyActiveSubagentsLocked(payload.activeSubagents)
+            }
         }
     }
 
@@ -1065,6 +1065,11 @@ internal class SessionDetailStore(
                         scope.launch { fetchInitialPage(active, sessionId) }
                         return@withLock
                     }
+                    // Always reconcile the subagent set from a fresh resume
+                    // response — a subagent that disappeared while the app
+                    // was backgrounded would otherwise stay in the strip
+                    // until the user navigates away and back.
+                    applyActiveSubagentsLocked(result.activeSubagents)
                     if (fresh.isEmpty()) {
                         if (result.totalCount >= 0 && result.totalCount != latest.value.totalCount) {
                             _session.value = UiData.Loaded(
