@@ -449,10 +449,16 @@ internal class SessionDetailStore(
                     if (p.sessionId != sessionId) continue
                     if (p.attachments.isNotEmpty()) continue
                     if (p.csid in optimisticClientSendIds) continue
+                    val body = p.text.orEmpty()
                     _optimisticEntries.value = _optimisticEntries.value +
                         EntrySummary(
                             role = EntryRoleDto.User,
-                            preview = p.text.orEmpty(),
+                            preview = body,
+                            // Mirror `sendMessageBlocks` — rendering off
+                            // `markdown` keeps the bubble identical to a
+                            // freshly-sent one (the latter sets `preview`
+                            // to the truncated stub).
+                            markdown = body.takeIf { it.isNotEmpty() },
                             clientSendId = p.csid,
                         )
                     optimisticIds.add(p.localId)
@@ -533,40 +539,52 @@ internal class SessionDetailStore(
         scope.launch {
             sessionMutex.withLock {
                 if (openSessionId != payload.sessionId) return@withLock
-                // Fast-pop optimistic bubbles whose csid lands in the
-                // notification. Done FIRST inside the mutex so the
-                // subsequent placeholder add can't create a brief
-                // duplicate-bubble window (the prior two-launch
-                // arrangement made `pop` and `applyPlaceholder` race —
-                // when the apply landed before the pop the chat
-                // briefly showed both the local + server bubble).
-                if (payload.role == EntryRoleDto.User && csids.isNotEmpty()) {
-                    for (c in csids) popOptimisticByClientSendIdLocked(c)
-                }
-                // Apply the placeholder ONLY for new entries (slot
-                // doesn't exist yet). For updates to an existing entry
-                // (the common case under throttled EntryUpdated
-                // streaming — ~5 emits/sec while the agent writes a
-                // long reply), skipping the placeholder lets the
-                // already-rendered full markdown stay on screen while
-                // [fetchAndReplaceEntry] races the new content in.
-                // Without this guard the bubble collapsed to the
-                // truncated preview between every two updates and the
-                // `animateContentSize` tween produced a vertical
-                // jitter the user noticed on 2026-05-20.
-                val current = _session.value as? UiData.Loaded ?: return@withLock
-                val entries = current.value.entries
-                if (payload.entryIndex >= entries.size) {
-                    when (val outcome = applyAppendedPlaceholder(entries, payload)) {
-                        is AppendedPlaceholderOutcome.Replaced -> {
-                            _session.value = UiData.Loaded(
-                                current.value.copy(entries = outcome.entries),
-                            )
-                        }
-                        AppendedPlaceholderOutcome.OutOfRange -> {
-                            val active = context.activeClient() ?: return@withLock
-                            scope.launch {
-                                runCatching { fetchFullSession(active, payload.sessionId) }
+                // If this echo corresponds to a local optimistic bubble
+                // (we stamped its csid and the notification carries it
+                // back), defer BOTH the fast-pop and the placeholder.
+                // The optimistic already shows the full user-typed body
+                // (`markdown` populated in [sendMessageBlocks]); leaving
+                // it visible keeps the bubble's content stable until
+                // `fetchAndReplaceEntry` slots the canonical server
+                // entry into the same `csid:N` LazyColumn key —
+                // [echoedCsids] then hides the optimistic in the same
+                // recomposition. Without this, the bubble visibly
+                // regressed from full body → server's truncated preview
+                // (the notification's `preview` field) → full body
+                // again, perceived as "the bubble disappears and comes
+                // back" by the user.
+                val matchesLocalOptimistic = payload.role == EntryRoleDto.User &&
+                    csids.any { it in optimisticClientSendIds }
+                if (!matchesLocalOptimistic) {
+                    // Fast-pop optimistic bubbles whose csid lands in
+                    // the notification. Done FIRST inside the mutex so
+                    // the subsequent placeholder add can't create a
+                    // brief duplicate-bubble window.
+                    if (payload.role == EntryRoleDto.User && csids.isNotEmpty()) {
+                        for (c in csids) popOptimisticByClientSendIdLocked(c)
+                    }
+                    // Apply the placeholder ONLY for new entries (slot
+                    // doesn't exist yet). For updates to an existing
+                    // entry (the common case under throttled
+                    // EntryUpdated streaming — ~5 emits/sec while the
+                    // agent writes a long reply), skipping the
+                    // placeholder lets the already-rendered full
+                    // markdown stay on screen while
+                    // [fetchAndReplaceEntry] races the new content in.
+                    val current = _session.value as? UiData.Loaded ?: return@withLock
+                    val entries = current.value.entries
+                    if (payload.entryIndex >= entries.size) {
+                        when (val outcome = applyAppendedPlaceholder(entries, payload)) {
+                            is AppendedPlaceholderOutcome.Replaced -> {
+                                _session.value = UiData.Loaded(
+                                    current.value.copy(entries = outcome.entries),
+                                )
+                            }
+                            AppendedPlaceholderOutcome.OutOfRange -> {
+                                val active = context.activeClient() ?: return@withLock
+                                scope.launch {
+                                    runCatching { fetchFullSession(active, payload.sessionId) }
+                                }
                             }
                         }
                     }
@@ -1155,11 +1173,19 @@ internal class SessionDetailStore(
         val active = context.activeClient() ?: return
         val sessionId = openSessionId ?: return
         val preview = buildBlocksPreview(blocks)
+        // Full user-typed body for the optimistic bubble. UserBubble
+        // renders `markdown ?: preview` — populating `markdown` here lets
+        // the bubble show the COMPLETE multi-line message immediately
+        // instead of `buildBlocksPreview`'s first-line + 200-char clamp.
+        // Without this, long sends flashed as a truncated stub until the
+        // `fetchAndReplaceEntry` round-trip back-filled the real body.
+        val fullMarkdown = buildBlocksFullText(blocks)
         val localId = optimisticIdGen.incrementAndGet()
         val clientSendId = clientSendIdGen.incrementAndGet()
         val optimistic = EntrySummary(
             role = EntryRoleDto.User,
             preview = preview,
+            markdown = fullMarkdown.takeIf { it.isNotEmpty() },
             clientSendId = clientSendId,
         )
         val stamped = stampClientSendId(blocks, clientSendId)
@@ -1179,7 +1205,10 @@ internal class SessionDetailStore(
                 csid = clientSendId,
                 localId = localId,
                 sessionId = sessionId,
-                text = preview,
+                // Persist the FULL typed body so rehydration on next
+                // [openSession] re-shows the complete message, not the
+                // truncated `buildBlocksPreview` clamp.
+                text = fullMarkdown.takeIf { it.isNotEmpty() } ?: preview,
                 attachments = emptyList(),
             ),
         )
@@ -1545,7 +1574,14 @@ internal class SessionDetailStore(
         // "Uploading …" badge off `entry.clientSendId == send.csid`
         // — without it userBubbleStatusFor falls through to "Sending"
         // and the whole upload-progress UI silently dies.
-        val optimistic = EntrySummary(role = EntryRoleDto.User, preview = preview, clientSendId = send.csid)
+        val optimistic = EntrySummary(
+            role = EntryRoleDto.User,
+            preview = preview,
+            // Show the full typed body immediately; the preview is the
+            // first-line / 200-char clamp used elsewhere (session list).
+            markdown = send.text?.takeIf { it.isNotEmpty() },
+            clientSendId = send.csid,
+        )
         sessionMutex.withLock {
             // Defensive: don't re-seed if the bubble is already present
             // (shouldn't happen — runDeferredSend is the only producer
@@ -1682,6 +1718,24 @@ internal class SessionDetailStore(
      * recognises what they just sent before the server echoes the full
      * rendering back.
      */
+    /**
+     * Concatenate every text block's body verbatim (separated by blank
+     * lines) for use as the optimistic bubble's `markdown` payload. Image
+     * and file blocks are intentionally skipped — the optimistic carries
+     * no inline image bytes, and the rendered preview from the server
+     * eventually slots them in via [fetchAndReplaceEntry].
+     */
+    private fun buildBlocksFullText(blocks: List<ContentBlockDto>): String {
+        val parts = mutableListOf<String>()
+        for (block in blocks) {
+            if (block is ContentBlockDto.Text) {
+                val body = block.text.trimEnd()
+                if (body.isNotEmpty()) parts += body
+            }
+        }
+        return parts.joinToString("\n\n")
+    }
+
     private fun buildBlocksPreview(blocks: List<ContentBlockDto>): String {
         val parts = mutableListOf<String>()
         for (block in blocks) {

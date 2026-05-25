@@ -19,7 +19,9 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -737,12 +739,6 @@ private fun ChatList(
             lazyState.firstVisibleItemIndex == 0 && lazyState.firstVisibleItemScrollOffset == 0
         }
     }
-    // Auto-scroll on growth. We suppress while [isScrollInProgress] so a
-    // user mid-drag to read history doesn't get yanked back by a
-    // freshly-arrived turn.
-    val isScrolling by remember {
-        derivedStateOf { lazyState.isScrollInProgress }
-    }
     // Identity of the newest entry (= `combined.last()`; reverseLayout
     // maps it to item 0). Keying the auto-scroll on this — not just on
     // `combined.size` — catches the optimistic→server-echo swap, where a
@@ -757,30 +753,75 @@ private fun ChatList(
             ?: if (entry.index >= 0) "idx:${entry.index}"
             else "role:${entry.role}#${entry.preview.hashCode()}"
     }
-    // Was the user pinned to the newest entry IMMEDIATELY BEFORE this
-    // growth? Computed in `remember(...)` so it runs during the
-    // composition that brings the new entry in — at that point `lazyState`
-    // still reports last frame's layout (relayout happens in the layout
-    // phase, AFTER composition), so the index/offset reflect where the
-    // user actually was before the new item shifted the indices.
-    //
-    // Crucially this checks `firstVisibleItemScrollOffset == 0`, NOT just
-    // the old offset-blind `firstVisibleItemIndex <= 1`. The newest reply
-    // renders as a single tall AssistantBubble (item 0 under
-    // reverseLayout); scrolling UP inside it to read keeps
-    // `firstVisibleItemIndex == 0` while only the offset grows. The
-    // offset-blind guard mistook "reading the reply" for "pinned" and
-    // yanked the viewport to the bottom on every streamed block. The
-    // `<= 1` index tolerance is retained for the case where a fresh entry
-    // already bumped the previous (flush) bottom from slot 0 to slot 1.
-    val wasPinnedToNewest = remember(combined.size, newestEntryKey) {
-        lazyState.firstVisibleItemIndex <= 1 && lazyState.firstVisibleItemScrollOffset == 0
+    // The "Thinking…" sentinel slot below renders as item 0 in
+    // reverseLayout source order when the agent is Running and the
+    // latest entry is still the user message. Lift the check up here
+    // so the auto-scroll keys on the row appearing — without that the
+    // row materialised below the fold and the user had to scroll down
+    // to see it.
+    val showThinking = sessionDisplayState == DisplayState.Running &&
+        combined.lastOrNull()?.role == ru.sipaha.spkremote.core.EntryRoleDto.User
+
+    // Sticky-bottom flag: drives auto-scroll on content growth. Starts
+    // true and flips off ONLY when a user-initiated drag lands the
+    // viewport away from the bottom. Auto-scroll animations don't toggle
+    // it, so an interrupted `animateScrollToItem(0)` (next chunk arrives
+    // mid-flight, cancelling the previous animate) doesn't make the
+    // chat "un-stick" — the next size/key change just re-fires the
+    // animate. Previously the pin/un-pin decision sampled the live
+    // scroll position every time, so an interrupted animate at offset
+    // ≠ 0 read as "user scrolled away".
+    val stickyBottom = remember { mutableStateOf(true) }
+    val isUserDragging by lazyState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(lazyState) {
+        var sawUserDrag = false
+        launch {
+            lazyState.interactionSource.interactions.collect { i ->
+                if (i is androidx.compose.foundation.interaction.DragInteraction.Start) {
+                    sawUserDrag = true
+                }
+            }
+        }
+        androidx.compose.runtime.snapshotFlow { lazyState.isScrollInProgress }
+            .collect { scrolling ->
+                if (!scrolling && sawUserDrag) {
+                    sawUserDrag = false
+                    stickyBottom.value = lazyState.firstVisibleItemIndex == 0 &&
+                        lazyState.firstVisibleItemScrollOffset == 0
+                }
+            }
     }
-    LaunchedEffect(combined.size, newestEntryKey) {
+    LaunchedEffect(combined.size, newestEntryKey, showThinking) {
         if (combined.isEmpty()) return@LaunchedEffect
-        if (isScrolling) return@LaunchedEffect
-        if (wasPinnedToNewest) {
+        if (isUserDragging) return@LaunchedEffect
+        if (stickyBottom.value) {
             lazyState.animateScrollToItem(0)
+        }
+    }
+    // Counter the reverseLayout drift bug: when item 0 (the newest
+    // bubble, typically the streaming agent reply) grows by ΔH and the
+    // user is NOT pinned to the bottom, the LazyColumn measures `offset`
+    // from item 0's BOTTOM edge — so growth shifts the visible portion
+    // of item 0 DOWN by ΔH within the bubble. The user, mid-read of
+    // the message's start, perceives the viewport "scrolling itself
+    // forward through the text". Compensate by scrolling forward by ΔH,
+    // which keeps the visible content rooted at the same offset from
+    // item 0's TOP. No-op when pinned — there the natural anchoring is
+    // what we want (latest tokens visible at the bubble's top edge).
+    LaunchedEffect(lazyState) {
+        var prevSize: Int? = null
+        androidx.compose.runtime.snapshotFlow {
+            lazyState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == 0 }?.size
+        }.collect { size ->
+            val prev = prevSize
+            prevSize = size
+            if (size == null || prev == null) return@collect
+            val delta = size - prev
+            if (delta <= 0) return@collect
+            val pinned = lazyState.firstVisibleItemIndex == 0 &&
+                lazyState.firstVisibleItemScrollOffset == 0
+            if (pinned) return@collect
+            lazyState.scrollBy(delta.toFloat())
         }
     }
 
@@ -863,12 +904,10 @@ private fun ChatList(
                 // recent message in the timeline is still a user bubble.
                 // The moment the first assistant chunk arrives, the most-
                 // recent message becomes Assistant and this row hides,
-                // leaving the streaming reply in its place.
-                val lastMessage = timeline
-                    .firstOrNull { it is ru.sipaha.spkremote.core.ChatItem.Message }
-                    as? ru.sipaha.spkremote.core.ChatItem.Message
-                val showThinking = sessionDisplayState == DisplayState.Running &&
-                    lastMessage?.entry?.role == ru.sipaha.spkremote.core.EntryRoleDto.User
+                // leaving the streaming reply in its place. [showThinking]
+                // is lifted to the enclosing scope so the auto-scroll
+                // trigger keys on it — appearance of the row scrolls it
+                // into view instead of materialising it below the fold.
                 if (showThinking) {
                     item("thinking-row") { ThinkingRow() }
                 }
