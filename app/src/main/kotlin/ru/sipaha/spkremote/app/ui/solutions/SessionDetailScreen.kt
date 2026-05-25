@@ -67,6 +67,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Done
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.HourglassBottom
@@ -1142,16 +1143,13 @@ private fun ChatBubble(
             when (role) {
                 EntryRoleDto.User -> UserBubble(entry = entry, status = userStatus)
                 EntryRoleDto.Assistant -> {
-                    // Skip assistant turns whose body is effectively invisible:
-                    //  - tool-call-only turns produce `## Assistant\n\n\n\n` (no
-                    //    chunks at all);
-                    //  - thought-only turns produce `## Assistant\n\n<thinking>…
-                    //    </thinking>\n\n` and our markdown widget silently
-                    //    swallows the unknown HTML tag, drawing a padded gray
-                    //    rectangle with nothing in it.
-                    // Strip the role banner, strip `<thinking>…</thinking>`
-                    // blocks, then check what's left.
-                    if (hasVisibleAssistantBody(entry.markdown ?: entry.preview)) {
+                    // Skip assistant turns that have neither visible body
+                    // NOR thinking — the no-chunks tool-call-only case from
+                    // `acp_thread::AssistantMessage::to_markdown` ("##
+                    // Assistant\n\n\n\n"). Thinking-only turns now render
+                    // (as the collapsible Thoughts card in AssistantBubble),
+                    // so the visibility check folds both signals together.
+                    if (hasVisibleAssistantContent(entry.markdown ?: entry.preview)) {
                         AssistantBubble(entry = entry)
                     }
                 }
@@ -1556,42 +1554,115 @@ private fun AssistantBubble(entry: EntrySummary) {
             color = MaterialTheme.colorScheme.surfaceVariant,
             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
             shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
-            // Smooth the streaming bubble's VERTICAL growth only. Plain
-            // `animateContentSize` animated both axes, so a streamed line
-            // that widened the bubble produced a horizontal squeeze too —
-            // `animateHeightOnly` keeps width instant and animates height.
             modifier = Modifier
                 .widthIn(max = 360.dp)
                 .animateHeightOnly(),
         ) {
-            Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                // SelectionContainer wraps the assistant body so the rendered
-                // markdown + the fallback preview Text are both long-press
-                // selectable. The image-tap handler inside AssistantMarkdownBody
-                // continues to fire on tap because Compose routes long-press
-                // to the selection layer separately from clicks.
-                SelectionContainer {
-                    val md = entry.markdown
-                    if (md != null) {
-                        // Strip <thinking>...</thinking> blocks BEFORE rendering
-                        // (not just for visibility-check). The markdown widget
-                        // doesn't display unknown HTML but still allocates layout
-                        // space for the block — the user sees a phantom gap above
-                        // the actual answer.
-                        AssistantMarkdownBody(
-                            markdown = stripThinkingBlocks(stripRoleHeading(md)),
-                            images = entry.images.orEmpty(),
-                        )
-                    } else {
-                        // No full markdown yet (placeholder during streaming, or
-                        // pre-R-5e server). Falls back to preview to keep the
-                        // bubble informative until the per-entry RPC settles.
+            Column(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                val md = entry.markdown
+                if (md != null) {
+                    // Split the rendered markdown into thinking chunks and
+                    // the remaining answer body. Thinking blocks render as
+                    // a collapsible "💭 Thoughts" card above the answer so
+                    // extended-thinking turns become discoverable on mobile
+                    // (previously stripped entirely — the user saw nothing
+                    // for a thought-only turn and reasoning was hidden even
+                    // on mixed turns). Default collapsed: thoughts can be
+                    // multi-page on complex turns, the user opts in to view.
+                    val stripped = stripRoleHeading(md)
+                    val thoughts = extractThinkingBlocks(stripped)
+                    val body = stripThinkingBlocks(stripped)
+                    if (thoughts.isNotBlank()) {
+                        ThoughtsCard(thoughts = thoughts)
+                    }
+                    if (body.isNotBlank()) {
+                        // SelectionContainer wraps the assistant body so the
+                        // rendered markdown is long-press selectable. The
+                        // image-tap handler inside AssistantMarkdownBody
+                        // continues to fire on tap (Compose routes long-
+                        // press to the selection layer separately).
+                        SelectionContainer {
+                            AssistantMarkdownBody(
+                                markdown = body,
+                                images = entry.images.orEmpty(),
+                            )
+                        }
+                    }
+                } else {
+                    // No full markdown yet (placeholder during streaming, or
+                    // pre-R-5e server). Falls back to preview to keep the
+                    // bubble informative until the per-entry RPC settles.
+                    SelectionContainer {
                         Text(
                             text = stripRoleHeading(entry.preview),
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Collapsible "💭 Thoughts" panel that surfaces the agent's reasoning on
+ * mobile. Default collapsed — extended-thinking content is multi-paragraph
+ * and would dominate the bubble; we let the user opt in. Tap the header
+ * to toggle expansion. The body renders as muted italic text without the
+ * full markdown widget (thinking is usually plain prose; saving the
+ * markdown-parsing cost keeps this lightweight when a long-running
+ * session accumulates many thought-bearing turns).
+ */
+@Composable
+private fun ThoughtsCard(thoughts: String) {
+    var expanded by rememberSaveable(thoughts) { mutableStateOf(false) }
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(8.dp),
+        tonalElevation = 0.dp,
+    ) {
+        Column {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+            ) {
+                Text(
+                    text = "💭 Thoughts",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                Icon(
+                    imageVector = if (expanded) {
+                        Icons.Filled.KeyboardArrowUp
+                    } else {
+                        Icons.Filled.KeyboardArrowDown
+                    },
+                    contentDescription = if (expanded) "Collapse thoughts" else "Expand thoughts",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            if (expanded) {
+                Text(
+                    text = thoughts,
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontStyle = FontStyle.Italic,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
+                    modifier = Modifier.padding(
+                        start = 8.dp,
+                        end = 8.dp,
+                        bottom = 8.dp,
+                    ),
+                )
             }
         }
     }
@@ -2385,17 +2456,48 @@ private fun CenteredAnnotatedBubble(
  *
  * The upstream `acp_thread::AssistantMessage::to_markdown` always wraps
  * the chunks in `"## Assistant\n\n{chunks}\n\n"`, so an empty chunks list
- * still produces a non-empty markdown string. And a chunks list that
- * contains only `<thinking>` blocks looks non-blank but renders nothing
- * — our markdown widget treats `<thinking>` as raw HTML and drops it.
+ * still produces a non-empty markdown string. A bubble is worth drawing
+ * if it has EITHER a non-thinking answer body OR thinking content — the
+ * collapsible Thoughts card now renders the latter, so a thought-only
+ * turn (the no-text-output extended-thinking case) is no longer hidden.
  *
- * Returns false when both filters strip everything away. The dispatch
- * site at [ChatBubble] skips the bubble entirely in that case, so the
- * user doesn't see a padded gray rectangle with no content inside.
+ * Returns false only when stripping the role banner leaves nothing at
+ * all (the no-chunks tool-call-only shape of `"## Assistant\n\n\n\n"`).
+ * The dispatch site at [ChatBubble] skips the bubble entirely in that
+ * case, so the user doesn't see a padded gray rectangle with no content.
  */
-private fun hasVisibleAssistantBody(raw: String): Boolean {
+internal fun hasVisibleAssistantContent(raw: String): Boolean {
     val stripped = stripRoleHeading(raw)
-    return stripThinkingBlocks(stripped).isNotBlank()
+    val body = stripThinkingBlocks(stripped)
+    if (body.isNotBlank()) return true
+    return extractThinkingBlocks(stripped).isNotBlank()
+}
+
+/**
+ * Concatenate every `<thinking>…</thinking>` block in [md] into one
+ * blank-line-separated string for the collapsible Thoughts card. Mirrors
+ * [stripThinkingBlocks] but in reverse — we KEEP the inner content and
+ * drop everything else.
+ *
+ * Sources of `<thinking>` blocks in our markdown:
+ *  - `AssistantMessageChunk::Thought` (the upstream rendering of
+ *    `stream_event(thinking_delta)` content);
+ *  - The "[encrypted reasoning hidden …]" placeholder our pump emits
+ *    for `redacted_thinking` content blocks;
+ *  - Local-command thinking blocks recovered by the
+ *    `text_streamed_for_current_message` fallback.
+ *
+ * Returns an empty string when no blocks exist — the dispatch in
+ * [AssistantBubble] uses `isNotBlank()` to decide whether to mount the
+ * card at all.
+ */
+internal fun extractThinkingBlocks(md: String): String {
+    val matches = THINKING_BLOCK.findAll(md)
+        .map { it.groupValues[1].trim() }
+        .filter { it.isNotEmpty() }
+        .toList()
+    if (matches.isEmpty()) return ""
+    return matches.joinToString("\n\n")
 }
 
 /**
@@ -2426,9 +2528,11 @@ internal fun stripThinkingBlocks(md: String): String {
 
 // `[\s\S]` matches across newlines so multi-line `<thinking>` payloads
 // are removed in one pass. The lazy `*?` keeps each match minimal so two
-// thinking blocks in the same body each shed independently.
+// thinking blocks in the same body each shed independently. Group 1
+// captures the inner body so `extractThinkingBlocks` can collect just
+// the reasoning text without the surrounding tags.
 private val THINKING_BLOCK = Regex(
-    pattern = """<thinking>[\s\S]*?</thinking>""",
+    pattern = """<thinking>([\s\S]*?)</thinking>""",
     options = setOf(RegexOption.IGNORE_CASE),
 )
 private val OPEN_THINKING = Regex(
