@@ -122,6 +122,82 @@ class WorkspaceStore(
         runResyncLocked()
     }
 
+    // ---- Optimistic lifecycle mutations (C6) ----
+    //
+    // Each variant fires the wire RPC and (when meaningful) applies a
+    // local snapshot mutation immediately so the UI reacts without
+    // waiting for the round-trip + matching delta. On RPC failure we
+    // attempt to roll back — but only if the snapshot hasn't already
+    // moved on (a concurrent delta from the server is authoritative).
+    //
+    // Opens (`openSolutionOptimistic` / `openSessionOptimistic`) cannot
+    // be applied optimistically because the local store doesn't have
+    // the data needed to materialise a new row (sessions, member count,
+    // titles). They rely on the server delta to surface the new row.
+
+    suspend fun openSolutionOptimistic(id: String) {
+        // Opens are best applied via delta, not optimistic — we have no
+        // local OpenSolutionVM data to splice in. Just fire the call.
+        runCatching { client.openSolution(id) }
+    }
+
+    suspend fun closeSolutionOptimistic(id: String) {
+        val rollback = applyOptimistic { snap ->
+            snap.copy(solutions = snap.solutions.filterNot { it.id == id })
+        }
+        runCatching { client.closeSolution(id) }
+            .onFailure { rollback() }
+    }
+
+    suspend fun openSessionOptimistic(id: String) {
+        // No-op locally — relies on server delta to surface the new session row.
+        runCatching { client.openSession(id) }
+    }
+
+    suspend fun closeSessionOptimistic(id: String) {
+        val rollback = applyOptimistic { snap ->
+            snap.copy(solutions = snap.solutions.map { sol ->
+                sol.copy(sessions = sol.sessions.filterNot { it.id == id })
+            })
+        }
+        runCatching { client.closeSession(id) }
+            .onFailure { rollback() }
+    }
+
+    /**
+     * Apply [transform] to the current Loaded snapshot atomically and
+     * return a rollback closure. If state isn't Loaded yet (cold start),
+     * returns a no-op rollback — there's nothing to optimistically
+     * mutate.
+     *
+     * The returned rollback only reverts if the snapshot still matches
+     * our optimistic version; a concurrent delta may have moved the
+     * store forward, in which case the delta is the new truth and we
+     * must not undo it.
+     */
+    private suspend fun applyOptimistic(
+        transform: (WorkspaceSnapshotVM) -> WorkspaceSnapshotVM,
+    ): suspend () -> Unit {
+        val before: WorkspaceSnapshotVM = snapshotMutex.withLock {
+            val cur = _state.value as? WorkspaceUiState.Loaded
+                ?: return@applyOptimistic { /* no-op: nothing to roll back */ }
+            val transformed = transform(cur.snapshot)
+            _state.value = WorkspaceUiState.Loaded(transformed, stale = cur.stale)
+            cur.snapshot
+        }
+        return {
+            snapshotMutex.withLock {
+                val cur = _state.value as? WorkspaceUiState.Loaded ?: return@withLock
+                // Only rollback if the current state is still our optimistic
+                // version — a concurrent delta may have moved us forward; in
+                // that case the delta is the new truth, don't undo it.
+                if (cur.snapshot.solutions != before.solutions) {
+                    _state.value = WorkspaceUiState.Loaded(before, stale = cur.stale)
+                }
+            }
+        }
+    }
+
     fun onSolutionOpened(seq: Long, solution: SolutionSummary?, sessions: List<SessionSummary>) {
         applyOrBufferSequenced(SequencedDelta.SolutionOpened(seq, solution, sessions))
     }

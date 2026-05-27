@@ -627,14 +627,21 @@ internal class SessionListStore(
     }
 
     /**
-     * Close the session [sessionId] on the server. On success, optimistically
-     * remove the session from the in-memory list (so the row vanishes
-     * immediately even before the `agent_session_closed` notification round-
-     * trips back) and trigger a refresh against the currently-observed
-     * solution (if any) so cached state stays consistent with the server.
-     * Failures surface through the shared error channel.
+     * Delete the session [sessionId] on the server (DESTRUCTIVE — wipes
+     * the transcript). On success, optimistically remove the session from
+     * the in-memory list (so the row vanishes immediately even before the
+     * `workspace.session_deleted` notification round-trips back) and
+     * trigger a refresh against the currently-observed solution (if any)
+     * so cached state stays consistent with the server. Failures surface
+     * through the shared error channel.
+     *
+     * Wire-schema v2 renamed `solution_agent.close_session` →
+     * `solution_agent.delete_session` to match the actual semantics; the
+     * non-destructive "remove the tab" action is now
+     * `workspace.close_session`, wired separately through
+     * [WorkspaceStore.closeSessionOptimistic].
      */
-    fun closeSession(sessionId: String) {
+    fun deleteSession(sessionId: String) {
         val active = context.activeClient()
         if (active == null) {
             context.emitError(context.notConnectedMessage())
@@ -642,7 +649,7 @@ internal class SessionListStore(
         }
         val params = buildJsonObject { put("session_id", sessionId) }
         scope.launch {
-            runCatching { active.call("remote.solution_agent.close_session", params) }
+            runCatching { active.call("remote.solution_agent.delete_session", params) }
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
@@ -661,7 +668,7 @@ internal class SessionListStore(
                     val solutionId = observingSolutionId
                     if (solutionId != null) refreshSessions(solutionId)
                 }
-                .onFailure { context.emitError("Couldn't close session: ${it.message ?: "?"}") }
+                .onFailure { context.emitError("Couldn't delete session: ${it.message ?: "?"}") }
         }
     }
 

@@ -249,22 +249,104 @@ class WorkspaceStoreTest {
         assertEquals(1, list.size)
         assertEquals("c1", list[0].id)
     }
+
+    // ---- C6: optimistic UI for lifecycle mutations ----
+
+    @Test
+    fun close_solution_optimistic_removes_immediately_and_keeps_on_success() = runTest {
+        val fake = FakeWorkspaceClient(
+            snapshotResult = WorkspaceSnapshotVM(
+                seq = 5,
+                solutions = listOf(OpenSolutionVM("s1", "a", 0, emptyList())),
+            ),
+            closeSolutionSeq = 6,
+        )
+        val store = WorkspaceStore(client = fake, scope = backgroundScope)
+        store.refresh(); advanceUntilIdle()
+
+        store.closeSolutionOptimistic("s1")
+        advanceUntilIdle()
+
+        val state = store.state.value as WorkspaceUiState.Loaded
+        assertEquals(0, state.snapshot.solutions.size, "solution removed optimistically")
+        assertEquals(5L, state.snapshot.seq, "seq unchanged — delta will advance it")
+    }
+
+    @Test
+    fun close_solution_optimistic_rolls_back_on_failure() = runTest {
+        val fake = FakeWorkspaceClient(
+            snapshotResult = WorkspaceSnapshotVM(
+                seq = 5,
+                solutions = listOf(OpenSolutionVM("s1", "a", 0, emptyList())),
+            ),
+            closeSolutionShouldThrow = true,
+        )
+        val store = WorkspaceStore(client = fake, scope = backgroundScope)
+        store.refresh(); advanceUntilIdle()
+
+        store.closeSolutionOptimistic("s1")
+        advanceUntilIdle()
+
+        val state = store.state.value as WorkspaceUiState.Loaded
+        assertEquals(1, state.snapshot.solutions.size, "rollback restored the solution")
+    }
+
+    /**
+     * Sanity check for the `applyOptimistic` cold-start path: calling an
+     * optimistic mutation BEFORE refresh() (state still Loading) must not
+     * crash and must leave the store in Loading. The wire call is still
+     * fired (we have no way to know yet whether a snapshot exists), but
+     * the optimistic snapshot mutation + rollback path is a no-op.
+     */
+    @Test
+    fun close_solution_optimistic_before_refresh_does_not_crash() = runTest {
+        val fake = FakeWorkspaceClient(closeSolutionSeq = 1)
+        val store = WorkspaceStore(client = fake, scope = backgroundScope)
+
+        // No refresh() — state is still Loading.
+        store.closeSolutionOptimistic("any")
+        advanceUntilIdle()
+
+        // State is still Loading; the call ran but there was nothing to
+        // mutate locally.
+        assertEquals(WorkspaceUiState.Loading, store.state.value)
+    }
 }
 
-/** Minimal in-memory mock of the wire client. Fill in surface as needed. */
+/**
+ * Minimal in-memory mock of the wire client. Fill in surface as needed.
+ *
+ * C6 added the optional `*Seq` and `*ShouldThrow` knobs so individual
+ * lifecycle methods can be driven without subclassing for every test.
+ * Only methods that need full behaviour for a given test are wired —
+ * the rest stay as loud stubs so a regression in the test setup is
+ * obvious.
+ */
 open class FakeWorkspaceClient(
     val snapshotResult: WorkspaceSnapshotVM = WorkspaceSnapshotVM(0, emptyList()),
     val closedListResult: List<ClosedSolutionRow> = emptyList(),
+    val closeSolutionSeq: Long? = null,
+    val closeSolutionShouldThrow: Boolean = false,
+    val closeSessionSeq: Long? = null,
+    val closeSessionShouldThrow: Boolean = false,
 ) : WorkspaceClient {
     override suspend fun fetchSnapshot(): WorkspaceSnapshotVM = snapshotResult
     override suspend fun fetchClosedSolutions(): List<ClosedSolutionRow> = closedListResult
-    // Lifecycle methods are exercised by C6 — C5 ships only the wire surface,
-    // and the eight existing tests don't drive them. Throw loudly if anything
-    // calls them so a regression in the test setup is obvious.
-    override suspend fun openSolution(id: String): Long = throw NotImplementedError("not used in C5 tests")
-    override suspend fun closeSolution(id: String): Long = throw NotImplementedError("not used in C5 tests")
-    override suspend fun openSession(id: String): Long = throw NotImplementedError("not used in C5 tests")
-    override suspend fun closeSession(id: String): Long = throw NotImplementedError("not used in C5 tests")
+    // openSolution / openSession aren't exercised by any current test —
+    // they're best applied via delta and the optimistic path is a
+    // passthrough — so keep loud stubs.
+    override suspend fun openSolution(id: String): Long =
+        throw NotImplementedError("openSolution not wired in this test")
+    override suspend fun openSession(id: String): Long =
+        throw NotImplementedError("openSession not wired in this test")
+    override suspend fun closeSolution(id: String): Long {
+        if (closeSolutionShouldThrow) error("simulated closeSolution failure")
+        return closeSolutionSeq ?: 0L
+    }
+    override suspend fun closeSession(id: String): Long {
+        if (closeSessionShouldThrow) error("simulated closeSession failure")
+        return closeSessionSeq ?: 0L
+    }
 }
 
 /** Minimal valid SolutionSummary for tests that don't care about specifics. */

@@ -254,7 +254,7 @@ fun SolutionDetailScreen(
                                 SessionRow(
                                     session = session,
                                     onClick = { onOpenSession(session) },
-                                    onDelete = { viewModel.closeSession(session.id) },
+                                    onDelete = { viewModel.deleteSession(session.id) },
                                 )
                                 HorizontalDivider()
                             }

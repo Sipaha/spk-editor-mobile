@@ -467,6 +467,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         workspaceStore.refreshClosedSolutions()
     }
 
+    // ---- Workspace lifecycle wrappers (C6) ----
+    //
+    // Each wrapper fires the matching `workspace.*` RPC through the
+    // optimistic-UI helpers on [WorkspaceStore]:
+    //  - opens delegate to the server delta (no local materialisation),
+    //  - closes apply locally first and roll back on RPC failure.
+    //
+    // NOTE on naming: the session-level pair uses a `…SessionTab`
+    // suffix to avoid colliding with [openSession] (which navigates
+    // into the chat detail view) and the no-arg [closeSession]
+    // (which exits the chat detail). The `…SessionTab` wrappers are
+    // SHALLOW "remove-from-tab-strip" actions, not destructive. The
+    // destructive delete-the-session-entirely action is
+    // [deleteSession] above, which targets
+    // `solution_agent.delete_session`.
+
+    fun openSolution(id: String) = viewModelScope.launch {
+        workspaceStore.openSolutionOptimistic(id)
+    }
+    fun closeSolution(id: String) = viewModelScope.launch {
+        workspaceStore.closeSolutionOptimistic(id)
+    }
+    fun openSessionTab(id: String) = viewModelScope.launch {
+        workspaceStore.openSessionOptimistic(id)
+    }
+    fun closeSessionTab(id: String) = viewModelScope.launch {
+        workspaceStore.closeSessionOptimistic(id)
+    }
+
     // ---- Sessions surface ----
 
     val sessions: StateFlow<UiData<List<SessionSummary>>> get() = sessionList.sessions
@@ -492,7 +521,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     fun clearSessions() = sessionList.clearSessions()
     fun openSession(sessionId: String) = sessionDetail.openSession(sessionId)
     fun closeSession() = sessionDetail.closeSession()
-    fun closeSession(sessionId: String) = sessionList.closeSession(sessionId)
+    /**
+     * Destructive: deletes the session entirely (transcript and all)
+     * via `solution_agent.delete_session`. The non-destructive
+     * remove-from-tab-strip is exposed separately as [closeSession]
+     * (id variant) below, which targets `workspace.close_session`.
+     */
+    fun deleteSession(sessionId: String) = sessionList.deleteSession(sessionId)
     fun loadOlder(sessionId: String) = sessionDetail.loadOlder(sessionId)
     fun sendMessage(text: String) = sessionDetail.sendMessage(text)
     fun sendMessageBlocks(blocks: List<ContentBlockDto>) =

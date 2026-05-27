@@ -44,8 +44,11 @@ import kotlinx.serialization.json.put
  *
  * **Version history**
  * - v1: initial versioned wire (structured [SessionStateDto]/[EntryRoleDto]/[ToolCallStatusDto])
- * - v2: added `workspace.*` notification namespace; renamed `window_open` → `workspace.open`
- *       and `close_session` → `workspace.close_session`
+ * - v2: added `workspace.*` notification namespace; renamed
+ *       `SolutionSummary.window_open` → `open`; renamed
+ *       `solution_agent.close_session` →
+ *       `solution_agent.delete_session` (`workspace.close_session` is
+ *       a NEW non-destructive tab-strip-remove tool, not a rename)
  */
 const val SUPPORTED_WIRE_SCHEMA_VERSION: Int = 2
 
