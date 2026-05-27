@@ -201,7 +201,7 @@ private fun SolutionRow(
             // meaningless on the phone (and leaks server layout). Name +
             // member/window summary is enough to identify the solution.
             val memberLabel = "${solution.memberCount} ${if (solution.memberCount == 1) "member" else "members"}"
-            val windowLabel = if (solution.windowOpen) "open" else "closed"
+            val windowLabel = if (solution.open) "open" else "closed"
             Text(
                 text = "$memberLabel | $windowLabel",
                 style = MaterialTheme.typography.labelSmall,

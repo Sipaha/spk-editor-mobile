@@ -84,7 +84,7 @@ data class SolutionSummary(
     val root: String,
     @SerialName("member_count") val memberCount: Int,
     @SerialName("last_opened_at") val lastOpenedAt: String? = null,
-    @SerialName("window_open") val windowOpen: Boolean,
+    @SerialName("open") val open: Boolean,
     @SerialName("main_window_id") val mainWindowId: String? = null,
 )
 

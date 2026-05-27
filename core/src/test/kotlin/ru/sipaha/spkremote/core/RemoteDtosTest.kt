@@ -128,7 +128,7 @@ class RemoteDtosTest {
               "root": "/home/spk/.spk/spk-editor",
               "member_count": 4,
               "last_opened_at": "2026-05-16T08:00:00Z",
-              "window_open": true,
+              "open": true,
               "main_window_id": "win-7"
             }
         """.trimIndent()
@@ -138,7 +138,7 @@ class RemoteDtosTest {
         assertEquals("/home/spk/.spk/spk-editor", parsed.root)
         assertEquals(4, parsed.memberCount)
         assertEquals("2026-05-16T08:00:00Z", parsed.lastOpenedAt)
-        assertTrue(parsed.windowOpen)
+        assertTrue(parsed.open)
         assertEquals("win-7", parsed.mainWindowId)
 
         val reencoded = JsonRpc.json.encodeToString(SolutionSummary.serializer(), parsed)
@@ -154,14 +154,14 @@ class RemoteDtosTest {
               "name": "Other",
               "root": "/tmp/x",
               "member_count": 0,
-              "window_open": false
+              "open": false
             }
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(SolutionSummary.serializer(), text)
         assertNull(parsed.lastOpenedAt)
         assertNull(parsed.mainWindowId)
         assertEquals(0, parsed.memberCount)
-        assertEquals(false, parsed.windowOpen)
+        assertEquals(false, parsed.open)
     }
 
     @Test
@@ -174,7 +174,7 @@ class RemoteDtosTest {
                   "name": "A",
                   "root": "/a",
                   "member_count": 1,
-                  "window_open": true
+                  "open": true
                 },
                 {
                   "id": "sol-b",
@@ -182,7 +182,7 @@ class RemoteDtosTest {
                   "root": "/b",
                   "member_count": 2,
                   "last_opened_at": "2026-05-15T00:00:00Z",
-                  "window_open": false,
+                  "open": false,
                   "main_window_id": "win-2"
                 }
               ]
