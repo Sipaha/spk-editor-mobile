@@ -24,6 +24,7 @@ import ru.sipaha.spkremote.app.data.PendingSendsRepository
 import ru.sipaha.spkremote.app.data.PersistedPendingAttachment
 import ru.sipaha.spkremote.app.data.PersistedPendingSend
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
+import ru.sipaha.spkremote.core.AgentSessionContextResetPayload
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.ContentBlockDto
 import ru.sipaha.spkremote.core.EntryRoleDto
@@ -634,6 +635,29 @@ internal class SessionDetailStore(
         val openSid = openSessionId ?: return
         if (notifSessionId != null && notifSessionId != openSid) return
         refreshSession(openSid)
+    }
+
+    override fun onSessionContextReset(payload: AgentSessionContextResetPayload) {
+        val openSid = openSessionId ?: return
+        if (payload.sessionId != openSid) return
+        scope.launch {
+            sessionMutex.withLock {
+                // stale-write barrier (see class kdoc invariant 1)
+                if (openSessionId != payload.sessionId) return@withLock
+                // Drop optimistic bubbles tied to the now-wiped context.
+                _optimisticEntries.value = emptyList()
+                optimisticIds.clear()
+                optimisticClientSendIds.clear()
+                // Flip to Loading so the chat shows a clean refresh state
+                // rather than briefly painting the old entries during the
+                // get_session round-trip.
+                _session.value = UiData.Loading
+            }
+            // refreshSession is a full get_session WITHOUT after_index — exactly
+            // what we need: a fresh transcript page (likely empty) replaces the
+            // stale one.
+            refreshSession(payload.sessionId)
+        }
     }
 
     override fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload) {

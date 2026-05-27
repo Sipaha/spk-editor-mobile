@@ -1251,6 +1251,17 @@ class RemoteDtosTest {
     }
 
     @Test
+    fun agent_session_context_reset_payload_decodes() {
+        val raw = """{"session_id":"se1","context_count":3}"""
+        val p = JsonRpc.json.decodeFromString(
+            AgentSessionContextResetPayload.serializer(),
+            raw,
+        )
+        assertEquals("se1", p.sessionId)
+        assertEquals(3, p.contextCount)
+    }
+
+    @Test
     fun `MessageAppendedPayload defaults client_send_id to null when omitted`() {
         // Pre-rollout / desktop-originated append — server omits the
         // field entirely. The DTO must surface null so the fast-pop

@@ -22,6 +22,7 @@ import ru.sipaha.spkremote.core.MemberAddCompletedPayload
 import ru.sipaha.spkremote.core.MemberAddProgressPayload
 import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.RemoteClient
+import ru.sipaha.spkremote.core.AgentSessionContextResetPayload
 import ru.sipaha.spkremote.core.SessionActiveSubagentsChangedPayload
 import ru.sipaha.spkremote.core.SessionCreatedPayload
 import ru.sipaha.spkremote.core.SessionQueueChangedPayload
@@ -247,6 +248,11 @@ internal class SessionListStore(
                             // which moves the tab strip; without this the
                             // strip only refreshes via cold-start seed.
                             "agent_session_active_subagents_changed",
+                            // Server wiped this session's transcript in-place
+                            // (`/clear` reset_context or `/compact` rotate_context).
+                            // Without this kind, the chat surface keeps showing
+                            // stale entries until a foreground / cold refresh.
+                            "agent_session_context_reset",
                             // Chunked-upload acks share this collector — server
                             // forwards them through the same notification path
                             // (allow_list pattern `upload_*`). Subscribing
@@ -503,6 +509,10 @@ internal class SessionListStore(
                 } ?: return
                 router.onActiveSubagentsChanged(payload)
             }
+            "agent_session_context_reset" -> {
+                val payload = data?.decodeOrNull(AgentSessionContextResetPayload.serializer()) ?: return
+                router.onSessionContextReset(payload)
+            }
         }
     }
 
@@ -749,6 +759,13 @@ internal interface DetailNotificationRouter {
      * server-side `active_subagent_order` Vec — render as-is.
      */
     fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload)
+
+    /**
+     * The server wiped this session's transcript in-place via /clear or
+     * /compact. The session id is unchanged. Implementations must drop
+     * their cached entry list for [payload.sessionId] and re-fetch.
+     */
+    fun onSessionContextReset(payload: AgentSessionContextResetPayload)
 }
 
 /**

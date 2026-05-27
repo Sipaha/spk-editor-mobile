@@ -540,6 +540,22 @@ data class SessionActiveSubagentsChangedPayload(
     @SerialName("active_subagents") val activeSubagents: List<SubagentDto>,
 )
 
+/**
+ * Server-emitted `agent_session_context_reset` — fires when the desktop
+ * wipes a session's transcript in-place via `/clear` (reset_context) or
+ * `/compact` (rotate_context). The session_id is stable across the swap;
+ * only the entries are gone. Mobile must drop its cached entry list and
+ * re-fetch via `get_session` (no after_index cursor).
+ *
+ * `contextCount` is informational — incremented by /compact, unchanged
+ * by /clear. Both code paths require the same client-side action.
+ */
+@Serializable
+data class AgentSessionContextResetPayload(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("context_count") val contextCount: Int,
+)
+
 @Serializable
 data class MessageAppendedPayload(
     @SerialName("session_id") val sessionId: String,
