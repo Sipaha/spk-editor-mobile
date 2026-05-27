@@ -445,6 +445,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
      * notification, so no manual list-refresh is needed.
      */
     fun deleteSolution(solutionId: String) = catalogStore.deleteSolution(solutionId)
+    /**
+     * Create a new empty solution named [name]. The workspace mirror picks
+     * up the new solution via the `workspace.solution_opened` delta —
+     * no manual list refresh required.
+     */
+    fun createSolution(name: String) = catalogStore.createSolution(name)
     fun refreshCatalog() = catalogStore.refreshCatalog()
     fun addMemberFromCatalog(solutionId: String, catalogId: String) =
         catalogStore.addMemberFromCatalog(solutionId, catalogId)

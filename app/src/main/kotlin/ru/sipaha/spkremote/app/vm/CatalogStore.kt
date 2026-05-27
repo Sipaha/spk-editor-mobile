@@ -72,6 +72,31 @@ internal class CatalogStore(
     }
 
     /**
+     * Create a new (empty) solution named [name] on the server.  No follow-up
+     * list refresh: the workspace mirror picks up the new solution via the
+     * `workspace.solution_opened` delta the server emits as part of the
+     * create flow.  Failures surface through the shared error channel.
+     */
+    fun createSolution(name: String) {
+        val active = context.activeClient()
+        if (active == null) {
+            context.emitError(context.notConnectedMessage())
+            return
+        }
+        val params = buildJsonObject { put("name", name) }
+        scope.launch {
+            runCatching { active.call("remote.solutions.create", params) }
+                .mapCatching { resp ->
+                    val err = resp.error
+                    if (err != null) error(err.message)
+                    val toolErr = resp.toolError()
+                    if (toolErr != null) error(toolErr)
+                }
+                .onFailure { context.emitError("Couldn't create solution: ${it.message ?: "?"}") }
+        }
+    }
+
+    /**
      * Delete the solution [solutionId] on the server. Failures surface
      * through the shared error channel. The workspace mirror picks up the
      * removal via the `workspace.solution_deleted` notification — no

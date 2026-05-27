@@ -17,6 +17,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import ru.sipaha.spkremote.app.ui.solutions.NewSessionDialog
 import ru.sipaha.spkremote.app.ui.solutions.StatePill
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.app.vm.OpenSessionVM
@@ -31,8 +32,6 @@ fun WorkspaceScreen(
     onOpenSession: (sessionId: String) -> Unit,
     onOpenProjects: (solutionId: String) -> Unit,
     onOpenSettings: () -> Unit,
-    onCreateNewSolution: () -> Unit,
-    onCreateNewSessionFor: (solutionId: String) -> Unit,
 ) {
     val state by viewModel.workspaceState.collectAsState()
     // Picker visibility lives inside the screen now (E1): the FAB and
@@ -41,6 +40,11 @@ fun WorkspaceScreen(
     // rememberSaveable so a rotation mid-pick doesn't snap the sheet
     // shut.
     var showPicker by rememberSaveable { mutableStateOf(false) }
+    // F2 reintroduces the create-solution + new-session flows inside the
+    // workspace. Both pieces of state survive config-change so a rotation
+    // doesn't dismiss an in-progress dialog.
+    var showCreateSolution by rememberSaveable { mutableStateOf(false) }
+    var newSessionForSolution by rememberSaveable { mutableStateOf<String?>(null) }
 
     Scaffold(
         topBar = {
@@ -55,7 +59,7 @@ fun WorkspaceScreen(
         },
         floatingActionButton = {
             ExpandableFab(
-                onCreateNew = onCreateNewSolution,
+                onCreateNew = { showCreateSolution = true },
                 onOpenPicker = { showPicker = true },
             )
         },
@@ -68,7 +72,7 @@ fun WorkspaceScreen(
                     if (s.snapshot.solutions.isEmpty()) {
                         EmptyState(
                             onOpenPicker = { showPicker = true },
-                            onCreateNew = onCreateNewSolution,
+                            onCreateNew = { showCreateSolution = true },
                         )
                     } else {
                         if (s.stale) StaleProgressBar()
@@ -80,7 +84,9 @@ fun WorkspaceScreen(
                             onDeleteSolution = { id -> viewModel.deleteSolution(id) },
                             onCloseSession = { id -> viewModel.closeSessionTab(id) },
                             onDeleteSession = { id -> viewModel.deleteSession(id) },
-                            onCreateNewSessionFor = onCreateNewSessionFor,
+                            onCreateNewSessionFor = { solutionId ->
+                                newSessionForSolution = solutionId
+                            },
                         )
                     }
                 }
@@ -92,6 +98,23 @@ fun WorkspaceScreen(
         ClosedSolutionsPickerSheet(
             viewModel = viewModel,
             onDismiss = { showPicker = false },
+        )
+    }
+    if (showCreateSolution) {
+        CreateSolutionDialog(
+            onDismiss = { showCreateSolution = false },
+            onCreate = { name -> viewModel.createSolution(name) },
+        )
+    }
+    newSessionForSolution?.let { solutionId ->
+        NewSessionDialog(
+            viewModel = viewModel,
+            solutionId = solutionId,
+            onDismiss = { newSessionForSolution = null },
+            onCreated = { newSessionId ->
+                newSessionForSolution = null
+                onOpenSession(newSessionId)
+            },
         )
     }
 }
@@ -297,6 +320,11 @@ internal fun EmptyState(onOpenPicker: () -> Unit = {}, onCreateNew: () -> Unit =
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(Modifier.height(16.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onCreateNew) { Text("New solution") }
+            OutlinedButton(onClick = onOpenPicker) { Text("Open closed solution") }
+        }
     }
 }
 

@@ -208,16 +208,6 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                         navController.navigate("workspace/solutions/$solutionId/projects")
                     },
                     onOpenSettings = { navController.navigate("settings") },
-                    // G1 deleted the legacy SolutionsListScreen /
-                    // SolutionDetailScreen that owned the "new solution"
-                    // and "new session" dialogs. The workspace-owned
-                    // versions are F-phase / beyond — until then these
-                    // callbacks are no-ops so the build stays green;
-                    // the FAB still surfaces the "Open closed solution…"
-                    // picker, which is the only creation-adjacent flow
-                    // wired end-to-end on the workspace today.
-                    onCreateNewSolution = {},
-                    onCreateNewSessionFor = {},
                 )
             }
             composable("settings") {
