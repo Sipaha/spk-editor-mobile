@@ -49,10 +49,12 @@ data class ClosedSolutionRow(
  * Minimal client surface consumed by [WorkspaceStore]. The real wire
  * implementation lives in a later task — tests inject a fake.
  *
- * Lifecycle + closed-list calls will be added in later tasks (C4+).
+ * Lifecycle calls (openSolution, closeSolution, openSession, closeSession)
+ * are deferred to C6, when they are actually used.
  */
 interface WorkspaceClient {
     suspend fun fetchSnapshot(): WorkspaceSnapshotVM
+    suspend fun fetchClosedSolutions(): List<ClosedSolutionRow>
 }
 
 /**
@@ -127,6 +129,36 @@ class WorkspaceStore(
 
     fun onSessionDeleted(seq: Long, solutionId: String, sessionId: String) {
         applyOrBufferSequenced(SequencedDelta.SessionDeleted(seq, solutionId, sessionId))
+    }
+
+    fun onSessionMetricsChanged(
+        sessionId: String, lastActivityAt: Long?, totalTokens: Long?, maxTokens: Long?
+    ) {
+        scope.launch {
+            snapshotMutex.withLock {
+                val cur = _state.value as? WorkspaceUiState.Loaded ?: return@withLock
+                val newSolutions = cur.snapshot.solutions.map { sol ->
+                    val sIdx = sol.sessions.indexOfFirst { it.id == sessionId }
+                    if (sIdx < 0) sol else sol.copy(
+                        sessions = sol.sessions.toMutableList().also {
+                            it[sIdx] = it[sIdx].copy(
+                                lastActivityAt = lastActivityAt ?: it[sIdx].lastActivityAt,
+                                totalTokens = totalTokens ?: it[sIdx].totalTokens,
+                                maxTokens = maxTokens ?: it[sIdx].maxTokens,
+                            )
+                        }
+                    )
+                }
+                _state.value = WorkspaceUiState.Loaded(
+                    cur.snapshot.copy(solutions = newSolutions), stale = false,
+                )
+            }
+        }
+    }
+
+    suspend fun refreshClosedSolutions() {
+        _closedSolutions.value = UiData.Loading
+        _closedSolutions.value = UiData.Loaded(client.fetchClosedSolutions())
     }
 
     // ---- internals ----

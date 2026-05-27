@@ -1,6 +1,7 @@
 package ru.sipaha.spkremote.app.vm
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -208,14 +209,55 @@ class WorkspaceStoreTest {
         assertEquals(9L, state.snapshot.seq)
         assertEquals(false, state.stale)
     }
+
+    @Test
+    fun metrics_patch_updates_only_known_session_and_does_not_advance_seq() = runTest {
+        val fake = FakeWorkspaceClient(
+            snapshotResult = WorkspaceSnapshotVM(
+                seq = 5,
+                solutions = listOf(OpenSolutionVM("s1", "a", 0, listOf(
+                    OpenSessionVM("se1", "t", SessionStateDto.Idle, 0L, null, null)
+                )))
+            )
+        )
+        val store = WorkspaceStore(client = fake, scope = backgroundScope)
+        store.refresh(); advanceUntilIdle()
+
+        store.onSessionMetricsChanged(sessionId = "se1", lastActivityAt = 7777L, totalTokens = 99L, maxTokens = null)
+        store.onSessionMetricsChanged(sessionId = "UNKNOWN", lastActivityAt = 0L, totalTokens = 0L, maxTokens = null)
+        runCurrent()
+
+        val state = store.state.value as WorkspaceUiState.Loaded
+        assertEquals(5L, state.snapshot.seq, "metrics must not advance seq")
+        val ses = state.snapshot.solutions[0].sessions[0]
+        assertEquals(7777L, ses.lastActivityAt)
+        assertEquals(99L, ses.totalTokens)
+    }
+
+    @Test
+    fun refresh_closed_solutions_populates_picker() = runTest {
+        val fake = FakeWorkspaceClient(
+            closedListResult = listOf(
+                ClosedSolutionRow("c1", "frozen", 2, lastOpenedAt = null)
+            ),
+        )
+        val store = WorkspaceStore(client = fake, scope = backgroundScope)
+        store.refreshClosedSolutions()
+        advanceUntilIdle()
+
+        val list = (store.closedSolutions.value as UiData.Loaded).value
+        assertEquals(1, list.size)
+        assertEquals("c1", list[0].id)
+    }
 }
 
 /** Minimal in-memory mock of the wire client. Fill in surface as needed. */
 open class FakeWorkspaceClient(
     val snapshotResult: WorkspaceSnapshotVM = WorkspaceSnapshotVM(0, emptyList()),
+    val closedListResult: List<ClosedSolutionRow> = emptyList(),
 ) : WorkspaceClient {
     override suspend fun fetchSnapshot(): WorkspaceSnapshotVM = snapshotResult
-    // ... add lifecycle calls / closed list etc. in later tasks.
+    override suspend fun fetchClosedSolutions(): List<ClosedSolutionRow> = closedListResult
 }
 
 /** Minimal valid SolutionSummary for tests that don't care about specifics. */
