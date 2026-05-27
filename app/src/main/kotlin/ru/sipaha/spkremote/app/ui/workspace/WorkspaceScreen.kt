@@ -1,19 +1,27 @@
 package ru.sipaha.spkremote.app.ui.workspace
 
+import android.text.format.DateUtils
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import ru.sipaha.spkremote.app.ui.solutions.StatePill
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.app.vm.OpenSessionVM
 import ru.sipaha.spkremote.app.vm.OpenSolutionVM
 import ru.sipaha.spkremote.app.vm.WorkspaceUiState
+import ru.sipaha.spkremote.core.displayState
 
 @OptIn(ExperimentalMaterial3Api::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -110,9 +118,6 @@ private fun WorkspaceList(
     }
 }
 
-// (SolutionHeader, SessionRow, NewConsoleRow, ExpandableFab, EmptyState, ErrorState,
-//  LoadingState, StaleProgressBar — implemented in Task D2.)
-
 @Composable
 private fun SolutionHeader(
     sol: OpenSolutionVM,
@@ -120,7 +125,59 @@ private fun SolutionHeader(
     onCloseSolution: () -> Unit,
     onDeleteSolution: () -> Unit,
 ) {
-    TODO("D2")
+    var menuExpanded by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    var confirmClose by remember { mutableStateOf(false) }
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(sol.name, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    text = "${sol.memberCount} ${if (sol.memberCount == 1) "member" else "members"}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = { menuExpanded = true }) {
+                Icon(Icons.Filled.MoreVert, contentDescription = "Solution menu")
+            }
+            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                DropdownMenuItem(text = { Text("Projects") }, onClick = { menuExpanded = false; onOpenProjects() })
+                DropdownMenuItem(text = { Text("Close solution") }, onClick = { menuExpanded = false; confirmClose = true })
+                DropdownMenuItem(text = { Text("Delete solution") }, onClick = { menuExpanded = false; confirmDelete = true })
+            }
+        }
+    }
+    if (confirmClose) {
+        AlertDialog(
+            onDismissRequest = { confirmClose = false },
+            title = { Text("Close solution?") },
+            text = { Text("Terminate the agents and terminals for \"${sol.name}\". Session conversations are preserved.") },
+            confirmButton = { TextButton(onClick = { confirmClose = false; onCloseSolution() }) { Text("Close") } },
+            dismissButton = { TextButton(onClick = { confirmClose = false }) { Text("Cancel") } },
+        )
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete solution?") },
+            text = { Text("Delete \"${sol.name}\" and remove all its session conversations from the computer. This can't be undone.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmDelete = false; onDeleteSolution() },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
 }
 
 @Composable
@@ -130,45 +187,126 @@ private fun SessionRow(
     onCloseConsole: () -> Unit,
     onDeleteSession: () -> Unit,
 ) {
-    TODO("D2")
+    var menuExpanded by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(session.title.ifBlank { "(untitled session)" }, style = MaterialTheme.typography.titleSmall)
+            Row {
+                StatePill(state = session.state.displayState(), raw = "")
+                Text(
+                    text = " · ${relativeTime(session.lastActivityAt)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        IconButton(onClick = { menuExpanded = true }) {
+            Icon(Icons.Filled.MoreVert, contentDescription = "Session menu")
+        }
+        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+            DropdownMenuItem(text = { Text("Close console") }, onClick = { menuExpanded = false; onCloseConsole() })
+            DropdownMenuItem(text = { Text("Delete session") }, onClick = { menuExpanded = false; confirmDelete = true })
+        }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("Delete session?") },
+            text = { Text("Permanently delete \"${session.title.ifBlank { "this session" }}\" and its conversation. This can't be undone.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmDelete = false; onDeleteSession() },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
+        )
+    }
 }
 
 @Composable
-private fun NewConsoleRow(
-    onClick: () -> Unit,
-) {
-    TODO("D2")
+private fun NewConsoleRow(onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.width(8.dp))
+        Text("New console", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
+    }
 }
 
 @Composable
-private fun ExpandableFab(
-    onCreateNew: () -> Unit,
-    onOpenPicker: () -> Unit,
-) {
-    TODO("D2")
+private fun ExpandableFab(onCreateNew: () -> Unit, onOpenPicker: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Column(horizontalAlignment = Alignment.End) {
+        if (expanded) {
+            ExtendedFloatingActionButton(
+                onClick = { expanded = false; onCreateNew() },
+                icon = { Icon(Icons.Filled.Add, null) },
+                text = { Text("New solution") },
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+            ExtendedFloatingActionButton(
+                onClick = { expanded = false; onOpenPicker() },
+                icon = { Icon(Icons.Filled.FolderOpen, null) },
+                text = { Text("Open closed solution…") },
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+        FloatingActionButton(onClick = { expanded = !expanded }) {
+            Icon(if (expanded) Icons.Filled.Close else Icons.Filled.Add, contentDescription = "Expand actions")
+        }
+    }
 }
 
 @Composable
-private fun EmptyState(
-    onOpenPicker: () -> Unit,
-    onCreateNew: () -> Unit,
-) {
-    TODO("D2")
+private fun EmptyState(onOpenPicker: () -> Unit, onCreateNew: () -> Unit) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("No open solutions", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Tap + to create a new one or open an existing one.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 @Composable
-private fun ErrorState(
-    message: String,
-) {
-    TODO("D2")
-}
+private fun LoadingState() = Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
 
 @Composable
-private fun LoadingState() {
-    TODO("D2")
-}
+private fun ErrorState(msg: String) = Box(Modifier.fillMaxSize().padding(24.dp), Alignment.Center) { Text(msg) }
 
 @Composable
-private fun StaleProgressBar() {
-    TODO("D2")
+private fun StaleProgressBar() = LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+
+/**
+ * Format `last_activity_at` (epoch millis) into a relative string like "5m ago".
+ *
+ * TODO(post-G1): extract to ui/util/ once SolutionDetailScreen is removed.
+ * Copied verbatim from `SolutionDetailScreen.kt` so this file stands alone;
+ * G1 deletes that screen so the duplicate naturally dies later.
+ */
+private fun relativeTime(epochMillis: Long): String {
+    if (epochMillis <= 0L) return ""
+    val now = System.currentTimeMillis()
+    return DateUtils.getRelativeTimeSpanString(
+        epochMillis,
+        now,
+        DateUtils.SECOND_IN_MILLIS,
+        DateUtils.FORMAT_ABBREV_RELATIVE,
+    ).toString()
 }
