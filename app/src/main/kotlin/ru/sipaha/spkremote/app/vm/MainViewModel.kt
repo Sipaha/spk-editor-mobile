@@ -455,7 +455,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
      * mirror picks up the removal via the `workspace.solution_deleted`
      * notification, so no manual list-refresh is needed.
      */
-    fun deleteSolution(solutionId: String) = catalogStore.deleteSolution(solutionId)
+    fun deleteSolution(solutionId: String) {
+        // Optimistic drop from the closed-solutions picker so the row vanishes
+        // immediately. The server confirms via workspace.solution_deleted which
+        // re-runs the same drop inside WorkspaceStore.applyDelta (idempotent
+        // on an already-gone row). If the RPC fails the row reappears on the
+        // next picker open.
+        workspaceStore.dropClosedSolutionRow(solutionId)
+        catalogStore.deleteSolution(solutionId)
+    }
     /**
      * Create a new empty solution named [name]. The workspace mirror picks
      * up the new solution via the `workspace.solution_opened` delta —

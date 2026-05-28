@@ -296,7 +296,35 @@ class WorkspaceStore(
 
     suspend fun refreshClosedSolutions() {
         _closedSolutions.value = UiData.Loading
-        _closedSolutions.value = UiData.Loaded(client.fetchClosedSolutions())
+        _closedSolutions.value = UiData.Loaded(client.fetchClosedSolutions().sortedByLastOpenedDesc())
+    }
+
+    /**
+     * Sort closed-solution rows by [ClosedSolutionRow.lastOpenedAt] descending
+     * — most-recently-touched solutions first, nulls (no recorded activity)
+     * sink to the bottom. `lastOpenedAt` is RFC3339 on the wire so byte-wise
+     * string compare is equivalent to chronological compare; we use the raw
+     * string to avoid parsing per element.
+     */
+    private fun List<ClosedSolutionRow>.sortedByLastOpenedDesc(): List<ClosedSolutionRow> =
+        sortedWith(
+            compareByDescending<ClosedSolutionRow> { it.lastOpenedAt != null }
+                .thenByDescending { it.lastOpenedAt.orEmpty() },
+        )
+
+    /**
+     * Optimistic local removal of a closed-solution row. Called by the picker
+     * the moment the user taps Delete on an entry — the server later confirms
+     * via the `workspace.solution_deleted` notification (which also runs
+     * through this path inside [applyDelta]). Idempotent on a row that's
+     * already gone, so the duplicate from the delta is harmless.
+     */
+    fun dropClosedSolutionRow(solutionId: String) {
+        val current = _closedSolutions.value as? UiData.Loaded ?: return
+        val pruned = current.value.filterNot { it.id == solutionId }
+        if (pruned.size != current.value.size) {
+            _closedSolutions.value = UiData.Loaded(pruned)
+        }
     }
 
     // ---- internals ----
@@ -426,6 +454,14 @@ class WorkspaceStore(
                     is SequencedDelta.SolutionDeleted -> d.solutionId
                 }
                 newSolutions.removeAll { it.id == id }
+                // Mirror the deletion into the closed-solutions picker list:
+                // a deleted solution is gone from both surfaces. Closed-only
+                // (not-deleted) transitions don't touch this list — the
+                // server's next list_solutions(open=false) will populate it
+                // when the user reopens the picker.
+                if (d is SequencedDelta.SolutionDeleted) {
+                    dropClosedSolutionRow(id)
+                }
             }
             is SequencedDelta.SessionOpened -> {
                 val idx = newSolutions.indexOfFirst { it.id == d.solutionId }
