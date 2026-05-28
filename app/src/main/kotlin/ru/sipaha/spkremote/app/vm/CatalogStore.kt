@@ -8,7 +8,6 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import ru.sipaha.spkremote.core.CatalogProjectInfo
-import ru.sipaha.spkremote.core.CreateSolutionResult
 import ru.sipaha.spkremote.core.GetSolutionResult
 import ru.sipaha.spkremote.core.MemberAddCompletedPayload
 import ru.sipaha.spkremote.core.MemberAddProgressPayload
@@ -73,14 +72,12 @@ internal class CatalogStore(
     }
 
     /**
-     * Create a new (empty) solution named [name] on the server, then
-     * immediately open it so the workspace mirror surfaces the row
-     * (and a desktop window comes up). `solutions.create` itself only
-     * creates a closed entry on disk; the desktop Welcome screen
-     * chains the same create → open call for the same reason. Without
-     * the explicit `workspace.open_solution` follow-up the new
-     * solution stays in the closed-picker only and the user sees
-     * nothing happen on either side after they tap Create.
+     * Create a new (empty) solution named [name] on the server. The
+     * backend `solutions.create` tool auto-opens the new solution
+     * (mark_open + sequenced `workspace.solution_opened` notification)
+     * so the workspace mirror picks it up via the standard delta
+     * applier — no client-side chain to `workspace.open_solution`
+     * needed.  Failures surface through the shared error channel.
      */
     fun createSolution(name: String) {
         val active = context.activeClient()
@@ -90,33 +87,12 @@ internal class CatalogStore(
         }
         val params = buildJsonObject { put("name", name) }
         scope.launch {
-            val outcome = runCatching { active.call("remote.solutions.create", params) }
+            runCatching { active.call("remote.solutions.create", params) }
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
                     val toolErr = resp.toolError()
                     if (toolErr != null) error(toolErr)
-                    resp.decodeResultOrThrow(CreateSolutionResult.serializer())
-                }
-            outcome
-                .onSuccess { result ->
-                    val openParams = buildJsonObject { put("solution_id", result.solutionId) }
-                    runCatching { active.call("remote.workspace.open_solution", openParams) }
-                        .mapCatching { resp ->
-                            val err = resp.error
-                            if (err != null) error(err.message)
-                            val toolErr = resp.toolError()
-                            if (toolErr != null) error(toolErr)
-                        }
-                        .onFailure {
-                            // Create succeeded; only the open follow-up
-                            // failed. Surface as a softer error so the user
-                            // knows the solution exists in the closed
-                            // picker even though it didn't auto-open.
-                            context.emitError(
-                                "Solution created but couldn't open it: ${it.message ?: "?"}",
-                            )
-                        }
                 }
                 .onFailure { context.emitError("Couldn't create solution: ${it.message ?: "?"}") }
         }
