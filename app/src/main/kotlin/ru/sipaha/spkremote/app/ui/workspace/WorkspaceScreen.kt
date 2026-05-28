@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Add
@@ -18,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -200,12 +202,13 @@ private fun SolutionHeader(
                 text = "${sol.memberCount}",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
-                modifier = Modifier.weight(1f),
             )
-            IconButton(onClick = { menuExpanded = true }) {
-                Icon(Icons.Filled.MoreVert, contentDescription = "Solution menu")
-            }
-            DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+            Spacer(Modifier.weight(1f))
+            KebabMenuButton(
+                contentDescription = "Solution menu",
+                expanded = menuExpanded,
+                onExpandedChange = { menuExpanded = it },
+            ) {
                 DropdownMenuItem(text = { Text("Projects") }, onClick = { menuExpanded = false; onOpenProjects() })
                 DropdownMenuItem(text = { Text("Close solution") }, onClick = { menuExpanded = false; confirmClose = true })
                 DropdownMenuItem(text = { Text("Delete solution") }, onClick = { menuExpanded = false; confirmDelete = true })
@@ -264,7 +267,10 @@ private fun SessionRow(
             style = MaterialTheme.typography.bodyMedium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f, fill = false),
+            // weight(1f) (fill = true) makes the title eat all remaining width
+            // so the pill / time / kebab align flush to the right edge — without
+            // it short titles let the meta cluster float in the middle.
+            modifier = Modifier.weight(1f),
         )
         Spacer(Modifier.width(8.dp))
         StatePill(state = session.state.displayState(), raw = "")
@@ -276,10 +282,11 @@ private fun SessionRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        IconButton(onClick = { menuExpanded = true }) {
-            Icon(Icons.Filled.MoreVert, contentDescription = "Session menu")
-        }
-        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+        KebabMenuButton(
+            contentDescription = "Session menu",
+            expanded = menuExpanded,
+            onExpandedChange = { menuExpanded = it },
+        ) {
             DropdownMenuItem(text = { Text("Close console") }, onClick = { menuExpanded = false; onCloseConsole() })
             DropdownMenuItem(text = { Text("Delete session") }, onClick = { menuExpanded = false; confirmDelete = true })
         }
@@ -304,17 +311,17 @@ private fun SessionRow(
 private fun NewConsoleRow(onClick: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
-            .padding(start = 28.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
+            .padding(start = 28.dp, end = 16.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
             imageVector = Icons.Filled.Add,
             contentDescription = null,
-            modifier = Modifier.size(14.dp),
+            modifier = Modifier.size(18.dp),
             tint = MaterialTheme.colorScheme.primary,
         )
         Spacer(Modifier.width(10.dp))
-        Text("New console", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
+        Text("New console", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
     }
 }
 
@@ -372,6 +379,42 @@ private fun ErrorState(msg: String) = Box(Modifier.fillMaxSize().padding(24.dp),
 
 @Composable
 private fun StaleProgressBar() = LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+
+/**
+ * Compact 36-dp kebab trigger. [IconButton]'s baked-in 40 dp visual + 48 dp
+ * touch target made every row at least 48 dp tall — too roomy for a dense
+ * list. This is a manual clickable Box at 36 dp (still above Material's
+ * 32 dp small-component threshold) plus its anchored [DropdownMenu].
+ */
+@Composable
+private fun KebabMenuButton(
+    contentDescription: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    menuContent: @Composable () -> Unit,
+) {
+    Box {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .clickable { onExpandedChange(true) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.MoreVert,
+                contentDescription = contentDescription,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { onExpandedChange(false) },
+        ) {
+            menuContent()
+        }
+    }
+}
 
 /**
  * Format `last_activity_at` (epoch millis) into a relative string like "5m ago".
