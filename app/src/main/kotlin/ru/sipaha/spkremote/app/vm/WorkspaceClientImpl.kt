@@ -30,7 +30,7 @@ internal class WorkspaceClientImpl(
 
     override suspend fun fetchSnapshot(): WorkspaceSnapshotVM {
         val client = getClient() ?: error("Not connected")
-        val resp = client.call("workspace.snapshot", buildJsonObject {})
+        val resp = client.call("remote.workspace.snapshot", buildJsonObject {})
         val raw = resp.decodeResultOrThrow(WorkspaceSnapshot.serializer())
         return raw.toVM()
     }
@@ -38,7 +38,7 @@ internal class WorkspaceClientImpl(
     override suspend fun fetchClosedSolutions(): List<ClosedSolutionRow> {
         val client = getClient() ?: error("Not connected")
         val resp = client.call(
-            "workspace.list_solutions",
+            "remote.workspace.list_solutions",
             buildJsonObject { put("open", false) },
         )
         val raw = resp.decodeResultOrThrow(WorkspaceListSolutionsResult.serializer())
@@ -53,16 +53,16 @@ internal class WorkspaceClientImpl(
     }
 
     override suspend fun openSolution(id: String): Long =
-        lifecycleCall("workspace.open_solution", "solution_id", id)
+        lifecycleCall("remote.workspace.open_solution", "solution_id", id)
 
     override suspend fun closeSolution(id: String): Long =
-        lifecycleCall("workspace.close_solution", "solution_id", id)
+        lifecycleCall("remote.workspace.close_solution", "solution_id", id)
 
     override suspend fun openSession(id: String): Long =
-        lifecycleCall("workspace.open_session", "session_id", id)
+        lifecycleCall("remote.workspace.open_session", "session_id", id)
 
     override suspend fun closeSession(id: String): Long =
-        lifecycleCall("workspace.close_session", "session_id", id)
+        lifecycleCall("remote.workspace.close_session", "session_id", id)
 
     private suspend fun lifecycleCall(
         toolName: String,

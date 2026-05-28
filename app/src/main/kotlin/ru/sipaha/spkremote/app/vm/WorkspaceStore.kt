@@ -340,7 +340,21 @@ class WorkspaceStore(
             // gap still remains after replay, we re-fetch immediately rather
             // than leaving stale state until the next incoming delta.
             while (true) {
-                val snap = client.fetchSnapshot()
+                // Catch RPC / transport failures here so a server error (e.g.
+                // "method not found" against an older desktop, or a dropped
+                // connection mid-fetch) degrades to UiData.Error rather than
+                // bubbling up through viewModelScope and crashing the app.
+                // We KEEP pending intact on failure — a subsequent successful
+                // resync will replay them.
+                val snap = try {
+                    client.fetchSnapshot()
+                } catch (t: Throwable) {
+                    val message = t.message ?: t.javaClass.simpleName
+                    if (_state.value !is WorkspaceUiState.Loaded) {
+                        _state.value = WorkspaceUiState.Error(message)
+                    }
+                    return
+                }
                 var s = snap
                 // Replay buffered deltas with seq > snap.seq, contiguous run only.
                 val drained = pending.toList()
