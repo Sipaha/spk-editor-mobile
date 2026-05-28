@@ -3,6 +3,8 @@ package ru.sipaha.spkremote.app.ui.solutions
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
+import androidx.core.graphics.createBitmap
+import java.util.Locale
 import android.provider.OpenableColumns
 import android.util.Base64
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -112,6 +114,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -156,6 +159,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import ru.sipaha.spkremote.app.vm.DeferredUpload
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.app.vm.PendingUploadProgress
+import ru.sipaha.spkremote.app.vm.PickedAttachment
 import ru.sipaha.spkremote.app.vm.UiData
 import ru.sipaha.spkremote.app.vm.UploadManager
 import ru.sipaha.spkremote.core.ConnectionState
@@ -489,6 +493,9 @@ fun SessionDetailScreen(
                     initialDraft = seedText,
                     seedLoaded = seedLoaded,
                     onDraftChanged = { text -> viewModel.saveDraft(sessionId, text) },
+                    onDraftFlush = { text -> viewModel.flushDraft(sessionId, text) },
+                    initialAttachments = { viewModel.pickedAttachments(sessionId) },
+                    onAttachmentsChanged = { viewModel.setPickedAttachments(sessionId, it) },
                     onStartUpload = { uri, sid, mime, name, size ->
                         viewModel.startAttachmentUpload(uri, sid, mime, name, size)
                     },
@@ -1159,7 +1166,7 @@ private fun userBubbleStatusFor(
 
 /** Pretty-print bytes as "N.N MB" / "NN KB" / "NNN B" for the bubble badge. */
 private fun formatBytes(b: Long): String = when {
-    b >= 1024L * 1024L -> String.format("%.1f MB", b / (1024.0 * 1024.0))
+    b >= 1024L * 1024L -> String.format(Locale.ROOT, "%.1f MB", b / (1024.0 * 1024.0))
     b >= 1024L -> "${b / 1024L} KB"
     else -> "$b B"
 }
@@ -2213,7 +2220,7 @@ private fun bitmapPainterFromBase64(data: String): Painter {
 }
 
 private fun emptyBitmapPainter(): Painter {
-    val bm = android.graphics.Bitmap.createBitmap(1, 1, android.graphics.Bitmap.Config.ARGB_8888)
+    val bm = createBitmap(1, 1)
     return BitmapPainter(bm.asImageBitmap())
 }
 
@@ -2289,7 +2296,7 @@ private fun ToolCallBubble(
                     val startedAt: Long? = call.toolStatusStartedAtMs
                     if (startedAt != null && call.status == ToolCallStatusDto.Running) {
                         var elapsedSeconds by remember(startedAt) {
-                            mutableStateOf(((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(0L))
+                            mutableLongStateOf(((System.currentTimeMillis() - startedAt) / 1000L).coerceAtLeast(0L))
                         }
                         LaunchedEffect(startedAt, call.status) {
                             if (call.status != ToolCallStatusDto.Running) return@LaunchedEffect
@@ -2687,6 +2694,19 @@ private fun ComposeBar(
     seedLoaded: Boolean,
     onDraftChanged: suspend (String) -> Unit,
     /**
+     * Synchronous flush of the current draft text, called when the
+     * compose bar leaves composition (back-nav). The debounced
+     * `onDraftChanged` writer above only fires on the trailing edge of a
+     * 500 ms quiet window, so a keystroke followed within < 500 ms by a
+     * back-press never made it to disk and the user saw their draft
+     * vanish on reopen.
+     */
+    onDraftFlush: (String) -> Unit,
+    /** Initial picked-attachment list, hydrated from the per-session store. */
+    initialAttachments: () -> List<PickedAttachment>,
+    /** Mirror every mutation of the picked-attachment list back to the store. */
+    onAttachmentsChanged: (List<PickedAttachment>) -> Unit,
+    /**
      * Kick off a fresh chunked upload for [uri]. Returns the local key
      * (used for cancel / forget) + the StateFlow the preview card
      * collects to drive progress UI.
@@ -2726,12 +2746,22 @@ private fun ComposeBar(
 ) {
     val context = LocalContext.current
     val composeScope = rememberCoroutineScope()
-    // Live, non-persisted V1: attachments survive config changes (would
-    // need to round-trip Uri/displayName/mime through Bundle, doable but
-    // out of scope) but are dropped on process death. The expected flow
-    // is "pick → optionally type → Send" within seconds.
+    // Live, non-persisted V1: attachments survive config changes AND
+    // back-nav within the same process (via [SessionDetailStore]'s
+    // per-session map provided through `initialAttachments` +
+    // `onAttachmentsChanged`; the previous composable-local `remember`
+    // reset to empty on every chat-screen remount, so a user who
+    // attached a file, hit Back, and reopened the chat lost their picks).
+    // Process death still drops them — round-tripping Uri/displayName/
+    // mime/upload localKey through disk is doable but out of scope.
     var pickedAttachments by remember(sessionId) {
-        mutableStateOf<List<PickedAttachment>>(emptyList())
+        mutableStateOf(initialAttachments())
+    }
+    // Mirror every list mutation into the store so a subsequent
+    // back→reopen on the same session re-hydrates from the same list.
+    LaunchedEffect(sessionId) {
+        androidx.compose.runtime.snapshotFlow { pickedAttachments }
+            .collect { onAttachmentsChanged(it) }
     }
     var showAttachSheet by remember { mutableStateOf(false) }
     val attachSheetState = rememberModalBottomSheetState()
@@ -2827,6 +2857,12 @@ private fun ComposeBar(
             .debounce(500)
             .distinctUntilChanged()
             .collect { text -> onDraftChanged(text) }
+    }
+    // Flush the trailing keystrokes synchronously when the compose bar
+    // leaves composition (back-nav). Without this the debounced writer
+    // misses anything typed within 500 ms of the back-press.
+    DisposableEffect(sessionId) {
+        onDispose { onDraftFlush(draft) }
     }
     val isRunning = state == DisplayState.Running
     // Stopping is the post-cancel transient state — the server is settling
@@ -3067,70 +3103,70 @@ private fun ComposeBar(
                         val attachments = pickedAttachments
                         if (toSendText.isEmpty() && attachments.isEmpty()) return@FilledIconButton
 
-                            // Branch on whether every attachment is
-                            // already Done. If so, fire the existing
-                            // single-shot path — the optimistic bubble
-                            // transitions straight to "Sending →
-                            // Delivered". If any upload is still in
-                            // flight, route through the deferred path:
-                            // the bubble appears immediately with an
-                            // "Uploading X/Y" badge and the store
-                            // dispatches send_message_blocks once
-                            // every upload terminates Done. Failed
-                            // attachments are already blocked by
-                            // [sendEnabled].
-                            val allDone = attachments.isNotEmpty() &&
-                                attachments.all {
-                                    it.uploadState.value is UploadManager.State.Done
-                                }
-                            if (attachments.isEmpty() || allDone) {
-                                composeScope.launch {
-                                    val blocks = mutableListOf<ContentBlockDto>()
-                                    for (item in attachments) {
-                                        val handle = awaitUploadTerminal(item.localKey)
-                                        if (handle == null) {
-                                            onAttachmentError(
-                                                "`${item.displayName}` failed to upload — drop it and retry",
-                                            )
-                                            continue
-                                        }
-                                        blocks += ContentBlockDto.ResourceLink(
-                                            name = item.displayName,
-                                            uri = handle,
+                        // Branch on whether every attachment is
+                        // already Done. If so, fire the existing
+                        // single-shot path — the optimistic bubble
+                        // transitions straight to "Sending →
+                        // Delivered". If any upload is still in
+                        // flight, route through the deferred path:
+                        // the bubble appears immediately with an
+                        // "Uploading X/Y" badge and the store
+                        // dispatches send_message_blocks once
+                        // every upload terminates Done. Failed
+                        // attachments are already blocked by
+                        // [sendEnabled].
+                        val allDone = attachments.isNotEmpty() &&
+                            attachments.all {
+                                it.uploadState.value is UploadManager.State.Done
+                            }
+                        if (attachments.isEmpty() || allDone) {
+                            composeScope.launch {
+                                val blocks = mutableListOf<ContentBlockDto>()
+                                for (item in attachments) {
+                                    val handle = awaitUploadTerminal(item.localKey)
+                                    if (handle == null) {
+                                        onAttachmentError(
+                                            "`${item.displayName}` failed to upload — drop it and retry",
                                         )
+                                        continue
                                     }
-                                    if (toSendText.isEmpty() && blocks.isEmpty()) return@launch
-                                    onSend(toSendText, blocks)
-                                    attachments.forEach { onForgetUpload(it.localKey) }
-                                    draft = ""
-                                    pickedAttachments = emptyList()
+                                    blocks += ContentBlockDto.ResourceLink(
+                                        name = item.displayName,
+                                        uri = handle,
+                                    )
                                 }
-                            } else {
-                                // Deferred path. We pass DeferredUpload
-                                // descriptors to the store (NOT the
-                                // StateFlows themselves, since the
-                                // store doesn't know about the
-                                // collector — it dereferences localKey
-                                // through the upload manager). The
-                                // store's `cleanupDeferred` calls
-                                // `uploadManager.forget(localKey)` for
-                                // every attachment on both success and
-                                // failure terminals, so no manual
-                                // forget here — same net effect as the
-                                // all-Done path above.
-                                onSendDeferred(
-                                    toSendText,
-                                    attachments.map {
-                                        DeferredUpload(
-                                            localKey = it.localKey,
-                                            displayName = it.displayName,
-                                            mime = it.mimeType,
-                                        )
-                                    },
-                                )
+                                if (toSendText.isEmpty() && blocks.isEmpty()) return@launch
+                                onSend(toSendText, blocks)
+                                attachments.forEach { onForgetUpload(it.localKey) }
                                 draft = ""
                                 pickedAttachments = emptyList()
                             }
+                        } else {
+                            // Deferred path. We pass DeferredUpload
+                            // descriptors to the store (NOT the
+                            // StateFlows themselves, since the
+                            // store doesn't know about the
+                            // collector — it dereferences localKey
+                            // through the upload manager). The
+                            // store's `cleanupDeferred` calls
+                            // `uploadManager.forget(localKey)` for
+                            // every attachment on both success and
+                            // failure terminals, so no manual
+                            // forget here — same net effect as the
+                            // all-Done path above.
+                            onSendDeferred(
+                                toSendText,
+                                attachments.map {
+                                    DeferredUpload(
+                                        localKey = it.localKey,
+                                        displayName = it.displayName,
+                                        mime = it.mimeType,
+                                    )
+                                },
+                            )
+                            draft = ""
+                            pickedAttachments = emptyList()
+                        }
                         },
                     enabled = sendEnabled,
                 ) {
@@ -3180,25 +3216,9 @@ private fun ComposeBar(
     }
 }
 
-/**
- * Live (non-persisted) representation of one file the user has picked
- * for attaching AND for which an upload has been started. URI is the
- * canonical handle — the actual bytes stream through [UploadManager]
- * over the WebSocket binary-frame path, not the old
- * "readBytes into base64" route.
- *
- * [localKey] is the [UploadManager]-assigned identifier used for
- * cancel / forget. [uploadState] is the per-upload StateFlow the
- * preview card collects to drive progress / Done / Failed UI.
- */
-data class PickedAttachment(
-    val uri: Uri,
-    val displayName: String,
-    val mimeType: String,
-    val sizeBytes: Long,
-    val localKey: String,
-    val uploadState: StateFlow<UploadManager.State>,
-)
+// PickedAttachment now lives in `ru.sipaha.spkremote.app.vm.PickedAttachment`
+// so [SessionDetailStore] can keep a per-session draft list across the
+// chat-detail composable's unmount/remount cycle on back-navigation.
 
 /**
  * Lightweight intermediate the picker callbacks emit from the
@@ -3773,7 +3793,7 @@ internal fun formatElapsed(secs: Long): String {
 internal fun RunningElapsed(displayState: DisplayState, stateStartedAtMs: Long?) {
     if (displayState != DisplayState.Running || stateStartedAtMs == null) return
     var elapsedSeconds by remember(stateStartedAtMs) {
-        mutableStateOf(
+        mutableLongStateOf(
             ((System.currentTimeMillis() - stateStartedAtMs) / 1000L).coerceAtLeast(0L)
         )
     }
@@ -3830,7 +3850,7 @@ private fun ConnectionBanner(state: ConnectionState, lastConnectedMs: Long?) {
             MaterialTheme.colorScheme.onTertiaryContainer
         }
 
-        var now by remember { mutableStateOf(System.currentTimeMillis()) }
+        var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
         LaunchedEffect(lastConnectedMs) {
             if (lastConnectedMs == null) return@LaunchedEffect
             while (true) {
@@ -3898,7 +3918,7 @@ private fun ConnectionBanner(state: ConnectionState, lastConnectedMs: Long?) {
 @Composable
 internal fun LastActivityLabel(lastActivityMs: Long?) {
     if (lastActivityMs == null) return
-    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(lastActivityMs) {
         while (true) {
             delay(15_000L)

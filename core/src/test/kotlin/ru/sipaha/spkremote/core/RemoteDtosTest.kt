@@ -42,9 +42,9 @@ class RemoteDtosTest {
         // Unknown extra keys are tolerated (per JsonRpc.json config).
         val extra = JsonRpc.json.decodeFromString(
             CapabilitiesDto.serializer(),
-            """{"protocol_version":"x","wire_schema_version":2,"build":"abc"}""",
+            """{"protocol_version":"x","wire_schema_version":3,"build":"abc"}""",
         )
-        assertEquals(2, extra.wireSchemaVersion)
+        assertEquals(3, extra.wireSchemaVersion)
         assertTrue(isServerTooNew(extra.wireSchemaVersion))
     }
 
@@ -128,7 +128,7 @@ class RemoteDtosTest {
               "root": "/home/spk/.spk/spk-editor",
               "member_count": 4,
               "last_opened_at": "2026-05-16T08:00:00Z",
-              "window_open": true,
+              "open": true,
               "main_window_id": "win-7"
             }
         """.trimIndent()
@@ -138,7 +138,7 @@ class RemoteDtosTest {
         assertEquals("/home/spk/.spk/spk-editor", parsed.root)
         assertEquals(4, parsed.memberCount)
         assertEquals("2026-05-16T08:00:00Z", parsed.lastOpenedAt)
-        assertTrue(parsed.windowOpen)
+        assertTrue(parsed.open)
         assertEquals("win-7", parsed.mainWindowId)
 
         val reencoded = JsonRpc.json.encodeToString(SolutionSummary.serializer(), parsed)
@@ -154,14 +154,14 @@ class RemoteDtosTest {
               "name": "Other",
               "root": "/tmp/x",
               "member_count": 0,
-              "window_open": false
+              "open": false
             }
         """.trimIndent()
         val parsed = JsonRpc.json.decodeFromString(SolutionSummary.serializer(), text)
         assertNull(parsed.lastOpenedAt)
         assertNull(parsed.mainWindowId)
         assertEquals(0, parsed.memberCount)
-        assertEquals(false, parsed.windowOpen)
+        assertEquals(false, parsed.open)
     }
 
     @Test
@@ -174,7 +174,7 @@ class RemoteDtosTest {
                   "name": "A",
                   "root": "/a",
                   "member_count": 1,
-                  "window_open": true
+                  "open": true
                 },
                 {
                   "id": "sol-b",
@@ -182,7 +182,7 @@ class RemoteDtosTest {
                   "root": "/b",
                   "member_count": 2,
                   "last_opened_at": "2026-05-15T00:00:00Z",
-                  "window_open": false,
+                  "open": false,
                   "main_window_id": "win-2"
                 }
               ]
@@ -1248,6 +1248,17 @@ class RemoteDtosTest {
         val again = JsonRpc.json.decodeFromString(MessageAppendedPayload.serializer(), reencoded)
         assertEquals(parsed, again)
         assertEquals(9876543210L, again.clientSendId)
+    }
+
+    @Test
+    fun agent_session_context_reset_payload_decodes() {
+        val raw = """{"session_id":"se1","context_count":3}"""
+        val p = JsonRpc.json.decodeFromString(
+            AgentSessionContextResetPayload.serializer(),
+            raw,
+        )
+        assertEquals("se1", p.sessionId)
+        assertEquals(3, p.contextCount)
     }
 
     @Test

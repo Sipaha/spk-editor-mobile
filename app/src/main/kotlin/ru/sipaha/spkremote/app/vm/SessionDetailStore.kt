@@ -18,12 +18,16 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import android.net.Uri
+import ru.sipaha.spkremote.app.data.AttachmentDraftRepository
+import ru.sipaha.spkremote.app.data.AttachmentRef
 import ru.sipaha.spkremote.app.data.CachedSessionHistory
 import ru.sipaha.spkremote.app.data.DraftRepository
 import ru.sipaha.spkremote.app.data.PendingSendsRepository
 import ru.sipaha.spkremote.app.data.PersistedPendingAttachment
 import ru.sipaha.spkremote.app.data.PersistedPendingSend
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
+import ru.sipaha.spkremote.core.AgentSessionContextResetPayload
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
 import ru.sipaha.spkremote.core.ContentBlockDto
 import ru.sipaha.spkremote.core.EntryRoleDto
@@ -160,6 +164,8 @@ internal class SessionDetailStore(
     private val scope: CoroutineScope,
     private val context: ConnectionContext,
     private val draftRepository: DraftRepository,
+    private val attachmentDraftRepository: AttachmentDraftRepository,
+    private val uploadManager: UploadManager,
     private val lastSeen: LastSeenIndex,
     private val sessionList: SessionListStore,
     private val sessionHistoryRepository: SessionHistoryRepository,
@@ -634,6 +640,29 @@ internal class SessionDetailStore(
         val openSid = openSessionId ?: return
         if (notifSessionId != null && notifSessionId != openSid) return
         refreshSession(openSid)
+    }
+
+    override fun onSessionContextReset(payload: AgentSessionContextResetPayload) {
+        val openSid = openSessionId ?: return
+        if (payload.sessionId != openSid) return
+        scope.launch {
+            sessionMutex.withLock {
+                // stale-write barrier (see class kdoc invariant 1)
+                if (openSessionId != payload.sessionId) return@withLock
+                // Drop optimistic bubbles tied to the now-wiped context.
+                _optimisticEntries.value = emptyList()
+                optimisticIds.clear()
+                optimisticClientSendIds.clear()
+                // Flip to Loading so the chat shows a clean refresh state
+                // rather than briefly painting the old entries during the
+                // get_session round-trip.
+                _session.value = UiData.Loading
+            }
+            // refreshSession is a full get_session WITHOUT after_index — exactly
+            // what we need: a fresh transcript page (likely empty) replaces the
+            // stale one.
+            refreshSession(payload.sessionId)
+        }
     }
 
     override fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload) {
@@ -2054,7 +2083,89 @@ internal class SessionDetailStore(
         draftRepository.save(sessionId, text)
     }
 
+    /**
+     * Synchronous flush of the draft text. Called from the chat detail
+     * screen's `DisposableEffect.onDispose` so a back-press inside the
+     * 500 ms debounce window of the live `saveDraft` writer doesn't drop
+     * the trailing keystrokes. The underlying [DraftRepository.save] is
+     * `SharedPreferences.edit().apply()` — already non-blocking — so
+     * calling it on the main thread is fine.
+     */
+    fun flushDraft(sessionId: String, text: String) {
+        draftRepository.save(sessionId, text)
+    }
+
     fun clearDraft(sessionId: String) {
         draftRepository.clear(sessionId)
+    }
+
+    // ---- Per-session picked-attachment draft (survives screen remount) ----
+
+    private val pickedAttachmentsBySession = mutableMapOf<String, List<PickedAttachment>>()
+
+    /**
+     * Read the picked-attachment list the user had assembled in the
+     * compose bar for [sessionId] before the screen last left composition
+     * (back-nav OR process death). The in-memory map is consulted first;
+     * on a cold miss the on-disk [AttachmentDraftRepository] is read and
+     * each persisted [AttachmentRef] is joined with the matching
+     * [UploadManager.stateFlowOf] to recover the live progress flow.
+     *
+     * Refs whose `localKey` is no longer known to [UploadManager] (the
+     * upload was cancelled / forgotten between runs) are silently dropped
+     * from the restored list so the user doesn't see a chip stuck at
+     * "Queued" forever.
+     */
+    fun pickedAttachments(sessionId: String): List<PickedAttachment> {
+        val cached = pickedAttachmentsBySession[sessionId]
+        if (cached != null) return cached
+        val refs = attachmentDraftRepository.load(sessionId)
+        if (refs.isEmpty()) return emptyList()
+        val restored = refs.mapNotNull { ref ->
+            val flow = uploadManager.stateFlowOf(ref.localKey) ?: return@mapNotNull null
+            PickedAttachment(
+                uri = Uri.EMPTY,
+                displayName = ref.displayName,
+                mimeType = ref.mimeType,
+                sizeBytes = ref.sizeBytes,
+                localKey = ref.localKey,
+                uploadState = flow,
+            )
+        }
+        pickedAttachmentsBySession[sessionId] = restored
+        // If the persisted list shrank (some uploads vanished), rewrite
+        // disk so the next cold start doesn't re-do the drop work.
+        if (restored.size != refs.size) {
+            persistAttachments(sessionId, restored)
+        }
+        return restored
+    }
+
+    /**
+     * Stash the picked-attachment list for [sessionId]. Empty list removes
+     * the entry so a long-lived `MainViewModel` with many sessions doesn't
+     * leak references to stale [UploadManager.State] flows, AND wipes the
+     * on-disk slot so a follow-up cold start doesn't restore a list the
+     * user already cleared (send-success path).
+     */
+    fun setPickedAttachments(sessionId: String, attachments: List<PickedAttachment>) {
+        if (attachments.isEmpty()) {
+            pickedAttachmentsBySession.remove(sessionId)
+        } else {
+            pickedAttachmentsBySession[sessionId] = attachments
+        }
+        persistAttachments(sessionId, attachments)
+    }
+
+    private fun persistAttachments(sessionId: String, attachments: List<PickedAttachment>) {
+        val refs = attachments.map {
+            AttachmentRef(
+                localKey = it.localKey,
+                displayName = it.displayName,
+                mimeType = it.mimeType,
+                sizeBytes = it.sizeBytes,
+            )
+        }
+        attachmentDraftRepository.save(sessionId, refs)
     }
 }

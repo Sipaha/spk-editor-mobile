@@ -19,6 +19,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -38,9 +39,8 @@ import ru.sipaha.spkremote.app.ui.servers.ServersListScreen
 import ru.sipaha.spkremote.app.ui.settings.CrashLogsScreen
 import ru.sipaha.spkremote.app.ui.settings.SettingsScreen
 import ru.sipaha.spkremote.app.ui.solutions.SessionDetailScreen
-import ru.sipaha.spkremote.app.ui.solutions.SolutionDetailScreen
 import ru.sipaha.spkremote.app.ui.solutions.SolutionProjectsScreen
-import ru.sipaha.spkremote.app.ui.solutions.SolutionsListScreen
+import ru.sipaha.spkremote.app.ui.workspace.WorkspaceScreen
 import ru.sipaha.spkremote.app.vm.ConnectionBanner
 import ru.sipaha.spkremote.app.vm.MainViewModel
 import ru.sipaha.spkremote.app.vm.UiState
@@ -50,13 +50,13 @@ import ru.sipaha.spkremote.app.vm.UiState
  *   pairing                                              — QR + manual URL entry (R-5a/b).
  *   connecting                                           — handshake spinner.
  *   servers                                              — paired-server picker (R-6c-multi, ≥2 servers).
- *   solutions                                            — list of solutions on the paired editor.
- *   solutions/{solutionId}                               — sessions in one solution.
- *   solutions/{solutionId}/sessions/{sessionId}          — chat surface (R-5d).
+ *   workspace                                            — unified open-solutions list (F1).
+ *   workspace/sessions/{sessionId}                       — chat surface (R-5d).
+ *   workspace/solutions/{solutionId}/projects            — solution projects list.
  *
  * The nav graph is the source of truth for navigation. Pairing success is
  * detected via [MainViewModel.state]: when it flips to [UiState.Connected]
- * we push `solutions` onto the back stack (popping any prior pairing entry).
+ * we push `workspace` onto the back stack (popping any prior pairing entry).
  * When it flips back to Disconnected we pop everything except `pairing`.
  *
  * **R-6c-multi:** [initialRoute] picks the cold-start landing destination
@@ -65,7 +65,7 @@ import ru.sipaha.spkremote.app.vm.UiState
  *     surviving VM state to push us forward.
  *   - `"pairing"` (first launch / no servers paired) → identical to the
  *     R-6b unpaired path.
- *   - `"solutions"` (single server) → R-6b auto-resume preserved.
+ *   - `"workspace"` (single server) → R-6b auto-resume preserved.
  *   - `"servers"` (multi-server) → user picks which one to connect to.
  *
  * R-6a adds a persistent banner above the NavHost surfaced from
@@ -83,7 +83,7 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
     // R-6d: persist the resolved nav route on every back-stack change so
     // a cold-start can land the user back on the deepest screen they
     // were on. The route string includes substituted arguments (e.g.
-    // `solutions/abc/sessions/xyz`) — we rebuild that from the entry's
+    // `workspace/sessions/xyz`) — we rebuild that from the entry's
     // NavArguments because Compose-Navigation only exposes the route
     // *template* on `currentDestination`. See [resolvedRoute] below.
     //
@@ -108,7 +108,7 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                 val current = navController.currentDestination?.route
                 if (current == null || current == "pairing" || current == "connecting") {
                     val savedRoute = if (!restored) viewModel.loadSavedRoute() else null
-                    val target = savedRoute?.takeIf { it.startsWith("solutions") } ?: "solutions"
+                    val target = savedRoute?.takeIf { it.startsWith("workspace") } ?: "workspace"
                     restored = true
                     navController.navigate(target) {
                         // Pop to the earliest entry in the back stack —
@@ -127,7 +127,7 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                 // pill on the Servers screen surfaces the connecting
                 // state inline. Pushing the spinner would hide the
                 // useful picker the user just landed on.
-                if (current != "connecting" && current != "solutions" && current != "servers") {
+                if (current != "connecting" && current != "workspace" && current != "servers") {
                     navController.navigate("connecting") {
                         popUpTo(startDestination) { inclusive = false }
                         launchSingleTop = true
@@ -184,7 +184,7 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                 ServersListScreen(
                     viewModel = viewModel,
                     onOpenServer = {
-                        navController.navigate("solutions") {
+                        navController.navigate("workspace") {
                             popUpTo("servers") { inclusive = false }
                             launchSingleTop = true
                         }
@@ -199,14 +199,14 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                     onOpenSettings = { navController.navigate("settings") },
                 )
             }
-            composable("solutions") {
-                SolutionsListScreen(
+            composable("workspace") {
+                WorkspaceScreen(
                     viewModel = viewModel,
-                    onOpenSolution = { sol ->
-                        navController.navigate("solutions/${sol.id}")
+                    onOpenSession = { sessionId ->
+                        navController.navigate("workspace/sessions/$sessionId")
                     },
-                    onOpenSolutionById = { solutionId ->
-                        navController.navigate("solutions/$solutionId")
+                    onOpenProjects = { solutionId ->
+                        navController.navigate("workspace/solutions/$solutionId/projects")
                     },
                     onOpenSettings = { navController.navigate("settings") },
                 )
@@ -229,7 +229,7 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                     },
                     onSwitchServer = {
                         navController.navigate("servers") {
-                            popUpTo("solutions") { inclusive = false }
+                            popUpTo("workspace") { inclusive = false }
                             launchSingleTop = true
                         }
                     },
@@ -240,27 +240,7 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                 CrashLogsScreen(onBack = { navController.popBackStack() })
             }
             composable(
-                route = "solutions/{solutionId}",
-                arguments = listOf(navArgument("solutionId") { type = NavType.StringType }),
-            ) { entry ->
-                val solutionId = entry.arguments?.getString("solutionId").orEmpty()
-                SolutionDetailScreen(
-                    viewModel = viewModel,
-                    solutionId = solutionId,
-                    onOpenSession = { session ->
-                        navController.navigate("solutions/$solutionId/sessions/${session.id}")
-                    },
-                    onOpenSessionById = { sessionId ->
-                        navController.navigate("solutions/$solutionId/sessions/$sessionId")
-                    },
-                    onOpenProjects = { sid ->
-                        navController.navigate("solutions/$sid/projects")
-                    },
-                    onBack = { navController.popBackStack() },
-                )
-            }
-            composable(
-                route = "solutions/{solutionId}/projects",
+                route = "workspace/solutions/{solutionId}/projects",
                 arguments = listOf(navArgument("solutionId") { type = NavType.StringType }),
             ) { entry ->
                 val solutionId = entry.arguments?.getString("solutionId").orEmpty()
@@ -271,23 +251,21 @@ fun AppNav(viewModel: MainViewModel, initialRoute: String? = null) {
                 )
             }
             composable(
-                route = "solutions/{solutionId}/sessions/{sessionId}",
-                arguments = listOf(
-                    navArgument("solutionId") { type = NavType.StringType },
-                    navArgument("sessionId") { type = NavType.StringType },
-                ),
+                route = "workspace/sessions/{sessionId}",
+                arguments = listOf(navArgument("sessionId") { type = NavType.StringType }),
             ) { entry ->
-                val solutionId = entry.arguments?.getString("solutionId").orEmpty()
                 val sessionId = entry.arguments?.getString("sessionId").orEmpty()
                 SessionDetailScreen(
                     viewModel = viewModel,
                     sessionId = sessionId,
                     onBack = { navController.popBackStack() },
-                    // F-phone: chip-row taps navigate sibling-wise within
-                    // the same solution. `launchSingleTop` prevents a
-                    // re-entry on the same id from stacking duplicates.
+                    // F-phone: chip-row taps navigate sibling-wise. The
+                    // unified workspace dropped the per-solution route
+                    // segment, so sibling navigation just swaps the
+                    // sessionId. `launchSingleTop` prevents a re-entry
+                    // on the same id from stacking duplicates.
                     onOpenSibling = { siblingId ->
-                        navController.navigate("solutions/$solutionId/sessions/$siblingId") {
+                        navController.navigate("workspace/sessions/$siblingId") {
                             launchSingleTop = true
                         }
                     },
@@ -347,7 +325,7 @@ private fun ConnectionStateBanner(banner: ConnectionBanner, onRePair: () -> Unit
                 System.currentTimeMillis() + banner.nextRetryMs
             }
             var remainingMs by remember(deadline) {
-                mutableStateOf((deadline - System.currentTimeMillis()).coerceAtLeast(0L))
+                mutableLongStateOf((deadline - System.currentTimeMillis()).coerceAtLeast(0L))
             }
             LaunchedEffect(deadline) {
                 while (remainingMs > 0) {

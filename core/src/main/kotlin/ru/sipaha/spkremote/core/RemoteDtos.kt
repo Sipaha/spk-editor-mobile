@@ -41,8 +41,16 @@ import kotlinx.serialization.json.put
  * NOT gated: the server's contract is to keep emitting decodable shapes
  * within a major version, and every DTO already defaults forward-compat
  * fields. Only `server > supported` blocks the UI.
+ *
+ * **Version history**
+ * - v1: initial versioned wire (structured [SessionStateDto]/[EntryRoleDto]/[ToolCallStatusDto])
+ * - v2: added `workspace.*` notification namespace; renamed
+ *       `SolutionSummary.window_open` → `open`; renamed
+ *       `solution_agent.close_session` →
+ *       `solution_agent.delete_session` (`workspace.close_session` is
+ *       a NEW non-destructive tab-strip-remove tool, not a rename)
  */
-const val SUPPORTED_WIRE_SCHEMA_VERSION: Int = 1
+const val SUPPORTED_WIRE_SCHEMA_VERSION: Int = 2
 
 /**
  * True iff the server advertises a chat-wire schema this client doesn't
@@ -84,7 +92,7 @@ data class SolutionSummary(
     val root: String,
     @SerialName("member_count") val memberCount: Int,
     @SerialName("last_opened_at") val lastOpenedAt: String? = null,
-    @SerialName("window_open") val windowOpen: Boolean,
+    @SerialName("open") val open: Boolean,
     @SerialName("main_window_id") val mainWindowId: String? = null,
 )
 
@@ -532,6 +540,22 @@ data class SessionActiveSubagentsChangedPayload(
     @SerialName("active_subagents") val activeSubagents: List<SubagentDto>,
 )
 
+/**
+ * Server-emitted `agent_session_context_reset` — fires when the desktop
+ * wipes a session's transcript in-place via `/clear` (reset_context) or
+ * `/compact` (rotate_context). The session_id is stable across the swap;
+ * only the entries are gone. Mobile must drop its cached entry list and
+ * re-fetch via `get_session` (no after_index cursor).
+ *
+ * `contextCount` is informational — incremented by /compact, unchanged
+ * by /clear. Both code paths require the same client-side action.
+ */
+@Serializable
+data class AgentSessionContextResetPayload(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("context_count") val contextCount: Int,
+)
+
 @Serializable
 data class MessageAppendedPayload(
     @SerialName("session_id") val sessionId: String,
@@ -706,6 +730,95 @@ fun GetSessionResult.withOptimisticStopping(): GetSessionResult =
 enum class DisplayState { Idle, Running, Stopping, AwaitingInput, Errored, Unknown }
 
 enum class EntryRole { User, Assistant, ToolCall, Plan, Unknown }
+
+// =====================================================================
+// workspace.* DTOs (wire schema v2)
+// =====================================================================
+
+@Serializable
+data class WorkspaceSolution(
+    val id: String,
+    val name: String,
+    val root: String,
+    @SerialName("member_count") val memberCount: Int,
+    @SerialName("last_opened_at") val lastOpenedAt: String? = null,
+    val open: Boolean,
+    @SerialName("main_window_id") val mainWindowId: String? = null,
+    val sessions: List<SessionSummary> = emptyList(),
+)
+
+@Serializable
+data class WorkspaceSnapshot(
+    val seq: Long,
+    val solutions: List<WorkspaceSolution> = emptyList(),
+)
+
+@Serializable
+data class WorkspaceListSolutionsResult(
+    val solutions: List<SolutionSummary> = emptyList(),
+)
+
+@Serializable
+data class WorkspaceSeqAck(val seq: Long)
+
+// Delta payloads (sequenced — every one carries `seq`).
+
+@Serializable
+data class WorkspaceSolutionOpenedPayload(
+    val seq: Long,
+    val solution: SolutionSummary? = null,
+    val sessions: List<SessionSummary> = emptyList(),
+)
+
+@Serializable
+data class WorkspaceSolutionClosedPayload(
+    val seq: Long,
+    @SerialName("solution_id") val solutionId: String,
+)
+
+@Serializable
+data class WorkspaceSolutionDeletedPayload(
+    val seq: Long,
+    @SerialName("solution_id") val solutionId: String,
+)
+
+@Serializable
+data class WorkspaceSessionOpenedPayload(
+    val seq: Long,
+    @SerialName("solution_id") val solutionId: String,
+    val session: SessionSummary,
+)
+
+@Serializable
+data class WorkspaceSessionClosedPayload(
+    val seq: Long,
+    @SerialName("solution_id") val solutionId: String,
+    @SerialName("session_id") val sessionId: String,
+)
+
+@Serializable
+data class WorkspaceSessionDeletedPayload(
+    val seq: Long,
+    @SerialName("solution_id") val solutionId: String,
+    @SerialName("session_id") val sessionId: String,
+)
+
+@Serializable
+data class WorkspaceSessionStateChangedPayload(
+    val seq: Long,
+    @SerialName("solution_id") val solutionId: String,
+    @SerialName("session_id") val sessionId: String,
+    val state: SessionStateDto,
+)
+
+// Non-sequenced — no `seq` field, never triggers gap detection.
+@Serializable
+data class WorkspaceSessionMetricsChangedPayload(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("last_activity_at") val lastActivityAt: Long? = null,
+    @SerialName("total_tokens") val totalTokens: Long? = null,
+    @SerialName("max_tokens") val maxTokens: Long? = null,
+)
 
 /**
  * Structured session state as emitted by the editor — a tagged object

@@ -1,7 +1,7 @@
 package ru.sipaha.spkremote.app.ui.settings
 
 import android.content.Intent
-import android.net.Uri
+import androidx.core.net.toUri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -48,7 +48,7 @@ import ru.sipaha.spkremote.core.PairingUrl
 
 /**
  * Settings / About screen. Reachable from the gear icon on
- * [ru.sipaha.spkremote.app.ui.solutions.SolutionsListScreen] and the
+ * [ru.sipaha.spkremote.app.ui.workspace.WorkspaceScreen] and the
  * Servers list (R-6c-multi).
  *
  * Surfaces:
@@ -209,7 +209,7 @@ fun SettingsScreen(
                 onOpenGithub = {
                     val intent = Intent(
                         Intent.ACTION_VIEW,
-                        Uri.parse("https://github.com/Sipaha/spk-editor"),
+                        "https://github.com/Sipaha/spk-editor".toUri(),
                     )
                     runCatching { context.startActivity(intent) }
                 },

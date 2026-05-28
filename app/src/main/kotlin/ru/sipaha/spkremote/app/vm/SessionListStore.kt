@@ -22,11 +22,20 @@ import ru.sipaha.spkremote.core.MemberAddCompletedPayload
 import ru.sipaha.spkremote.core.MemberAddProgressPayload
 import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.RemoteClient
+import ru.sipaha.spkremote.core.AgentSessionContextResetPayload
 import ru.sipaha.spkremote.core.SessionActiveSubagentsChangedPayload
 import ru.sipaha.spkremote.core.SessionCreatedPayload
 import ru.sipaha.spkremote.core.SessionQueueChangedPayload
 import ru.sipaha.spkremote.core.SessionSummary
 import ru.sipaha.spkremote.core.UploadChunkAckedPayload
+import ru.sipaha.spkremote.core.WorkspaceSessionClosedPayload
+import ru.sipaha.spkremote.core.WorkspaceSessionDeletedPayload
+import ru.sipaha.spkremote.core.WorkspaceSessionMetricsChangedPayload
+import ru.sipaha.spkremote.core.WorkspaceSessionOpenedPayload
+import ru.sipaha.spkremote.core.WorkspaceSessionStateChangedPayload
+import ru.sipaha.spkremote.core.WorkspaceSolutionClosedPayload
+import ru.sipaha.spkremote.core.WorkspaceSolutionDeletedPayload
+import ru.sipaha.spkremote.core.WorkspaceSolutionOpenedPayload
 
 /**
  * Sessions-list + agents + create-session + sub-agent children + the
@@ -95,14 +104,20 @@ internal class SessionListStore(
 
     /**
      * Solution member-add / change notification routing — wired by the
-     * coordinator to [SolutionStore]. Same single-collector discipline as
+     * coordinator to [CatalogStore]. Same single-collector discipline as
      * the detail + upload routers above: the list store owns the one
-     * subscription, [SolutionStore] just consumes the typed payloads.
+     * subscription, [CatalogStore] just consumes the typed payloads.
      */
     internal var solutionNotificationRouter: SolutionNotificationRouter? = null
 
-    private var listSubscribed = false
-    private var detailSubscribed = false
+    /**
+     * Workspace (`workspace.*`) notification routing — wired by the
+     * coordinator to [WorkspaceStore]. Same single-collector discipline
+     * as the detail / upload / solution routers above: this store owns
+     * the subscription, [WorkspaceStore] consumes the typed payloads.
+     */
+    internal var workspaceNotificationRouter: WorkspaceNotificationRouter? = null
+
     private var notificationsObserverJob: Job? = null
 
     /**
@@ -117,8 +132,8 @@ internal class SessionListStore(
     /**
      * Read-only accessor for the coordinator's foreground-refresh hook.
      * Returns the solution whose sessions list is currently being
-     * observed (i.e. the SolutionDetailScreen is mounted), or null when
-     * no list screen is visible.
+     * observed (i.e. a session-list surface is mounted), or null when
+     * no list surface is visible.
      */
     fun currentObservingSolutionId(): String? = observingSolutionId
 
@@ -131,8 +146,6 @@ internal class SessionListStore(
         observingSolutionId = null
         refreshSessionsJob?.cancel()
         refreshSessionsJob = null
-        listSubscribed = false
-        detailSubscribed = false
         _sessions.value = UiData.Loading
         _agents.value = UiData.Loading
         _sessionChildren.value = emptyMap()
@@ -206,6 +219,36 @@ internal class SessionListStore(
     }
 
     /**
+     * Force a fresh `subscribe(...)` + observer relaunch on the active
+     * client, blocking until the `subscribe` RPC has settled. Critical on
+     * the [ConnectionLifecycle.onReconnected] path — the server's
+     * subscription set is per-WS-connection, so a transient drop +
+     * reconnect on the same [RemoteClient] silently loses every kind we
+     * had subscribed to, and the existing observer's collect loop (still
+     * alive on the in-memory notifications [Flow]) wouldn't naturally
+     * re-send the subscribe.
+     *
+     * Suspending until subscribe lands is what callers that race a
+     * `workspace.snapshot` RPC against this restart need: the snapshot
+     * must be minted while the new subscription set is already
+     * registered server-side, otherwise a delta firing between snapshot-
+     * mint and subscribe-completion is silently dropped (the gap-detector
+     * self-heals on the next delta, but until then the mirror shows
+     * stale data).
+     */
+    suspend fun restartNotificationsObserverAndAwait() {
+        notificationsObserverJob?.cancel()
+        notificationsObserverJob = null
+        val active = context.activeClient() ?: return
+        // Synchronously dispatch the subscribe first. Result is best-effort:
+        // a transient failure here means the collector still launches and
+        // the next reconnect cycle will retry — better than leaving the
+        // wire un-observed.
+        runCatching { active.subscribe(SUBSCRIPTION_KINDS) }
+        notificationsObserverJob = scope.launch { runNotificationsCollector(active) }
+    }
+
+    /**
      * Public entry point for the detail store to make sure the
      * notifications collector is running. Idempotent.
      */
@@ -213,70 +256,93 @@ internal class SessionListStore(
         val active = context.activeClient() ?: return
         if (notificationsObserverJob?.isActive == true) return
         notificationsObserverJob = scope.launch {
-            // Subscribe to both list-level and detail-level kinds in one
-            // call so the server only sees one subscription event. The
-            // subscribe() call is idempotent on the server side.
-            if (!listSubscribed || !detailSubscribed) {
-                runCatching {
-                    active.subscribe(
-                        listOf(
-                            "agent_session_state_changed",
-                            "agent_session_created",
-                            "agent_session_closed",
-                            "agent_session_title_changed",
-                            "agent_session_message_appended",
-                            "agent_session_queue_changed",
-                            // Task/Agent subagent set changed mid-turn —
-                            // routes to SessionDetailStore.onActiveSubagentsChanged
-                            // which moves the tab strip; without this the
-                            // strip only refreshes via cold-start seed.
-                            "agent_session_active_subagents_changed",
-                            // Chunked-upload acks share this collector — server
-                            // forwards them through the same notification path
-                            // (allow_list pattern `upload_*`). Subscribing
-                            // here keeps a single notification observer per
-                            // active client; without this UploadManager would
-                            // need its own subscribe + collector duplicating
-                            // the lifecycle handling.
-                            "upload_chunk_acked",
-                            // Solution member-add progress + completion +
-                            // generic solution change — drive the project-
-                            // registry ghost rows and the member-list
-                            // refresh. Routed to SolutionStore via
-                            // [solutionNotificationRouter].
-                            "solution_member_add_progress",
-                            "solution_member_add_completed",
-                            "solution_changed",
-                        ),
-                    )
-                }.onSuccess {
-                    listSubscribed = true
-                    detailSubscribed = true
-                }
-            }
-            active.notifications.collect { frame ->
-                val params = (frame as? JsonObject)?.get("params") as? JsonObject
-                    ?: return@collect
-                val kind = params["kind"]?.jsonPrimitive?.content ?: return@collect
-                // The server (`editor_mcp::notifications::emit`) wraps each
-                // notification as `params: { kind, payload }`. An earlier
-                // mobile revision read `params["data"]` — that key never
-                // exists on the wire, so EVERY notification arrived with
-                // `data = null`. Most handlers had a "data missing →
-                // refresh-all" fallback, which masked the bug for text
-                // chat (`agent_session_message_appended` triggered a
-                // full re-fetch and the new entry appeared via that
-                // path). `upload_chunk_acked` has no fallback (its only
-                // job is to forward the ack offset into the per-upload
-                // channel), so the silent null sent every chunk-ack
-                // straight to /dev/null and the upload coroutine timed
-                // out at 30 s → Paused at 0 B. Diagnosed 2026-05-19
-                // via server-side `binary frame written: offset=0` +
-                // mobile `Paused at 0 B / 3.0 MB`.
-                val payload = params["payload"] as? JsonObject
-                handleNotification(kind, payload)
-            }
+            // Always (re-)send the subscribe set when this job starts. The
+            // server-side subscription list is per-WS-connection, so a
+            // transient drop + reconnect on the SAME RemoteClient leaves the
+            // new socket with no subscriptions — without this re-send, the
+            // workspace.* / agent_session_* deltas never make it back to us.
+            // (subscribe is documented idempotent server-side, so a duplicate
+            // when the observer restarts for any other reason is harmless.)
+            runCatching { active.subscribe(SUBSCRIPTION_KINDS) }
+            runNotificationsCollector(active)
         }
+    }
+
+    private suspend fun runNotificationsCollector(active: RemoteClient) {
+        active.notifications.collect { frame ->
+            val params = (frame as? JsonObject)?.get("params") as? JsonObject
+                ?: return@collect
+            val kind = params["kind"]?.jsonPrimitive?.content ?: return@collect
+            // The server (`editor_mcp::notifications::emit`) wraps each
+            // notification as `params: { kind, payload }`. An earlier
+            // mobile revision read `params["data"]` — that key never
+            // exists on the wire, so EVERY notification arrived with
+            // `data = null`. Most handlers had a "data missing →
+            // refresh-all" fallback, which masked the bug for text
+            // chat (`agent_session_message_appended` triggered a
+            // full re-fetch and the new entry appeared via that
+            // path). `upload_chunk_acked` has no fallback (its only
+            // job is to forward the ack offset into the per-upload
+            // channel), so the silent null sent every chunk-ack
+            // straight to /dev/null and the upload coroutine timed
+            // out at 30 s → Paused at 0 B. Diagnosed 2026-05-19
+            // via server-side `binary frame written: offset=0` +
+            // mobile `Paused at 0 B / 3.0 MB`.
+            val payload = params["payload"] as? JsonObject
+            handleNotification(kind, payload)
+        }
+    }
+
+    private companion object {
+        /**
+         * Notification kinds re-subscribed on every reconnect (server-side
+         * subscription set is per-WS-connection, so we must replay
+         * everything we want to hear after each new socket).
+         */
+        private val SUBSCRIPTION_KINDS: List<String> = listOf(
+            "agent_session_state_changed",
+            "agent_session_created",
+            "agent_session_closed",
+            "agent_session_title_changed",
+            "agent_session_message_appended",
+            "agent_session_queue_changed",
+            // Task/Agent subagent set changed mid-turn — routes to
+            // SessionDetailStore.onActiveSubagentsChanged which moves
+            // the tab strip; without this the strip only refreshes
+            // via cold-start seed.
+            "agent_session_active_subagents_changed",
+            // Server wiped this session's transcript in-place (`/clear`
+            // reset_context or `/compact` rotate_context). Without this
+            // kind, the chat surface keeps showing stale entries until
+            // a foreground / cold refresh.
+            "agent_session_context_reset",
+            // Chunked-upload acks share this collector — server
+            // forwards them through the same notification path
+            // (allow_list pattern `upload_*`). Subscribing here keeps a
+            // single notification observer per active client; without
+            // this UploadManager would need its own subscribe +
+            // collector duplicating the lifecycle handling.
+            "upload_chunk_acked",
+            // Solution member-add progress + completion + generic
+            // solution change — drive the project-registry ghost rows
+            // and the member-list refresh. Routed to CatalogStore via
+            // [solutionNotificationRouter].
+            "solution_member_add_progress",
+            "solution_member_add_completed",
+            "solution_changed",
+            // Workspace (open-set) notifications — routed to
+            // WorkspaceStore via [workspaceNotificationRouter]. Carry
+            // sequenced deltas for the desktop's open workspace mirror;
+            // gap detection is internal to the store.
+            "workspace.solution_opened",
+            "workspace.solution_closed",
+            "workspace.solution_deleted",
+            "workspace.session_opened",
+            "workspace.session_closed",
+            "workspace.session_deleted",
+            "workspace.session_state_changed",
+            "workspace.session_metrics_changed",
+        )
     }
 
     private fun handleNotification(kind: String, data: JsonObject?) {
@@ -297,7 +363,7 @@ internal class SessionListStore(
             return
         }
 
-        // Solution member-add / change events — fan out to SolutionStore
+        // Solution member-add / change events — fan out to CatalogStore
         // for the project-registry ghost rows + member-list refresh.
         // Independent of the session list/detail routing below.
         when (kind) {
@@ -331,14 +397,70 @@ internal class SessionListStore(
             }
         }
 
+        // Workspace open-set notifications — fan out the typed payloads
+        // to WorkspaceStore. Decoding failures (e.g. an unexpected wire
+        // shape from a future server) silently drop the delta; the store
+        // will detect the gap on the next sequenced event and trigger a
+        // bulk resync.
+        when (kind) {
+            "workspace.solution_opened" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSolutionOpenedPayload.serializer()) ?: return
+                router.onSolutionOpened(payload)
+                return
+            }
+            "workspace.solution_closed" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSolutionClosedPayload.serializer()) ?: return
+                router.onSolutionClosed(payload)
+                return
+            }
+            "workspace.solution_deleted" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSolutionDeletedPayload.serializer()) ?: return
+                router.onSolutionDeleted(payload)
+                return
+            }
+            "workspace.session_opened" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSessionOpenedPayload.serializer()) ?: return
+                router.onSessionOpened(payload)
+                return
+            }
+            "workspace.session_closed" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSessionClosedPayload.serializer()) ?: return
+                router.onSessionClosed(payload)
+                return
+            }
+            "workspace.session_deleted" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSessionDeletedPayload.serializer()) ?: return
+                router.onSessionDeleted(payload)
+                return
+            }
+            "workspace.session_state_changed" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSessionStateChangedPayload.serializer()) ?: return
+                router.onSessionStateChanged(payload)
+                return
+            }
+            "workspace.session_metrics_changed" -> {
+                val router = workspaceNotificationRouter ?: return
+                val payload = data?.decodeOrNull(WorkspaceSessionMetricsChangedPayload.serializer()) ?: return
+                router.onSessionMetricsChanged(payload)
+                return
+            }
+        }
+
         // List handler — refresh sessions list when a session-shaped
         // event arrives, regardless of whether a detail screen is also
         // mounted.
         //
         // Fallback when no solution-list screen is observing: derive the
         // solution id from the currently-loaded sessions cache. This is
-        // the SessionDetailScreen-mounted case where SolutionDetailScreen
-        // already disposed and reset `observingSolutionId = null` —
+        // the SessionDetailScreen-mounted case where the previously-mounted
+        // list surface already disposed and reset `observingSolutionId = null` —
         // without the fallback, an `agent_session_state_changed`
         // notification fired by a /compact (rotate_context sets
         // `cached_total_tokens = None` then emits SessionStateChanged)
@@ -417,6 +539,10 @@ internal class SessionListStore(
                     }.getOrNull()
                 } ?: return
                 router.onActiveSubagentsChanged(payload)
+            }
+            "agent_session_context_reset" -> {
+                val payload = data?.decodeOrNull(AgentSessionContextResetPayload.serializer()) ?: return
+                router.onSessionContextReset(payload)
             }
         }
     }
@@ -542,14 +668,21 @@ internal class SessionListStore(
     }
 
     /**
-     * Close the session [sessionId] on the server. On success, optimistically
-     * remove the session from the in-memory list (so the row vanishes
-     * immediately even before the `agent_session_closed` notification round-
-     * trips back) and trigger a refresh against the currently-observed
-     * solution (if any) so cached state stays consistent with the server.
-     * Failures surface through the shared error channel.
+     * Delete the session [sessionId] on the server (DESTRUCTIVE — wipes
+     * the transcript). On success, optimistically remove the session from
+     * the in-memory list (so the row vanishes immediately even before the
+     * `workspace.session_deleted` notification round-trips back) and
+     * trigger a refresh against the currently-observed solution (if any)
+     * so cached state stays consistent with the server. Failures surface
+     * through the shared error channel.
+     *
+     * Wire-schema v2 renamed `solution_agent.close_session` →
+     * `solution_agent.delete_session` to match the actual semantics; the
+     * non-destructive "remove the tab" action is now
+     * `workspace.close_session`, wired separately through
+     * [WorkspaceStore.closeSessionOptimistic].
      */
-    fun closeSession(sessionId: String) {
+    fun deleteSession(sessionId: String) {
         val active = context.activeClient()
         if (active == null) {
             context.emitError(context.notConnectedMessage())
@@ -557,7 +690,7 @@ internal class SessionListStore(
         }
         val params = buildJsonObject { put("session_id", sessionId) }
         scope.launch {
-            runCatching { active.call("remote.solution_agent.close_session", params) }
+            runCatching { active.call("remote.solution_agent.delete_session", params) }
                 .mapCatching { resp ->
                     val err = resp.error
                     if (err != null) error(err.message)
@@ -576,7 +709,7 @@ internal class SessionListStore(
                     val solutionId = observingSolutionId
                     if (solutionId != null) refreshSessions(solutionId)
                 }
-                .onFailure { context.emitError("Couldn't close session: ${it.message ?: "?"}") }
+                .onFailure { context.emitError("Couldn't delete session: ${it.message ?: "?"}") }
         }
     }
 
@@ -657,4 +790,23 @@ internal interface DetailNotificationRouter {
      * server-side `active_subagent_order` Vec — render as-is.
      */
     fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload)
+
+    /**
+     * The server wiped this session's transcript in-place via /clear or
+     * /compact. The session id is unchanged. Implementations must drop
+     * their cached entry list for [payload.sessionId] and re-fetch.
+     */
+    fun onSessionContextReset(payload: AgentSessionContextResetPayload)
 }
+
+/**
+ * Compact decode helper for the workspace notification dispatch — mirrors
+ * the `runCatching { JsonRpc.json.decodeFromJsonElement(...) }.getOrNull()`
+ * idiom used inline elsewhere in this file. Centralised here purely to
+ * cut down the per-kind boilerplate when there are 8 kinds to wire.
+ */
+private fun <T> JsonObject.decodeOrNull(
+    deserializer: kotlinx.serialization.DeserializationStrategy<T>,
+): T? = runCatching {
+    JsonRpc.json.decodeFromJsonElement(deserializer, this)
+}.getOrNull()
