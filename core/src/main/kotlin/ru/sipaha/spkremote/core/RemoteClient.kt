@@ -669,9 +669,17 @@ class RemoteClient internal constructor(
         // over for app-side RPC traffic.
         val handshakeTransportRef =
             AtomicReference<RemoteTransport?>(null)
-        val listener = HandshakeListener(handshake, stage, handshakeTransportRef)
+        // [boundTx] mirrors the per-attempt transport but is NEVER cleared
+        // — it stays set for the listener's lifetime so [HandshakeListener.isStale]
+        // can detect when a later attempt has displaced this socket and
+        // silently drop the late `onClosed` / `onFailure` events the OkHttp
+        // listener still fires from the dying socket. See the listener's
+        // `boundTx` kdoc for the full race.
+        val boundTx = AtomicReference<RemoteTransport?>(null)
+        val listener = HandshakeListener(handshake, stage, handshakeTransportRef, boundTx)
         val tx = transportFactory.connect(url, listener)
         handshakeTransportRef.set(tx)
+        boundTx.set(tx)
         // DO NOT publish to the shared `transport` field yet. Doing so
         // pre-handshake opens a TOCTOU window where any `client.call(...)`
         // path (e.g. a post-reconnect `SessionDetailStore.refreshSession`
@@ -797,7 +805,35 @@ class RemoteClient internal constructor(
          * onText paths fall back to whatever the shared field carries.
          */
         private val handshakeTx: AtomicReference<RemoteTransport?>,
+        /**
+         * Identity reference to the transport this listener was bound
+         * to. Stays set for the listener's lifetime — used by
+         * `onClosed` / `onFailure` to detect when a later attempt has
+         * displaced this transport and silently drop the late events
+         * the OkHttp listener still fires from the dying socket.
+         *
+         * Without this, the sequence ([forceReconnect] → new socket
+         * established → old socket's close handshake finishes →
+         * `onClosed(1001 "evicted by new connection")`) would push a
+         * stale `TransportClosed` into [events] AFTER the lifecycle
+         * loop had already settled on the new transport. The loop
+         * would interpret the stale event as the current transport
+         * dying and reconnect again, causing a self-reinforcing loop
+         * with the heartbeat watchdog re-firing every 30s.
+         */
+        private val boundTx: AtomicReference<RemoteTransport?>,
     ) : RemoteTransportListener {
+
+        /**
+         * `true` once the listener's transport has been displaced or
+         * abandoned by a newer attempt. Computed lazily on each event
+         * by comparing [boundTx] against the shared [transport] field.
+         */
+        private val isStale: Boolean
+            get() {
+                val mine = boundTx.get() ?: return false
+                return this@RemoteClient.transport !== mine
+            }
 
         override fun onBinary(bytes: ByteArray) {
             // R-2 handshake is text/JSON only — binary before Established
@@ -879,6 +915,7 @@ class RemoteClient internal constructor(
             val isTerminal = failure is ConnectFailure.TlsPinMismatch ||
                 failure is ConnectFailure.AuthRejected
             if (ref.stage == HandshakeStage.Established) {
+                if (isStale) return
                 events.trySend(LifecycleEvent.TransportFailure(failure, terminal = isTerminal))
             } else if (!handshake.isCompleted) {
                 handshake.complete(
@@ -892,6 +929,7 @@ class RemoteClient internal constructor(
             val failure = ConnectFailure.ServerClosed(code, reason)
             val isTerminal = !failure.isRetryable
             if (ref.stage == HandshakeStage.Established) {
+                if (isStale) return
                 events.trySend(LifecycleEvent.TransportClosed(failure))
             } else if (!handshake.isCompleted) {
                 handshake.complete(

@@ -26,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import androidx.navigation.NavBackStackEntry
@@ -411,6 +412,14 @@ private fun BannerSurface(background: Color, text: String, onClick: (() -> Unit)
     ) {
         Text(
             text = text,
+            // Single-line, ellipsised: the previous wrap could grow to three
+            // lines on a long failure reason (Reconnecting + attempt + retry
+            // tail), shifting the entire NavHost down by ~60 dp every time
+            // the banner appeared. The reason + countdown still fits on one
+            // line on a 360 dp screen; truncation is acceptable here — the
+            // per-screen banner under the header carries the verbose copy.
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .fillMaxWidth()
                 // The banner is the top-most element (above the NavHost), so
@@ -422,8 +431,8 @@ private fun BannerSurface(background: Color, text: String, onClick: (() -> Unit)
                         WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
                     ),
                 )
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            style = MaterialTheme.typography.bodyMedium,
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelMedium,
         )
     }
 }
