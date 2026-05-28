@@ -325,6 +325,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         if (openSid != null) {
             sessionDetail.resumeSession(openSid)
         }
+        // Server's subscription set is per-WS-connection — every transient
+        // drop loses our previous subscribe. Force a fresh subscribe +
+        // observer relaunch so workspace.* / agent_session_* deltas keep
+        // flowing on the new connection. Without this the workspace strip
+        // stays static (no solution_opened / closed deltas) until the user
+        // restarts the app or navigates into a session detail.
+        sessionList.restartNotificationsObserver()
         // Workspace mirror — treat the server as authoritative for the
         // open-set after any disconnect window. The session-list /
         // catalog stores observe their own notification kinds and

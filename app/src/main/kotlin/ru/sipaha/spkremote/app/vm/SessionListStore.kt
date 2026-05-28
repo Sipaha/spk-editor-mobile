@@ -118,8 +118,6 @@ internal class SessionListStore(
      */
     internal var workspaceNotificationRouter: WorkspaceNotificationRouter? = null
 
-    private var listSubscribed = false
-    private var detailSubscribed = false
     private var notificationsObserverJob: Job? = null
 
     /**
@@ -148,8 +146,6 @@ internal class SessionListStore(
         observingSolutionId = null
         refreshSessionsJob?.cancel()
         refreshSessionsJob = null
-        listSubscribed = false
-        detailSubscribed = false
         _sessions.value = UiData.Loading
         _agents.value = UiData.Loading
         _sessionChildren.value = emptyMap()
@@ -223,6 +219,22 @@ internal class SessionListStore(
     }
 
     /**
+     * Force a fresh `subscribe(...)` + observer relaunch on the active
+     * client. Called from [ConnectionLifecycle.onReconnected] because the
+     * server's subscription set is per-WS-connection — a transient drop
+     * + reconnect on the same [RemoteClient] silently loses every kind
+     * we had subscribed to, and the existing observer's collect loop
+     * (still alive on the in-memory notifications [Flow]) wouldn't
+     * naturally re-send the subscribe. Cancelling the job here makes
+     * [ensureNotificationsObserver] relaunch with a fresh subscribe.
+     */
+    fun restartNotificationsObserver() {
+        notificationsObserverJob?.cancel()
+        notificationsObserverJob = null
+        ensureNotificationsObserver()
+    }
+
+    /**
      * Public entry point for the detail store to make sure the
      * notifications collector is running. Idempotent.
      */
@@ -230,13 +242,16 @@ internal class SessionListStore(
         val active = context.activeClient() ?: return
         if (notificationsObserverJob?.isActive == true) return
         notificationsObserverJob = scope.launch {
-            // Subscribe to both list-level and detail-level kinds in one
-            // call so the server only sees one subscription event. The
-            // subscribe() call is idempotent on the server side.
-            if (!listSubscribed || !detailSubscribed) {
-                runCatching {
-                    active.subscribe(
-                        listOf(
+            // Always (re-)send the subscribe set when this job starts. The
+            // server-side subscription list is per-WS-connection, so a
+            // transient drop + reconnect on the SAME RemoteClient leaves the
+            // new socket with no subscriptions — without this re-send, the
+            // workspace.* / agent_session_* deltas never make it back to us.
+            // (subscribe is documented idempotent server-side, so a duplicate
+            // when the observer restarts for any other reason is harmless.)
+            runCatching {
+                active.subscribe(
+                    listOf(
                             "agent_session_state_changed",
                             "agent_session_created",
                             "agent_session_closed",
@@ -280,14 +295,10 @@ internal class SessionListStore(
                             "workspace.session_opened",
                             "workspace.session_closed",
                             "workspace.session_deleted",
-                            "workspace.session_state_changed",
-                            "workspace.session_metrics_changed",
-                        ),
-                    )
-                }.onSuccess {
-                    listSubscribed = true
-                    detailSubscribed = true
-                }
+                        "workspace.session_state_changed",
+                        "workspace.session_metrics_changed",
+                    ),
+                )
             }
             active.notifications.collect { frame ->
                 val params = (frame as? JsonObject)?.get("params") as? JsonObject
