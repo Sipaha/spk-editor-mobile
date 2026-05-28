@@ -142,6 +142,7 @@ internal fun WorkspaceListContent(
             stickyHeader(key = "header-${sol.id}") {
                 SolutionHeader(
                     sol = sol,
+                    onNewConsole = { onCreateNewSessionFor(sol.id) },
                     onOpenProjects = { onOpenProjects(sol.id) },
                     onCloseSolution = { onCloseSolution(sol.id) },
                     onDeleteSolution = { onDeleteSolution(sol.id) },
@@ -155,9 +156,6 @@ internal fun WorkspaceListContent(
                     onDeleteSession = { onDeleteSession(session.id) },
                 )
             }
-            item(key = "new-${sol.id}") {
-                NewConsoleRow(onClick = { onCreateNewSessionFor(sol.id) })
-            }
             item { HorizontalDivider() }
         }
     }
@@ -166,6 +164,7 @@ internal fun WorkspaceListContent(
 @Composable
 private fun SolutionHeader(
     sol: OpenSolutionVM,
+    onNewConsole: () -> Unit,
     onOpenProjects: () -> Unit,
     onCloseSolution: () -> Unit,
     onDeleteSolution: () -> Unit,
@@ -222,6 +221,7 @@ private fun SolutionHeader(
                 expanded = menuExpanded,
                 onExpandedChange = { menuExpanded = it },
             ) {
+                DropdownMenuItem(text = { Text("New console") }, onClick = { menuExpanded = false; onNewConsole() })
                 DropdownMenuItem(text = { Text("Projects") }, onClick = { menuExpanded = false; onOpenProjects() })
                 DropdownMenuItem(text = { Text("Close solution") }, onClick = { menuExpanded = false; confirmClose = true })
                 DropdownMenuItem(text = { Text("Delete solution") }, onClick = { menuExpanded = false; confirmDelete = true })
@@ -317,24 +317,6 @@ private fun SessionRow(
             },
             dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text("Cancel") } },
         )
-    }
-}
-
-@Composable
-private fun NewConsoleRow(onClick: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
-            .padding(start = 28.dp, end = 16.dp, top = 10.dp, bottom = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = Icons.Filled.Add,
-            contentDescription = null,
-            modifier = Modifier.size(18.dp),
-            tint = MaterialTheme.colorScheme.primary,
-        )
-        Spacer(Modifier.width(10.dp))
-        Text("New console", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
     }
 }
 
