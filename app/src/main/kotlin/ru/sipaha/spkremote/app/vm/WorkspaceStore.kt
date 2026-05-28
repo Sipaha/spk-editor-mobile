@@ -313,6 +313,23 @@ class WorkspaceStore(
         )
 
     /**
+     * Drop every buffered sequenced delta. Called by [MainViewModel.onReconnected]
+     * BEFORE the post-reconnect [refresh] because the desktop's
+     * [WorkspaceEventCoordinator] resets its monotonic counter on every
+     * process start — any delta we had buffered from the previous WS session
+     * carries a `seq` that's gibberish against the new coordinator's stream
+     * and can drive [runResyncLocked]'s replay loop into a permanent retry
+     * (snapshot seq < buffered seq, gap never closes because the server
+     * will never emit the missing intermediate seqs that "exist" only in
+     * our pre-restart memory). Clearing on the reconnect edge keeps the
+     * post-resync state derived entirely from the fresh snapshot + deltas
+     * emitted from this point forward.
+     */
+    suspend fun clearBufferedDeltas() {
+        snapshotMutex.withLock { pending.clear() }
+    }
+
+    /**
      * Optimistic local removal of a closed-solution row. Called by the picker
      * the moment the user taps Delete on an entry — the server later confirms
      * via the `workspace.solution_deleted` notification (which also runs

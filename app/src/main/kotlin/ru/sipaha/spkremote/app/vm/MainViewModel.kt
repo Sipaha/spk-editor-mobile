@@ -336,8 +336,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         // open-set after any disconnect window. The session-list /
         // catalog stores observe their own notification kinds and
         // refresh themselves when the user lands on the surface that
-        // needs them.
-        viewModelScope.launch { workspaceStore.refresh() }
+        // needs them. Clear the buffered sequenced-delta queue first so
+        // any pre-disconnect deltas (whose `seq` was minted by the
+        // previous coordinator instance — potentially reset by a desktop
+        // restart) don't poison the replay path with permanently
+        // unreachable gap targets.
+        viewModelScope.launch {
+            workspaceStore.clearBufferedDeltas()
+            workspaceStore.refresh()
+        }
         // Wake any paused upload coroutines back up. Each will hit
         // upload_status first (server is authoritative on offset).
         uploadManager.resumeAll()
