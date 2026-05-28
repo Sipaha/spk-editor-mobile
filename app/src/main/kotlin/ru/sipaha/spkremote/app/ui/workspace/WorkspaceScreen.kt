@@ -189,21 +189,34 @@ private fun SolutionHeader(
                 modifier = Modifier.size(18.dp),
             )
             Spacer(Modifier.width(10.dp))
-            Text(
-                text = sol.name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = "${sol.memberCount}",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
-            )
-            Spacer(Modifier.weight(1f))
+            // Wrap name + count in a weighted Row so the kebab gets pushed to
+            // the very right edge. A flat `name.weight(1f, fill=false)` + a
+            // trailing `Spacer.weight(1f)` LOOKED right but didn't deliver:
+            // both weighted children get an equal share of remaining width,
+            // and the slack a fill=false child leaves is not redistributed
+            // to its weighted siblings — it just becomes dead space inside
+            // the row, leaving the kebab adrift somewhere in the middle.
+            // Nesting moves the weight allocation up one level, so the
+            // kebab is laid out flush right regardless of name length.
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = sol.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "${sol.memberCount}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
+                )
+            }
             KebabMenuButton(
                 contentDescription = "Solution menu",
                 expanded = menuExpanded,
