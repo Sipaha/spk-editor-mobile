@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import ru.sipaha.spkremote.app.data.AttachmentDraftRepository
 import ru.sipaha.spkremote.app.data.DraftRepository
 import ru.sipaha.spkremote.app.data.InFlightUploadsRepository
 import ru.sipaha.spkremote.app.data.PendingSendsRepository
@@ -119,6 +120,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     private val draftRepository: DraftRepository =
         DraftRepository.get(application) { connectionMgr.activeServerId.value }
 
+    private val attachmentDraftRepository: AttachmentDraftRepository =
+        AttachmentDraftRepository.get(application) { connectionMgr.activeServerId.value }
+
     private val lastSeenRepository: LastSeenRepository =
         LastSeenRepository.get(application) { connectionMgr.activeServerId.value }
 
@@ -187,21 +191,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         it.workspaceNotificationRouter = workspaceStore
     }
 
-    private val sessionDetail: SessionDetailStore = SessionDetailStore(
-        scope = viewModelScope,
-        context = this,
-        draftRepository = draftRepository,
-        lastSeen = lastSeenIndex,
-        sessionList = sessionList,
-        sessionHistoryRepository = sessionHistoryRepository,
-        pendingSendsRepository = pendingSendsRepository,
-    )
-
     /**
      * Chunked-upload coordinator for the mobile attach flow. Constructed
      * here so its lifetime matches the coordinator's; the compose row
      * reaches it via [startAttachmentUpload] / [cancelAttachmentUpload] /
      * [forgetAttachmentUpload] / [attachmentUploadStateOf] etc.
+     *
+     * Must be initialised BEFORE [sessionDetail] — the detail store reads
+     * [UploadManager.stateFlowOf] to re-hydrate persisted attachment
+     * drafts on cold start.
      */
     private val uploadManager: UploadManager = UploadManager(
         scope = viewModelScope,
@@ -216,6 +214,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         // DetailNotificationRouter.
         sessionList.uploadNotificationRouter = it::onChunkAcked
     }
+
+    private val sessionDetail: SessionDetailStore = SessionDetailStore(
+        scope = viewModelScope,
+        context = this,
+        draftRepository = draftRepository,
+        attachmentDraftRepository = attachmentDraftRepository,
+        uploadManager = uploadManager,
+        lastSeen = lastSeenIndex,
+        sessionList = sessionList,
+        sessionHistoryRepository = sessionHistoryRepository,
+        pendingSendsRepository = pendingSendsRepository,
+    )
 
     init {
         // Foreground-refresh hook (see ForegroundEventBus KDoc + the
@@ -397,6 +407,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         // optional reassign.
         viewModelScope.launch(Dispatchers.IO) {
             draftRepository.clearAllFor(serverId)
+            attachmentDraftRepository.clearAllFor(serverId)
             lastSeenRepository.clearAllFor(serverId)
             navStateRepository.clearFor(serverId)
             listCacheRepository.clearAllFor(serverId)

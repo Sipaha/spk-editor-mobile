@@ -18,6 +18,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import android.net.Uri
+import ru.sipaha.spkremote.app.data.AttachmentDraftRepository
+import ru.sipaha.spkremote.app.data.AttachmentRef
 import ru.sipaha.spkremote.app.data.CachedSessionHistory
 import ru.sipaha.spkremote.app.data.DraftRepository
 import ru.sipaha.spkremote.app.data.PendingSendsRepository
@@ -161,6 +164,8 @@ internal class SessionDetailStore(
     private val scope: CoroutineScope,
     private val context: ConnectionContext,
     private val draftRepository: DraftRepository,
+    private val attachmentDraftRepository: AttachmentDraftRepository,
+    private val uploadManager: UploadManager,
     private val lastSeen: LastSeenIndex,
     private val sessionList: SessionListStore,
     private val sessionHistoryRepository: SessionHistoryRepository,
@@ -2100,19 +2105,48 @@ internal class SessionDetailStore(
 
     /**
      * Read the picked-attachment list the user had assembled in the
-     * compose bar for [sessionId] before the screen last unmounted.
-     * Empty when the session was never touched or after a successful send.
-     * Held in-memory only — process-death loses these (same V1 contract
-     * the previous composable-local `remember` had; survival across
-     * back-nav is the new property).
+     * compose bar for [sessionId] before the screen last left composition
+     * (back-nav OR process death). The in-memory map is consulted first;
+     * on a cold miss the on-disk [AttachmentDraftRepository] is read and
+     * each persisted [AttachmentRef] is joined with the matching
+     * [UploadManager.stateFlowOf] to recover the live progress flow.
+     *
+     * Refs whose `localKey` is no longer known to [UploadManager] (the
+     * upload was cancelled / forgotten between runs) are silently dropped
+     * from the restored list so the user doesn't see a chip stuck at
+     * "Queued" forever.
      */
-    fun pickedAttachments(sessionId: String): List<PickedAttachment> =
-        pickedAttachmentsBySession[sessionId] ?: emptyList()
+    fun pickedAttachments(sessionId: String): List<PickedAttachment> {
+        val cached = pickedAttachmentsBySession[sessionId]
+        if (cached != null) return cached
+        val refs = attachmentDraftRepository.load(sessionId)
+        if (refs.isEmpty()) return emptyList()
+        val restored = refs.mapNotNull { ref ->
+            val flow = uploadManager.stateFlowOf(ref.localKey) ?: return@mapNotNull null
+            PickedAttachment(
+                uri = Uri.EMPTY,
+                displayName = ref.displayName,
+                mimeType = ref.mimeType,
+                sizeBytes = ref.sizeBytes,
+                localKey = ref.localKey,
+                uploadState = flow,
+            )
+        }
+        pickedAttachmentsBySession[sessionId] = restored
+        // If the persisted list shrank (some uploads vanished), rewrite
+        // disk so the next cold start doesn't re-do the drop work.
+        if (restored.size != refs.size) {
+            persistAttachments(sessionId, restored)
+        }
+        return restored
+    }
 
     /**
      * Stash the picked-attachment list for [sessionId]. Empty list removes
      * the entry so a long-lived `MainViewModel` with many sessions doesn't
-     * leak references to stale [UploadManager.State] flows.
+     * leak references to stale [UploadManager.State] flows, AND wipes the
+     * on-disk slot so a follow-up cold start doesn't restore a list the
+     * user already cleared (send-success path).
      */
     fun setPickedAttachments(sessionId: String, attachments: List<PickedAttachment>) {
         if (attachments.isEmpty()) {
@@ -2120,5 +2154,18 @@ internal class SessionDetailStore(
         } else {
             pickedAttachmentsBySession[sessionId] = attachments
         }
+        persistAttachments(sessionId, attachments)
+    }
+
+    private fun persistAttachments(sessionId: String, attachments: List<PickedAttachment>) {
+        val refs = attachments.map {
+            AttachmentRef(
+                localKey = it.localKey,
+                displayName = it.displayName,
+                mimeType = it.mimeType,
+                sizeBytes = it.sizeBytes,
+            )
+        }
+        attachmentDraftRepository.save(sessionId, refs)
     }
 }
