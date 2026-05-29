@@ -14,6 +14,7 @@ import ru.sipaha.spkremote.app.data.ListCacheRepository
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AgentSummary
 import ru.sipaha.spkremote.core.CreateSessionResult
+import ru.sipaha.spkremote.core.GetSessionBackgroundShellsResult
 import ru.sipaha.spkremote.core.GetSessionChildrenResult
 import ru.sipaha.spkremote.core.JsonRpc
 import ru.sipaha.spkremote.core.ListAgentsResult
@@ -24,6 +25,7 @@ import ru.sipaha.spkremote.core.MessageAppendedPayload
 import ru.sipaha.spkremote.core.RemoteClient
 import ru.sipaha.spkremote.core.AgentSessionContextResetPayload
 import ru.sipaha.spkremote.core.SessionActiveSubagentsChangedPayload
+import ru.sipaha.spkremote.core.SessionBackgroundShellsChangedPayload
 import ru.sipaha.spkremote.core.SessionCreatedPayload
 import ru.sipaha.spkremote.core.SessionQueueChangedPayload
 import ru.sipaha.spkremote.core.SessionSummary
@@ -311,6 +313,12 @@ internal class SessionListStore(
             // the tab strip; without this the strip only refreshes
             // via cold-start seed.
             "agent_session_active_subagents_changed",
+            // Background-shell set changed (a `run_in_background` Bash
+            // tool launched / exited / was killed) — routes to
+            // SessionDetailStore.onBackgroundShellsChanged which updates
+            // the background-shell pill strip; without this the strip
+            // only refreshes via cold-start seed.
+            "agent_session_background_shells_changed",
             // Server wiped this session's transcript in-place (`/clear`
             // reset_context or `/compact` rotate_context). Without this
             // kind, the chat surface keeps showing stale entries until
@@ -540,6 +548,17 @@ internal class SessionListStore(
                 } ?: return
                 router.onActiveSubagentsChanged(payload)
             }
+            "agent_session_background_shells_changed" -> {
+                val payload = data?.let {
+                    runCatching {
+                        JsonRpc.json.decodeFromJsonElement(
+                            SessionBackgroundShellsChangedPayload.serializer(),
+                            it,
+                        )
+                    }.getOrNull()
+                } ?: return
+                router.onBackgroundShellsChanged(payload)
+            }
             "agent_session_context_reset" -> {
                 val payload = data?.decodeOrNull(AgentSessionContextResetPayload.serializer()) ?: return
                 router.onSessionContextReset(payload)
@@ -564,6 +583,34 @@ internal class SessionListStore(
                     _sessionChildren.value = _sessionChildren.value + (sessionId to result.children)
                 }
         }
+    }
+
+    /**
+     * Fetch the background shells (`run_in_background` Bash tool uses) for
+     * [sessionId] via `remote.solution_agent.get_session_background_shells`.
+     * Mirrors [loadChildren]'s call shape but is suspending + returns the
+     * result so [SessionDetailStore] can use it for BOTH the cold-start
+     * lite strip ([includeOutput] = false) and the drill-in stdout view
+     * ([includeOutput] = true). Returns an empty result on failure or when
+     * no client is connected — callers treat "no shells" and "couldn't
+     * fetch" identically (the strip just stays hidden).
+     */
+    suspend fun loadBackgroundShells(
+        sessionId: String,
+        includeOutput: Boolean,
+    ): GetSessionBackgroundShellsResult {
+        val active = context.activeClient() ?: return GetSessionBackgroundShellsResult()
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("include_output", includeOutput)
+        }
+        return runCatching {
+            active.call("remote.solution_agent.get_session_background_shells", params)
+        }
+            .mapCatching { resp ->
+                resp.decodeResultOrThrow(GetSessionBackgroundShellsResult.serializer())
+            }
+            .getOrDefault(GetSessionBackgroundShellsResult())
     }
 
     fun loadAgents() {
@@ -790,6 +837,14 @@ internal interface DetailNotificationRouter {
      * server-side `active_subagent_order` Vec — render as-is.
      */
     fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload)
+
+    /**
+     * The background-shell set (in-flight `run_in_background` Bash tool
+     * uses) changed for [payload.sessionId]. The payload always carries
+     * the FULL new set of lite DTOs (empty = no shells); insertion order
+     * matches the server-side ordering — render as-is.
+     */
+    fun onBackgroundShellsChanged(payload: SessionBackgroundShellsChangedPayload)
 
     /**
      * The server wiped this session's transcript in-place via /clear or

@@ -576,6 +576,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
     val activeSubagents: StateFlow<List<ru.sipaha.spkremote.core.SubagentDto>>
         get() = sessionDetail.activeSubagents
     val selectedSubagent: StateFlow<String?> get() = sessionDetail.selectedSubagent
+    val backgroundShells: StateFlow<List<ru.sipaha.spkremote.core.BackgroundShellDto>>
+        get() = sessionDetail.backgroundShells
     val cancelInFlight: StateFlow<Boolean> get() = sessionDetail.cancelInFlight
     val sessionChildren: StateFlow<Map<String, List<SessionSummary>>> get() = sessionList.sessionChildren
     val agents: StateFlow<UiData<List<AgentSummary>>> get() = sessionList.agents
@@ -601,6 +603,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
         sessionDetail.sendMessageBlocks(blocks)
     fun forceFlushQueue() = sessionDetail.forceFlushQueue()
     fun selectSubagent(id: String?) = sessionDetail.selectSubagent(id)
+    /**
+     * Fetch the stdout tail for one background shell of the open session
+     * (drill-in sheet). Suspends; returns null when the shell is gone or
+     * the fetch failed.
+     */
+    suspend fun loadBackgroundShellOutput(shellId: String) =
+        sessionDetail.loadBackgroundShellOutput(shellId)
     /**
      * Pending-send variant for the chat compose row: caller pressed
      * Send while one or more attachments were still uploading. The

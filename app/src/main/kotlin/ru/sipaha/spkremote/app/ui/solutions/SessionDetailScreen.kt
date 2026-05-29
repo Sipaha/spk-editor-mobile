@@ -23,6 +23,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
@@ -162,6 +163,7 @@ import ru.sipaha.spkremote.app.vm.PendingUploadProgress
 import ru.sipaha.spkremote.app.vm.PickedAttachment
 import ru.sipaha.spkremote.app.vm.UiData
 import ru.sipaha.spkremote.app.vm.UploadManager
+import ru.sipaha.spkremote.core.BackgroundShellDto
 import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.ContentBlockDto
 import ru.sipaha.spkremote.core.DisplayState
@@ -216,6 +218,7 @@ fun SessionDetailScreen(
     val serverQueuedBundles by viewModel.serverQueuedBundles.collectAsState()
     val activeSubagents by viewModel.activeSubagents.collectAsState()
     val selectedSubagent by viewModel.selectedSubagent.collectAsState()
+    val backgroundShells by viewModel.backgroundShells.collectAsState()
     val cancelInFlight by viewModel.cancelInFlight.collectAsState()
     val isLoadingOlder by viewModel.isLoadingOlder.collectAsState()
     val childrenMap by viewModel.sessionChildren.collectAsState()
@@ -224,6 +227,9 @@ fun SessionDetailScreen(
     val lastConnectedMs by viewModel.lastConnectedMs.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+    // Background-shell drill-in: id of the shell whose stdout sheet is
+    // open, or null when no sheet is showing.
+    var selectedShellId by remember { mutableStateOf<String?>(null) }
 
     DisposableEffect(sessionId) {
         viewModel.openSession(sessionId)
@@ -538,6 +544,13 @@ fun SessionDetailScreen(
                     selected = selectedSubagent,
                     onSelect = viewModel::selectSubagent,
                 )
+                // Background-shell strip — one pill per `run_in_background`
+                // Bash tool use. Hidden when no shell is in flight. Tapping
+                // a pill opens the stdout drill-in sheet.
+                BackgroundShellStrip(
+                    shells = backgroundShells,
+                    onSelect = { selectedShellId = it },
+                )
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                     when (val s = sessionState) {
                         is UiData.Loading -> Box(
@@ -613,6 +626,19 @@ fun SessionDetailScreen(
                 showCompactConfirm = false
                 viewModel.compactContextOnActiveSession()
             },
+        )
+    }
+
+    val shellId = selectedShellId
+    if (shellId != null) {
+        // Seed the header from the lite strip entry (command + state are
+        // already known); the stdout body is fetched lazily below.
+        val liteShell = backgroundShells.firstOrNull { it.id == shellId }
+        BackgroundShellOutputSheet(
+            shellId = shellId,
+            liteShell = liteShell,
+            loadOutput = { viewModel.loadBackgroundShellOutput(shellId) },
+            onDismiss = { selectedShellId = null },
         )
     }
 }
@@ -3980,6 +4006,157 @@ private fun SubagentTabStrip(
                 isActive = tab.id == selected,
                 onClick = { onSelect(tab.id) },
             )
+        }
+    }
+}
+
+/**
+ * Horizontally-scrollable strip of pills — one per background shell
+ * (`run_in_background` Bash tool use) the agent launched. Hidden when no
+ * shell exists so a plain conversation looks unchanged. Tapping a pill
+ * fires [onSelect] with the shell id (opens the stdout drill-in sheet).
+ *
+ * Order is the server-side order — iterate as-is, never re-sort.
+ */
+@Composable
+private fun BackgroundShellStrip(
+    shells: List<BackgroundShellDto>,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (shells.isEmpty()) return
+    val scrollState = rememberScrollState()
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .horizontalScroll(scrollState)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        for (shell in shells) {
+            BackgroundShellPill(shell = shell, onClick = { onSelect(shell.id) })
+        }
+    }
+}
+
+/**
+ * Parsed classification of a background shell's [BackgroundShellDto.state]
+ * string into the small set the pill colours on. `exited:0` is success,
+ * `exited:N` (N≠0) / `exited` / `killed` are failure-ish, anything else
+ * (incl. a future server state we don't recognise) is neutral.
+ */
+private enum class BackgroundShellStateClass { Running, ExitedOk, ExitedBad, Neutral }
+
+private fun classifyBackgroundShellState(state: String): BackgroundShellStateClass = when {
+    state == "running" -> BackgroundShellStateClass.Running
+    state == "exited:0" -> BackgroundShellStateClass.ExitedOk
+    state == "killed" -> BackgroundShellStateClass.ExitedBad
+    state == "exited" -> BackgroundShellStateClass.ExitedBad
+    state.startsWith("exited:") -> BackgroundShellStateClass.ExitedBad
+    else -> BackgroundShellStateClass.Neutral
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BackgroundShellPill(shell: BackgroundShellDto, onClick: () -> Unit) {
+    val cls = classifyBackgroundShellState(shell.state)
+    val container = when (cls) {
+        BackgroundShellStateClass.Running -> MaterialTheme.colorScheme.primaryContainer
+        BackgroundShellStateClass.ExitedOk -> MaterialTheme.colorScheme.tertiaryContainer
+        BackgroundShellStateClass.ExitedBad -> MaterialTheme.colorScheme.errorContainer
+        BackgroundShellStateClass.Neutral -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    val content = when (cls) {
+        BackgroundShellStateClass.Running -> MaterialTheme.colorScheme.onPrimaryContainer
+        BackgroundShellStateClass.ExitedOk -> MaterialTheme.colorScheme.onTertiaryContainer
+        BackgroundShellStateClass.ExitedBad -> MaterialTheme.colorScheme.onErrorContainer
+        BackgroundShellStateClass.Neutral -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val label = shell.command.let { if (it.length > 24) it.take(24) + "…" else it }
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.small,
+        color = container,
+        contentColor = content,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+        )
+    }
+}
+
+/**
+ * Read-only stdout drill-in for one background shell — a ModalBottomSheet
+ * showing the shell's `command` + `state` header and its `output_tail`
+ * (fetched lazily with `include_output=true`) in a monospace, vertically
+ * scrollable body. No kill action in V1.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BackgroundShellOutputSheet(
+    shellId: String,
+    liteShell: BackgroundShellDto?,
+    loadOutput: suspend () -> BackgroundShellDto?,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var loading by remember(shellId) { mutableStateOf(true) }
+    var fetched by remember(shellId) { mutableStateOf<BackgroundShellDto?>(null) }
+    LaunchedEffect(shellId) {
+        loading = true
+        fetched = loadOutput()
+        loading = false
+    }
+    // Prefer the freshly-fetched DTO (carries output_tail + latest state)
+    // but fall back to the lite strip entry for the header while loading.
+    val header = fetched ?: liteShell
+    val command = header?.command ?: shellId
+    val state = header?.state ?: "?"
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text(
+                text = command,
+                style = MaterialTheme.typography.titleSmall,
+                fontFamily = FontFamily.Monospace,
+            )
+            Text(
+                text = state,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp, bottom = 12.dp),
+            )
+            when {
+                loading -> Box(
+                    modifier = Modifier.fillMaxWidth().padding(24.dp),
+                    contentAlignment = Alignment.Center,
+                ) { CircularProgressIndicator() }
+                else -> {
+                    val output = fetched?.outputTail
+                    SelectionContainer {
+                        Text(
+                            text = output?.takeIf { it.isNotEmpty() } ?: "(no output)",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = if (output.isNullOrEmpty())
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 400.dp)
+                                .verticalScroll(rememberScrollState()),
+                        )
+                    }
+                }
+            }
         }
     }
 }

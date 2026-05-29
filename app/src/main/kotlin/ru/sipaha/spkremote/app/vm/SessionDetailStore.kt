@@ -29,11 +29,13 @@ import ru.sipaha.spkremote.app.data.PersistedPendingSend
 import ru.sipaha.spkremote.app.data.SessionHistoryRepository
 import ru.sipaha.spkremote.core.AgentSessionContextResetPayload
 import ru.sipaha.spkremote.core.AppendedPlaceholderOutcome
+import ru.sipaha.spkremote.core.BackgroundShellDto
 import ru.sipaha.spkremote.core.ContentBlockDto
 import ru.sipaha.spkremote.core.EntryRoleDto
 import ru.sipaha.spkremote.core.EntrySummary
 import ru.sipaha.spkremote.core.QueuedBundleSummary
 import ru.sipaha.spkremote.core.SessionActiveSubagentsChangedPayload
+import ru.sipaha.spkremote.core.SessionBackgroundShellsChangedPayload
 import ru.sipaha.spkremote.core.SessionQueueChangedPayload
 import ru.sipaha.spkremote.core.SubagentDto
 import ru.sipaha.spkremote.core.SessionStateDto
@@ -336,6 +338,18 @@ internal class SessionDetailStore(
     private val _selectedSubagent = MutableStateFlow<String?>(null)
     val selectedSubagent: StateFlow<String?> = _selectedSubagent.asStateFlow()
 
+    /**
+     * Background shells (`run_in_background` Bash tool uses) for the open
+     * session, in server-side order. Seeded once on [openSession] via the
+     * lite `get_session_background_shells` call (include_output=false),
+     * then live-updated from the `agent_session_background_shells_changed`
+     * notification (which already carries the full lite list — no refetch).
+     * Drives the `BackgroundShellStrip` on the detail screen. Empty for
+     * sessions that never launched one, or pre-feature servers.
+     */
+    private val _backgroundShells = MutableStateFlow<List<BackgroundShellDto>>(emptyList())
+    val backgroundShells: StateFlow<List<BackgroundShellDto>> = _backgroundShells.asStateFlow()
+
 
     /**
      * One-shot signal emitted after a successful Reset context. Carries the
@@ -391,6 +405,7 @@ internal class SessionDetailStore(
                 optimisticClientSendIds.clear()
                 _activeSubagents.value = emptyList()
                 _selectedSubagent.value = null
+                _backgroundShells.value = emptyList()
             }
         }
     }
@@ -443,6 +458,9 @@ internal class SessionDetailStore(
                 // selection to Main so the new session opens unfiltered.
                 _activeSubagents.value = emptyList()
                 _selectedSubagent.value = null
+                // Drop the previous session's background-shell strip; the
+                // explicit fetch below (after the mutex) re-seeds it.
+                _backgroundShells.value = emptyList()
                 lastSeen.primeFromDisk(sessionId)
                 // Re-materialise optimistic state for every deferred
                 // send whose waiter coroutine is still alive for THIS
@@ -526,6 +544,17 @@ internal class SessionDetailStore(
             fetchInitialOrDiff(active, sessionId, cached)
         }
         sessionList.loadChildren(sessionId)
+        // Seed the background-shell strip once with the lite list (no
+        // output_tail — the strip never needs it). Subsequent mutations
+        // ride the `agent_session_background_shells_changed` notification.
+        scope.launch {
+            val result = sessionList.loadBackgroundShells(sessionId, includeOutput = false)
+            sessionMutex.withLock {
+                // stale-write barrier (see class kdoc invariant 1)
+                if (openSessionId != sessionId) return@withLock
+                _backgroundShells.value = result.backgroundShells
+            }
+        }
         sessionList.ensureNotificationsObserver()
     }
 
@@ -541,6 +570,7 @@ internal class SessionDetailStore(
                 _serverQueuedBundles.value = emptyList()
                 _activeSubagents.value = emptyList()
                 _selectedSubagent.value = null
+                _backgroundShells.value = emptyList()
             }
         }
     }
@@ -677,6 +707,35 @@ internal class SessionDetailStore(
                 applyActiveSubagentsLocked(payload.activeSubagents)
             }
         }
+    }
+
+    override fun onBackgroundShellsChanged(payload: SessionBackgroundShellsChangedPayload) {
+        val openSid = openSessionId ?: return
+        if (payload.sessionId != openSid) return
+        // The notification carries the FULL post-change lite list — mirror
+        // it verbatim. Cross the mutex so the write can't race a concurrent
+        // openSession seed / stale-write barrier on the same flow.
+        scope.launch {
+            sessionMutex.withLock {
+                if (openSessionId != payload.sessionId) return@withLock
+                _backgroundShells.value = payload.backgroundShells
+            }
+        }
+    }
+
+    /**
+     * Fetch the full stdout tail for one background shell of the open
+     * session (`include_output=true`). Returns the matching
+     * [BackgroundShellDto] (carrying `output_tail`) or null when the
+     * shell is gone / the fetch failed / the session was switched away.
+     * Backs the drill-in sheet — kept off the live strip flow so the
+     * strip never carries (and re-renders on) the heavy output text.
+     */
+    suspend fun loadBackgroundShellOutput(shellId: String): BackgroundShellDto? {
+        val sessionId = openSessionId ?: return null
+        val result = sessionList.loadBackgroundShells(sessionId, includeOutput = true)
+        if (openSessionId != sessionId) return null
+        return result.backgroundShells.firstOrNull { it.id == shellId }
     }
 
     /**
