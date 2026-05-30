@@ -391,21 +391,8 @@ fun SessionDetailScreen(
                 title = displayTitle,
                 onBack = onBack,
                 onTitleClick = { if (sessionState is UiData.Loaded) showRenameDialog = true },
-                trailing = {
+                actions = {
                     if (sessionState is UiData.Loaded) {
-                        ContextFillMeter(
-                            totalTokens = activeTotalTokens,
-                            maxTokens = activeMaxTokens,
-                        )
-                        // `raw` only matters for [DisplayState.Unknown]; the
-                        // structured DTO carries no payload there, so an
-                        // empty string is fine — the pill renders "?".
-                        StatePill(state = displayState, raw = "")
-                        RunningElapsed(
-                            displayState = displayState,
-                            stateStartedAtMs = activeStateStartedAtMs,
-                        )
-                        LastActivityLabel(lastActivityMs = lastActivityMs)
                         // Overflow menu — Reset / Compact context. The
                         // anchor's `Box` wrapping is what lets DropdownMenu
                         // compute its caret position; placing the menu
@@ -442,6 +429,28 @@ fun SessionDetailScreen(
                             }
                         }
                     }
+                },
+                // Second row: read-only status indicators. Split off the
+                // title line so a long session title no longer collapses to
+                // an ellipsis to make room for them.
+                statusRow = if (sessionState is UiData.Loaded) {
+                    {
+                        ContextFillMeter(
+                            totalTokens = activeTotalTokens,
+                            maxTokens = activeMaxTokens,
+                        )
+                        // `raw` only matters for [DisplayState.Unknown]; the
+                        // structured DTO carries no payload there, so an
+                        // empty string is fine — the pill renders "?".
+                        StatePill(state = displayState, raw = "")
+                        RunningElapsed(
+                            displayState = displayState,
+                            stateStartedAtMs = activeStateStartedAtMs,
+                        )
+                        LastActivityLabel(lastActivityMs = lastActivityMs)
+                    }
+                } else {
+                    null
                 },
             )
         },
@@ -2687,43 +2696,72 @@ private fun SlimTopBar(
     title: String,
     onBack: () -> Unit,
     onTitleClick: (() -> Unit)? = null,
-    trailing: @Composable RowScope.() -> Unit = {},
+    // Row-1 trailing: real actions (the overflow menu). Kept on the title
+    // line so it's always reachable.
+    actions: @Composable RowScope.() -> Unit = {},
+    // Row-2 status strip: the read-only indicators (context meter, state
+    // pill, elapsed, last-activity). Split onto its own line so the title
+    // gets the full width instead of being squeezed to an ellipsis by the
+    // indicators sharing the line. Null → no second row (e.g. while the
+    // session is still loading and there's nothing to show).
+    statusRow: (@Composable RowScope.() -> Unit)? = null,
 ) {
     Surface(
         color = MaterialTheme.colorScheme.surface,
         tonalElevation = 2.dp,
     ) {
-        Row(
+        Column(
+            // Top (status bar) + horizontal (landscape cutout / side nav
+            // bar) so the back button isn't hidden under the left camera
+            // notch in landscape. Applied to the Column so both rows clear
+            // the insets.
             modifier = Modifier
                 .fillMaxWidth()
-                // Top (status bar) + horizontal (landscape cutout / side
-                // nav bar) so the back button isn't hidden under the left
-                // camera notch in landscape.
                 .windowInsetsPadding(
                     WindowInsets.safeDrawing.only(
                         WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
                     ),
-                )
-                .height(44.dp)
-                .padding(horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                ),
         ) {
-            IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                }
+                val titleModifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 4.dp)
+                    .let { if (onTitleClick != null) it.clickable(onClick = onTitleClick) else it }
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = titleModifier,
+                )
+                actions()
             }
-            val titleModifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 4.dp)
-                .let { if (onTitleClick != null) it.clickable(onClick = onTitleClick) else it }
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleSmall,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = titleModifier,
-            )
-            trailing()
-            Spacer(Modifier.padding(end = 8.dp))
+            if (statusRow != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // Indent under the title (back button 40dp + the
+                        // title's 4dp inset) so the strip reads as a
+                        // subtitle line. Horizontal scroll guards against
+                        // an overflow on very narrow screens.
+                        .horizontalScroll(rememberScrollState())
+                        .padding(start = 48.dp, end = 12.dp, top = 2.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    statusRow()
+                }
+            }
         }
     }
 }
