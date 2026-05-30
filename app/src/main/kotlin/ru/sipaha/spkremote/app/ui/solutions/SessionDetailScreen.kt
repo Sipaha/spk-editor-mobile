@@ -1049,7 +1049,7 @@ private fun ChatList(
                 //      — but defensive).
                 itemsIndexed(
                     items = timeline,
-                    key = { _, item ->
+                    key = { position, item ->
                         when (item) {
                             is ru.sipaha.spkremote.core.ChatItem.DateSeparator ->
                                 "date:${item.epochDay}"
@@ -1062,10 +1062,17 @@ private fun ChatList(
                                     // queue-drain → message-appended handoff (a bare
                                     // `csid:N` collision would crash the LazyColumn).
                                     entry in serverQueueIdentitySet ->
-                                        "queued:${entry.clientSendId ?: entry.preview.hashCode()}"
+                                        "queued:${entry.clientSendId ?: "pos$position"}"
                                     entry.clientSendId != null -> "csid:${entry.clientSendId}"
                                     entry.index >= 0 -> "idx:${entry.index}"
-                                    else -> "role:${entry.role}#${entry.preview.hashCode()}"
+                                    // Un-indexed streaming placeholders (index == -1,
+                                    // from applyAppendedPlaceholder — the notification
+                                    // carries no server index). Two such tool-call
+                                    // placeholders with the same truncated preview used
+                                    // to collide on `role#previewHash` and crash the
+                                    // LazyColumn ("Key … already used"). The itemsIndexed
+                                    // position is unique within the list, so key on it.
+                                    else -> "pos$position:${entry.role}"
                                 }
                             }
                         }
