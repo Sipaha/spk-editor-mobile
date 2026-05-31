@@ -191,6 +191,14 @@ class RemoteClient internal constructor(
     @Volatile private var lastConnectFailure: ConnectFailure? = null
 
     /**
+     * Wall-clock millis when the current transport last reached
+     * `Connected`. Read by [forceReconnect]'s grace window to refuse
+     * tearing down a connection that just established. 0 until the first
+     * successful handshake.
+     */
+    @Volatile private var lastConnectedAtMs: Long = 0L
+
+    /**
      * Current transport (null while reconnecting). Written only by the
      * lifecycle coroutine and [close]; read from arbitrary coroutines
      * via [callInternal] — @Volatile so non-Connected reads see the
@@ -288,9 +296,26 @@ class RemoteClient internal constructor(
      * No-ops when [_connectionState] is not `Connected` (any other
      * value means a reconnect is either already running or terminal,
      * neither of which we want to disturb).
+     *
+     * Also no-ops when the current connection is younger than
+     * [FORCE_RECONNECT_GRACE_MS]. A genuine zombie socket has been
+     * `Connected` for a long time (it died mid-session); a connection
+     * that JUST established and is already being asked to tear down is
+     * the signature of a reconnect storm — an on-resume / on-open
+     * liveness probe (or the heartbeat) firing against a socket that
+     * hasn't had a chance to prove itself, whose `capabilities` ping
+     * raced the handshake. Refusing to tear down a fresh connection
+     * breaks that feedback loop: the probe that misjudged a 1s-old
+     * socket as dead can no longer kick it, so the connection survives
+     * and steady-state liveness detection (the 30s heartbeat) takes over.
      */
     fun forceReconnect(reason: String = "heartbeat watchdog: server unresponsive") {
         if (_connectionState.value !is ConnectionState.Connected) return
+        val age = System.currentTimeMillis() - lastConnectedAtMs
+        if (age in 0 until FORCE_RECONNECT_GRACE_MS) {
+            // Fresh connection — refuse to tear it down (storm guard, see kdoc).
+            return
+        }
         val toClose: RemoteTransport?
         synchronized(stateLock) {
             if (closing) return
@@ -713,6 +738,7 @@ class RemoteClient internal constructor(
                 // queue flush after resubscribe so queued calls hit a
                 // fully-registered server.
                 onConnected()
+                lastConnectedAtMs = System.currentTimeMillis()
                 _connectionState.value = ConnectionState.Connected
                 firstConnect?.takeIf { !it.isCompleted }?.complete(Unit)
             } else {
@@ -1019,6 +1045,16 @@ class RemoteClient internal constructor(
          * mitigated by the `:app` bounce-to-input recovery path.
          */
         const val DEFAULT_QUEUE_TTL_MS: Long = 24L * 60L * 60L * 1_000L
+
+        /**
+         * Grace window after a connection reaches `Connected` during which
+         * [forceReconnect] is a no-op. Breaks reconnect storms caused by a
+         * liveness probe (or the heartbeat) misjudging a just-established
+         * socket as dead. Comfortably longer than a handshake + a probe's
+         * `capabilities` round-trip, far shorter than the age of any real
+         * mid-session zombie socket.
+         */
+        const val FORCE_RECONNECT_GRACE_MS: Long = 12_000L
 
         /**
          * Default per-call timeout for [call]. Bounds RPC duration so a
