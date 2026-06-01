@@ -913,22 +913,37 @@ private fun ChatList(
     val stickyBottom = remember { mutableStateOf(true) }
     val isUserDragging by lazyState.interactionSource.collectIsDraggedAsState()
     LaunchedEffect(lazyState) {
-        var sawUserDrag = false
+        // Unstick the moment the user starts dragging — they've taken
+        // control of the viewport, so a streaming reply they're reading
+        // mid-message must stop yanking back to the bottom.
+        //
+        // Previously sticky was resampled only at drag-END gated on
+        // `!isScrollInProgress`. During active streaming the back-to-back
+        // `animateScrollToItem(0)` calls keep `isScrollInProgress`
+        // continuously true, so that resample was starved and sticky never
+        // flipped off — hence the jump-on-every-update while scrolled up.
         launch {
             lazyState.interactionSource.interactions.collect { i ->
                 if (i is androidx.compose.foundation.interaction.DragInteraction.Start) {
-                    sawUserDrag = true
+                    stickyBottom.value = false
                 }
             }
         }
-        androidx.compose.runtime.snapshotFlow { lazyState.isScrollInProgress }
-            .collect { scrolling ->
-                if (!scrolling && sawUserDrag) {
-                    sawUserDrag = false
-                    stickyBottom.value = lazyState.firstVisibleItemIndex == 0 &&
-                        lazyState.firstVisibleItemScrollOffset == 0
-                }
+        // Re-arm sticky-bottom only when the viewport SETTLES at the bottom
+        // (scroll finished, index 0 / offset 0) — the user scrolled back
+        // down or tapped jump-to-bottom. Gating on `!isScrollInProgress`
+        // avoids a race at drag-start (the first drag frame is still at the
+        // bottom) and is harmless during streaming (sticky is already true
+        // there, so an in-progress auto-scroll doesn't need to re-arm).
+        launch {
+            androidx.compose.runtime.snapshotFlow {
+                !lazyState.isScrollInProgress &&
+                    lazyState.firstVisibleItemIndex == 0 &&
+                    lazyState.firstVisibleItemScrollOffset == 0
+            }.collect { settledAtBottom ->
+                if (settledAtBottom) stickyBottom.value = true
             }
+        }
     }
     LaunchedEffect(combined.size, newestEntryKey, showThinking) {
         if (combined.isEmpty()) return@LaunchedEffect
