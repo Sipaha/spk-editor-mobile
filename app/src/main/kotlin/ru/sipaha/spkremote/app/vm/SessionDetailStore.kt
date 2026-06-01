@@ -3,6 +3,7 @@ package ru.sipaha.spkremote.app.vm
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,6 +63,15 @@ import java.util.concurrent.atomic.AtomicLong
 
 /** Page size for [SessionDetailStore.openSession] / [SessionDetailStore.loadOlder]. */
 private const val SESSION_PAGE_SIZE = 50
+
+/**
+ * Cadence of the tail-resync poll while the open session's agent is
+ * actively producing — the safety net for a lost (and unsequenced)
+ * `agent_session_message_appended` on a live socket. Short enough that a
+ * stranded reply surfaces within a few seconds; only runs while
+ * Running/Stopping, so it costs nothing on an idle session.
+ */
+private const val TAIL_RESYNC_INTERVAL_MS: Long = 4_000L
 
 /**
  * Per-attachment grand timeout for deferred-send. `UploadManager` has
@@ -387,6 +397,17 @@ internal class SessionDetailStore(
 
     @Volatile
     var openSessionId: String? = null
+
+    /**
+     * Periodic tail-resync while the open session's agent is actively
+     * producing (Running / Stopping). The `agent_session_message_appended`
+     * stream is best-effort and NOT sequenced, so a notification lost on a
+     * live socket with no follow-up (the lost one was the last) would
+     * never be re-fetched until the next reconnect / resume / send. This
+     * poller closes that gap by pulling an `after_index` diff every
+     * [TAIL_RESYNC_INTERVAL_MS]; it's a no-op once the session goes Idle.
+     */
+    private var tailResyncJob: Job? = null
         private set
 
     /**
@@ -403,6 +424,8 @@ internal class SessionDetailStore(
 
     /** Tear-down hook called from coordinator on server switch / disconnect. */
     fun reset() {
+        tailResyncJob?.cancel()
+        tailResyncJob = null
         _isLoadingOlder.value = false
         // Detail-state mutations MUST run under `sessionMutex` — otherwise
         // an in-flight `withLock` block that already cleared its stale-write
@@ -436,6 +459,8 @@ internal class SessionDetailStore(
         // [reset] (driven by onTearDown) does that. Only drop the
         // open-session marker so resumeSession in onReconnected sees null.
         openSessionId = null
+        tailResyncJob?.cancel()
+        tailResyncJob = null
     }
 
     /** Bounce-to-input recovery routed here from ConnectionManager. */
@@ -584,6 +609,7 @@ internal class SessionDetailStore(
             }
         }
         sessionList.ensureNotificationsObserver()
+        startTailResync(sessionId)
         // Opening a session over a silently-dead socket (a zombie left by a
         // Doze window or a server restart the client never detected — state
         // still reads "Connected", no banner) would let the initial
@@ -597,7 +623,35 @@ internal class SessionDetailStore(
         scope.launch { context.probeLivenessNow() }
     }
 
+    /**
+     * Start (or restart) the tail-resync poller for [sessionId]. Runs for
+     * the lifetime of the open session; each tick pulls an `after_index`
+     * diff via [resumeSession] ONLY while the agent is actively producing
+     * (Running / Stopping), which is exactly when a lost
+     * `message_appended` would strand the tail. Idle / awaiting-input /
+     * errored ticks are cheap no-ops (no poll), so an open-but-quiet
+     * session generates no traffic. `resumeSession` also refreshes the
+     * session state, so a missed Idle-transition notification is picked up
+     * here and the poller naturally goes quiet.
+     */
+    private fun startTailResync(sessionId: String) {
+        tailResyncJob?.cancel()
+        tailResyncJob = scope.launch {
+            while (true) {
+                delay(TAIL_RESYNC_INTERVAL_MS)
+                if (openSessionId != sessionId) break
+                val producing = when ((_session.value as? UiData.Loaded)?.value?.state) {
+                    is SessionStateDto.Running, SessionStateDto.Stopping -> true
+                    else -> false
+                }
+                if (producing) resumeSession(sessionId)
+            }
+        }
+    }
+
     fun closeSession() {
+        tailResyncJob?.cancel()
+        tailResyncJob = null
         scope.launch {
             sessionMutex.withLock {
                 openSessionId = null
@@ -1213,14 +1267,21 @@ internal class SessionDetailStore(
                     // until the user navigates away and back.
                     applyActiveSubagentsLocked(result.activeSubagents)
                     if (fresh.isEmpty()) {
-                        if (result.totalCount >= 0 && result.totalCount != latest.value.totalCount) {
+                        // No new entries, but still adopt the freshest state +
+                        // total. The tail-resync poller relies on this to notice
+                        // the agent went Idle (and stop polling) even when the
+                        // state-change notification itself was the lost event.
+                        val newTotal =
+                            if (result.totalCount >= 0) maxOf(latest.value.totalCount, result.totalCount)
+                            else latest.value.totalCount
+                        if (newTotal != latest.value.totalCount || result.state != latest.value.state) {
                             _session.value = UiData.Loaded(
-                                latest.value.copy(totalCount = result.totalCount),
+                                latest.value.copy(totalCount = newTotal, state = result.state),
                             )
                         }
                         return@withLock
                     }
-                    val updated = latest.value.copy(entries = merged, totalCount = mergedTotal)
+                    val updated = latest.value.copy(entries = merged, totalCount = mergedTotal, state = result.state)
                     _session.value = UiData.Loaded(updated)
                     reconcileOptimisticLocked(merged)
                     fresh.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
