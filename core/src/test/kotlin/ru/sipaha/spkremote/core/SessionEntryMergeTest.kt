@@ -7,6 +7,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -194,6 +195,43 @@ class SessionEntryMergeTest {
             afterReplace.count { it.index == 3 },
             "a placeholder + racing resync must not yield two slots with index 3",
         )
+    }
+
+    // -------------------------------------------------------------------------
+    // dedupeEntriesByIndex (render-time defense-in-depth guard)
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `dedupe collapses duplicate-index slots to the first occurrence`() {
+        val out = dedupeEntriesByIndex(
+            listOf(
+                entry("user", "a", index = 0),
+                entry("assistant", "first927", index = 927),
+                entry("assistant", "second927", index = 927),
+            ),
+        )
+        assertEquals(2, out.size)
+        assertEquals(1, out.count { it.index == 927 })
+        assertEquals("first927", out[1].preview)
+    }
+
+    @Test
+    fun `dedupe keeps every un-indexed entry - placeholders and optimistic are distinct`() {
+        // index == -1 entries must NOT collapse — multiple optimistic /
+        // streaming placeholders legitimately coexist and key on csid/pos.
+        val input = listOf(
+            entry("user", "opt-a", index = -1, clientSendId = 1L),
+            entry("user", "opt-b", index = -1, clientSendId = 2L),
+            entry("assistant", "ph", index = -1),
+        )
+        val out = dedupeEntriesByIndex(input)
+        assertEquals(3, out.size)
+    }
+
+    @Test
+    fun `dedupe returns the same instance when there is nothing to drop`() {
+        val input = listOf(entry("user", "a", index = 0), entry("assistant", "b", index = 1))
+        assertSame(input, dedupeEntriesByIndex(input))
     }
 
     /**

@@ -87,6 +87,36 @@ fun applyAppendedPlaceholder(
 }
 
 /**
+ * Defense-in-depth guard for the chat list: collapse any entries that share
+ * a server `index` (>= 0) down to their FIRST occurrence, preserving order.
+ *
+ * Two list slots with the same index resolve to the same `idx:N` LazyColumn
+ * key and HARD-CRASH the chat ("Key idx:N was already used"). The merge /
+ * append paths in `SessionDetailStore` are meant to keep indices unique, but
+ * the position-vs-index dual-addressing there has produced this crash family
+ * more than once — this guard makes a residual duplicate degrade to a
+ * harmless double-render-avoided instead of an app kill.
+ *
+ *   - Entries with `index < 0` (optimistic bubbles, un-indexed streaming
+ *     placeholders) are passed through untouched — they are legitimately
+ *     distinct and never key on `idx:`.
+ *   - When nothing is dropped the SAME list instance is returned, so the
+ *     common (clean) case adds no allocation and keeps referential stability
+ *     for `remember`/recomposition.
+ *
+ * Pure — never mutates [entries].
+ */
+fun dedupeEntriesByIndex(entries: List<EntrySummary>): List<EntrySummary> {
+    val seen = HashSet<Int>()
+    val out = ArrayList<EntrySummary>(entries.size)
+    for (e in entries) {
+        if (e.index >= 0 && !seen.add(e.index)) continue
+        out.add(e)
+    }
+    return if (out.size == entries.size) entries else out
+}
+
+/**
  * Pop optimistic bubbles whose corresponding server-side "user" entry
  * has now landed. Matching is **id-first** (via `client_send_id`
  * stamped on the optimistic bubble + echoed by the server) with a

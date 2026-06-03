@@ -856,7 +856,27 @@ private fun ChatList(
     val visibleOptimisticEntries = remember(optimistic, echoedCsids) {
         ru.sipaha.spkremote.core.visibleOptimistic(optimistic, echoedCsids)
     }
-    val combined: List<EntrySummary> = server.entries + visibleOptimisticEntries + syntheticQueueEntries
+    // Defense-in-depth: collapse any same-`index` server slots before they
+    // reach the LazyColumn key derivation. The store's merge paths are meant
+    // to keep indices unique, but the position-vs-index dual addressing there
+    // has crashed this list with "Key idx:N already used" more than once; this
+    // guard turns a residual duplicate into a dropped row instead of an app
+    // kill. Should essentially never fire now that the placeholder carries its
+    // server index — the warn is the tripwire that says it did.
+    val renderServerEntries: List<EntrySummary> = remember(server.entries) {
+        val deduped = ru.sipaha.spkremote.core.dedupeEntriesByIndex(server.entries)
+        if (deduped.size != server.entries.size) {
+            android.util.Log.w(
+                "SessionDetailScreen",
+                "dropped ${server.entries.size - deduped.size} duplicate-index chat " +
+                    "entr${if (server.entries.size - deduped.size == 1) "y" else "ies"} " +
+                    "before render to avoid a LazyColumn key crash (root cause should be " +
+                    "fixed upstream in SessionEntryMerge/SessionDetailStore)",
+            )
+        }
+        deduped
+    }
+    val combined: List<EntrySummary> = renderServerEntries + visibleOptimisticEntries + syntheticQueueEntries
     // Identity of every optimistic entry is referential — they are the
     // same objects the store published — so we can use `===` to flip
     // the per-bubble status icon without touching server entries.
