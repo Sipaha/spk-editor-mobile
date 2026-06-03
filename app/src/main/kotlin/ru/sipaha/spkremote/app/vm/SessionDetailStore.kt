@@ -663,16 +663,43 @@ internal class SessionDetailStore(
                     producing -> {
                         trailing = TAIL_RESYNC_TRAILING_TICKS
                         resumeSession(sessionId)
+                        resyncLatestEntryContent(sessionId)
                     }
                     trailing > 0 -> {
                         // Agent just stopped — keep resyncing briefly to
                         // recover a stranded final message / Idle transition.
                         trailing--
                         resumeSession(sessionId)
+                        resyncLatestEntryContent(sessionId)
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Re-pull the CONTENT of the newest known entry during tail-resync.
+     *
+     * `resumeSession`'s `after_index = lastSeen` diff can only ADD entries
+     * past the cursor and dedups existing slots untouched — it can never
+     * refresh a slot the local view already has. But a streaming reply's body
+     * arrives as repeated `message_appended` for the SAME index, each one
+     * re-fetching that entry via [fetchAndReplaceEntry]. If the trailing
+     * updates (and the Idle-transition notification) are lost, the bubble
+     * freezes mid-content and `resumeSession` is structurally unable to heal
+     * it — it strands the final message ("cut off in the middle, won't load
+     * further"). So while we resync, also re-fetch the latest entry's content.
+     *
+     * [fetchAndReplaceEntry] is content-equality guarded (skips the StateFlow
+     * write + markdown re-render when the body is unchanged), so on a healthy
+     * stream this is a cheap no-op; its value is recovering the one entry the
+     * `after_index` diff can't see.
+     */
+    private fun resyncLatestEntryContent(sessionId: String) {
+        if (openSessionId != sessionId) return
+        val loaded = _session.value as? UiData.Loaded ?: return
+        val newestIndex = loaded.value.entries.lastOrNull { it.index >= 0 }?.index ?: return
+        fetchAndReplaceEntry(sessionId, newestIndex)
     }
 
     fun closeSession() {
