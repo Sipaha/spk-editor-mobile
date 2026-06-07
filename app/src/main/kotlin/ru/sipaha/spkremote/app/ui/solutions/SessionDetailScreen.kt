@@ -170,6 +170,7 @@ import ru.sipaha.spkremote.core.BackgroundAgentDto
 import ru.sipaha.spkremote.core.BackgroundShellDto
 import ru.sipaha.spkremote.core.ConnectionState
 import ru.sipaha.spkremote.core.ContentBlockDto
+import ru.sipaha.spkremote.core.ContextFill
 import ru.sipaha.spkremote.core.DisplayState
 import ru.sipaha.spkremote.app.ui.common.ConnectionStatusBanner
 import ru.sipaha.spkremote.core.EntryImage
@@ -4105,9 +4106,12 @@ internal fun LastActivityLabel(lastActivityMs: Long?) {
  */
 @Composable
 private fun ContextFillMeter(totalTokens: Long?, maxTokens: Long?) {
-    if (totalTokens == null || maxTokens == null || maxTokens <= 0L) return
-    val fraction: Float = (totalTokens.toFloat() / maxTokens.toFloat()).coerceIn(0f, 1f)
-    val percent: Int = (fraction * 100f).toInt()
+    // Sleeping / restored sessions arrive with `maxTokens == null` (the
+    // desktop never restores `cached_max_tokens` from disk), so resolve a
+    // default window instead of blanking the meter — see [ContextFill].
+    val fill = ContextFill.compute(totalTokens, maxTokens) ?: return
+    val fraction: Float = fill.fraction
+    val percent: Int = fill.percent
     val color: Color = when {
         fraction >= 0.80f -> MaterialTheme.colorScheme.error
         fraction >= 0.50f -> MaterialTheme.colorScheme.tertiary
