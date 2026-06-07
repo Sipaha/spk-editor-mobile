@@ -3,6 +3,9 @@ package ru.sipaha.spkremote.core
 import java.util.concurrent.ConcurrentLinkedQueue
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Test fake for [RemoteTransport].
@@ -61,7 +64,7 @@ internal open class FakeRemoteTransport(
      * Returns true if the handshake completed successfully (client's
      * response hex matches the HMAC we expect).
      */
-    fun completeHandshake(): Boolean {
+    fun completeHandshake(negotiateCompression: Boolean = false): Boolean {
         val nonce = ByteArray(HmacChallengeAuth.NONCE_LEN) { (it + 1).toByte() }
         val challengeHex = HexCodec.encode(nonce)
         val challengeFrame =
@@ -70,11 +73,21 @@ internal open class FakeRemoteTransport(
         // The listener is synchronous in our fake — by the time onText
         // returns, the client has sent its response.
         val lastText = sent.lastOrNull() ?: return false
+        // Parse-and-verify like the real server: check only the HMAC `response`
+        // field, ignoring optional capability fields (compress/dict) the client
+        // now advertises. An exact-string match would be brittle to additions.
+        val obj = runCatching { JsonRpc.json.parseToJsonElement(lastText).jsonObject }
+            .getOrNull() ?: return false
+        if (obj["type"]?.jsonPrimitive?.contentOrNull != "response") return false
         val expectedHmac = expectedHmac(pairingUrl.secret, nonce)
         val expectedHex = HexCodec.encode(expectedHmac)
-        val expectedResponse = """{"type":"response","response":"$expectedHex"}"""
-        if (lastText != expectedResponse) return false
-        listener.onText("""{"type":"welcome","client":"${pairingUrl.client}"}""")
+        if (obj["response"]?.jsonPrimitive?.contentOrNull != expectedHex) return false
+        val welcome = if (negotiateCompression) {
+            """{"type":"welcome","client":"${pairingUrl.client}","compress":"deflate","dict":1}"""
+        } else {
+            """{"type":"welcome","client":"${pairingUrl.client}"}"""
+        }
+        listener.onText(welcome)
         return true
     }
 

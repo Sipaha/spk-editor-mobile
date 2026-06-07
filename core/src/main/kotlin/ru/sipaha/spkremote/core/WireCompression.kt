@@ -28,6 +28,9 @@ class WireCompressionException(message: String) : Exception(message)
  * the Rust `flate2` codec in `crates/remote_control/src/wire_codec.rs`.
  */
 object WireCompression {
+    /** Handshake codec token negotiated in the `compress`/`welcome` frames. */
+    const val CODEC_DEFLATE: String = "deflate"
+
     /** "spkz" — distinguishes a compressed frame from an upload chunk. */
     private val MAGIC = byteArrayOf(0x73, 0x70, 0x6B, 0x7A)
     private const val FORMAT_DEFLATE: Byte = 1

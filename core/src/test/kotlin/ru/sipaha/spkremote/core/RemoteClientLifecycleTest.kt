@@ -73,10 +73,11 @@ class RemoteClientLifecycleTest {
     private suspend fun TestScope.connectAndHandshake(
         client: RemoteClient,
         factory: FakeRemoteTransportFactory,
+        negotiateCompression: Boolean = false,
     ) {
         val job = async { client.connect(scope = this@connectAndHandshake) }
         runCurrent()
-        factory.latest().completeHandshake()
+        factory.latest().completeHandshake(negotiateCompression)
         runCurrent()
         job.await()
     }
@@ -162,6 +163,67 @@ class RemoteClientLifecycleTest {
         client.close()
         runCurrent()
     }
+
+    @Test
+    fun `negotiated compression sends a large call as a compressed binary frame`() =
+        runTest(StandardTestDispatcher()) {
+            val (client, factory) = newClient()
+            connectAndHandshake(client, factory, negotiateCompression = true)
+
+            val longContent = "lorem ipsum dolor sit amet ".repeat(40)
+            val callJob = async {
+                client.queueCall(
+                    "remote.solution_agent.send_message",
+                    buildJsonObject {
+                        put("session_id", "s1")
+                        put("content", longContent)
+                    },
+                )
+            }
+            runCurrent()
+
+            // The request went out as a compressed BINARY frame, not text.
+            val tx = factory.latest()
+            assertTrue(tx.sent.none { it.contains("send_message") }, "should not send text: ${tx.sent}")
+            val binary = tx.sentBinary.toList().firstOrNull { WireCompression.isCompressed(it) }
+            assertTrue(binary != null, "expected a compressed binary request frame")
+            val decoded = WireCompression.decompress(binary!!)
+            assertTrue(decoded.contains("send_message"), "decoded request: $decoded")
+            assertTrue(decoded.contains(longContent), "decoded request must carry the payload")
+
+            // Reply (plain text is always accepted) to unblock the call.
+            val id = JSON_ID_REGEX.find(decoded)!!.groupValues[1].toLong()
+            tx.emit("""{"jsonrpc":"2.0","id":$id,"result":{"ok":true}}""")
+            runCurrent()
+            assertNull(callJob.await().error)
+            client.close()
+            runCurrent()
+        }
+
+    @Test
+    fun `negotiated compression decodes an inbound compressed notification`() =
+        runTest(StandardTestDispatcher()) {
+            val (client, factory) = newClient()
+            val received = mutableListOf<JsonObject>()
+            val collector = launch { client.notifications.collect { received += it.jsonObject } }
+            connectAndHandshake(client, factory, negotiateCompression = true)
+
+            val notif =
+                """{"jsonrpc":"2.0","method":"remote/notification","params":{"kind":""" +
+                    "\"session_state_changed\",\"session_id\":\"s1\"}}"
+            factory.latest().emitBinary(WireCompression.compress(notif, WIRE_DICT_PROTO_V1))
+            runCurrent()
+
+            assertTrue(
+                received.any {
+                    it["method"]?.jsonPrimitive?.content == "remote/notification"
+                },
+                "compressed notification should be decoded and delivered: $received",
+            )
+            collector.cancel()
+            client.close()
+            runCurrent()
+        }
 
     @Test
     fun `queueCall sends immediately when connected`() = runTest(StandardTestDispatcher()) {

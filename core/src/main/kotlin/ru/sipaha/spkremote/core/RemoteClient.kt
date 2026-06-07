@@ -24,6 +24,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.Serializable
@@ -205,6 +206,15 @@ class RemoteClient internal constructor(
      * most recent write.
      */
     @Volatile private var transport: RemoteTransport? = null
+
+    /**
+     * Negotiated outbound wire-compression dictionary id, or
+     * [COMPRESSION_DISABLED] when the server didn't accept compression (older
+     * server, or our advertisement was ignored). Set from the `welcome` frame
+     * and reset on each fresh handshake. Read on the send path in
+     * [callInternal]; @Volatile so post-handshake sends observe it.
+     */
+    @Volatile private var negotiatedOutboundDict: Int = COMPRESSION_DISABLED
 
     /**
      * Queue half of the state machine. Set lazily in [connect]. All
@@ -415,7 +425,7 @@ class RemoteClient internal constructor(
                 pending.remove(id)?.cancel()
             }
             val sent = try {
-                active.send(req)
+                sendMaybeCompressed(active, req)
             } catch (t: Throwable) {
                 pending.remove(id)
                 cont.resumeWithException(t)
@@ -426,6 +436,22 @@ class RemoteClient internal constructor(
                 cont.resumeWithException(IllegalStateException("websocket refused frame"))
             }
         }
+    }
+
+    /**
+     * Send a JSON-RPC text frame, transparently compressing it to a binary
+     * frame when the server negotiated wire compression in its `welcome` and
+     * the payload is large enough to benefit. Falls back to a plain TEXT
+     * frame otherwise, so a frame is never inflated and a peer that didn't
+     * negotiate compression only ever receives text.
+     */
+    private fun sendMaybeCompressed(tx: RemoteTransport, text: String): Boolean {
+        val dict = negotiatedOutboundDict
+        if (dict != COMPRESSION_DISABLED) {
+            val frame = WireCompression.compressIfWorthwhile(text, dict)
+            if (frame != null) return tx.send(frame)
+        }
+        return tx.send(text)
     }
 
     /**
@@ -863,15 +889,26 @@ class RemoteClient internal constructor(
 
         override fun onBinary(bytes: ByteArray) {
             // R-2 handshake is text/JSON only — binary before Established
-            // means the peer speaks a different protocol. Post-Established
-            // binary is unexpected too (JSON-RPC is text); drop silently.
+            // means the peer speaks a different protocol.
             if (ref.stage != HandshakeStage.Established) {
                 completeTransient(
                     ConnectFailure.ProtocolError(
                         "unexpected binary frame during handshake — peer isn't spk-editor"
                     )
                 )
+                return
             }
+            // Post-Established: a binary frame is a compressed JSON-RPC message
+            // (uploads only flow client→server, so we never receive those).
+            if (WireCompression.isCompressed(bytes)) {
+                val text = runCatching { WireCompression.decompress(bytes) }.getOrNull()
+                if (text != null) dispatchJsonRpc(text)
+                // A decode failure can't be wire corruption (TLS guarantees
+                // integrity) — it would be a codec bug. Drop rather than tear
+                // the connection down over one frame.
+                return
+            }
+            // Unknown binary frame — drop silently (forward-compat).
         }
 
         override fun onText(text: String) {
@@ -892,6 +929,9 @@ class RemoteClient internal constructor(
                     // deliberately null until handshake completes (see
                     // `runOneAttempt`).
                     val tx = handshakeTx.get() ?: return
+                    // Fresh handshake — clear any prior negotiation until the
+                    // welcome re-confirms it.
+                    negotiatedOutboundDict = COMPRESSION_DISABLED
                     val responseBytes = auth.respond(challengeBytes)
                     val responseFrame = JsonRpc.json.encodeToString(
                         HandshakeResponseFrame.serializer(),
@@ -906,6 +946,8 @@ class RemoteClient internal constructor(
                     val type = obj?.get("type")?.jsonPrimitive?.contentOrNull
                     when (type) {
                         "welcome" -> {
+                            negotiatedOutboundDict =
+                                obj?.let { parseNegotiatedDict(it) } ?: COMPRESSION_DISABLED
                             ref.stage = HandshakeStage.Established
                             handshake.complete(AttemptOutcome.Connected)
                         }
@@ -973,6 +1015,22 @@ class RemoteClient internal constructor(
         }
     }
 
+    /**
+     * Read negotiated compression from a `welcome` frame
+     * (`{"type":"welcome",...,"compress":"deflate","dict":N}`). Returns the
+     * dictionary id to use for outbound frames, or [COMPRESSION_DISABLED] when
+     * the server offered no compression — or a codec / dictionary this client
+     * doesn't implement (in which case we stay on plain text rather than risk a
+     * frame we can't produce or the peer can't read).
+     */
+    private fun parseNegotiatedDict(welcome: JsonObject): Int {
+        val codec = welcome["compress"]?.jsonPrimitive?.contentOrNull
+            ?: return COMPRESSION_DISABLED
+        if (codec != WireCompression.CODEC_DEFLATE) return COMPRESSION_DISABLED
+        val dict = welcome["dict"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: WIRE_DICT_NONE
+        return if (dict == WIRE_DICT_PROTO_V1) WIRE_DICT_PROTO_V1 else WIRE_DICT_NONE
+    }
+
     private fun dispatchJsonRpc(text: String) {
         val parsed = runCatching { JsonRpc.json.parseToJsonElement(text) }.getOrNull() ?: return
         val obj = parsed.jsonObject
@@ -1013,6 +1071,14 @@ class RemoteClient internal constructor(
     private data class HandshakeResponseFrame(
         val type: String = "response",
         val response: String,
+        /**
+         * Wire-compression codecs this client understands. The server echoes
+         * the one it picked in its `welcome` (`compress`/`dict`). Older servers
+         * ignore this field, so compression stays off against them.
+         */
+        val compress: List<String> = listOf(WireCompression.CODEC_DEFLATE),
+        /** Highest preset-dictionary id this client implements. */
+        val dict: Int = WIRE_DICT_PROTO_V1,
     )
 
     private sealed interface AttemptOutcome {
@@ -1045,6 +1111,9 @@ class RemoteClient internal constructor(
          * mitigated by the `:app` bounce-to-input recovery path.
          */
         const val DEFAULT_QUEUE_TTL_MS: Long = 24L * 60L * 60L * 1_000L
+
+        /** [negotiatedOutboundDict] sentinel: server didn't accept compression. */
+        private const val COMPRESSION_DISABLED: Int = -1
 
         /**
          * Grace window after a connection reaches `Connected` during which
