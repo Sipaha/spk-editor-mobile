@@ -416,7 +416,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application), C
 
     /**
      * Pair a new server (or re-pair an existing one) from a raw
-     * `spk-editor-remote://…` URL. Validates + persists asynchronously
+     * `sawe-remote://…` URL. Validates + persists asynchronously
      * on IO, then becomes the active server.
      */
     fun addServer(rawUrl: String) = connectionMgr.addServer(rawUrl)

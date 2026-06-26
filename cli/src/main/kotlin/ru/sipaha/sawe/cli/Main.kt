@@ -38,7 +38,7 @@ Usage:
   spk-remote-cli <pairing-url> [method] [params-json]
   SPK_EDITOR_PAIRING_URL=<url> spk-remote-cli [method] [params-json]
 
-  pairing-url:  spk-editor-remote://host:port?secret=...&server_fp=...&client=...
+  pairing-url:  sawe-remote://host:port?secret=...&server_fp=...&client=...
   method:       JSON-RPC method (default: remote.editor.capabilities)
   params-json:  optional JSON for `params`, e.g. '{"kinds":["buffer_opened"]}'
 
