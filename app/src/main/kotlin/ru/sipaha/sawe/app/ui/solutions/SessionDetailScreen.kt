@@ -316,39 +316,8 @@ fun SessionDetailScreen(
         }
     }
 
-    val displayTitle: String = (sessionState as? UiData.Loaded)?.value?.title?.ifBlank { "Session" }
-        ?: "Session"
-    val sessionStateDto: SessionStateDto? = (sessionState as? UiData.Loaded)?.value?.state
-    val displayState: DisplayState = sessionStateDto?.displayState() ?: DisplayState.Unknown
-
-    // F-phone chip row inputs.
-    //
-    // `parentId` is read from the loaded session (`GetSessionResult` now
-    // carries `parent_session_id`). The parent's *title* — the label we
-    // want to render on the chip — isn't in that payload, so we cross-
-    // reference `_sessions` (the list-of-sessions cache for the active
-    // solution). When the user deep-linked into a child whose parent
-    // isn't in that cache, fall back to a short hash of the id.
     val loadedSession: GetSessionResult? = (sessionState as? UiData.Loaded)?.value
-    val parentId: String? = loadedSession?.parentSessionId
     val sessionsCache: List<SessionSummary> = (sessionsList as? UiData.Loaded)?.value.orEmpty()
-    val parentTitle: String? = parentId?.let { id ->
-        sessionsCache.firstOrNull { it.id == id }?.title?.ifBlank { null }
-            ?: id.take(8)
-    }
-    // Immediate children of the current session, sorted by created_at ASC
-    // so the oldest sub-agent appears first (matches the spec). Empty list
-    // when the server hasn't reported any (or the child fetch is in flight).
-    val children: List<SessionSummary> = childrenMap[sessionId]
-        ?.sortedBy { it.createdAt }
-        .orEmpty()
-    val showChipRow = parentId != null || children.isNotEmpty()
-
-    var showRenameDialog by rememberSaveable { mutableStateOf(false) }
-    var showOverflowMenu by remember { mutableStateOf(false) }
-    var showResetConfirm by rememberSaveable { mutableStateOf(false) }
-    var showCompactConfirm by rememberSaveable { mutableStateOf(false) }
-
     // Cross-reference the open session to pull its `total_tokens` /
     // `max_tokens` — `GetSessionResult` doesn't carry those today.
     //
@@ -366,6 +335,43 @@ fun SessionDetailScreen(
         ?.solutions
         ?.firstNotNullOfOrNull { sol -> sol.sessions.firstOrNull { it.id == sessionId } }
     val activeSummary: SessionSummary? = sessionsCache.firstOrNull { it.id == sessionId }
+    // Title fallback chain: prefer the always-current session-list sources
+    // (mirror > list summary) over the loaded GetSessionResult, because
+    // the cache-first open path synthesises a blank title until the first
+    // delta or full `get_session` lands. A blank loaded title must NOT
+    // shadow the real title that the list already knows.
+    val displayTitle: String = mirrorSession?.title?.ifBlank { null }
+        ?: activeSummary?.title?.ifBlank { null }
+        ?: loadedSession?.title?.ifBlank { null }
+        ?: "Session"
+    val sessionStateDto: SessionStateDto? = (sessionState as? UiData.Loaded)?.value?.state
+    val displayState: DisplayState = sessionStateDto?.displayState() ?: DisplayState.Unknown
+
+    // F-phone chip row inputs.
+    //
+    // `parentId` is read from the loaded session (`GetSessionResult` now
+    // carries `parent_session_id`). The parent's *title* — the label we
+    // want to render on the chip — isn't in that payload, so we cross-
+    // reference `_sessions` (the list-of-sessions cache for the active
+    // solution). When the user deep-linked into a child whose parent
+    // isn't in that cache, fall back to a short hash of the id.
+    val parentId: String? = loadedSession?.parentSessionId
+    val parentTitle: String? = parentId?.let { id ->
+        sessionsCache.firstOrNull { it.id == id }?.title?.ifBlank { null }
+            ?: id.take(8)
+    }
+    // Immediate children of the current session, sorted by created_at ASC
+    // so the oldest sub-agent appears first (matches the spec). Empty list
+    // when the server hasn't reported any (or the child fetch is in flight).
+    val children: List<SessionSummary> = childrenMap[sessionId]
+        ?.sortedBy { it.createdAt }
+        .orEmpty()
+    val showChipRow = parentId != null || children.isNotEmpty()
+
+    var showRenameDialog by rememberSaveable { mutableStateOf(false) }
+    var showOverflowMenu by remember { mutableStateOf(false) }
+    var showResetConfirm by rememberSaveable { mutableStateOf(false) }
+    var showCompactConfirm by rememberSaveable { mutableStateOf(false) }
     val activeTotalTokens: Long? = mirrorSession?.totalTokens ?: activeSummary?.totalTokens
     val activeMaxTokens: Long? = mirrorSession?.maxTokens ?: activeSummary?.maxTokens
     // `state_started_at_ms` now lives inside the structured

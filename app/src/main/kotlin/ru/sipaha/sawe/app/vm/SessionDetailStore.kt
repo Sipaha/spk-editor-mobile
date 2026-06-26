@@ -56,7 +56,6 @@ import ru.sipaha.sawe.core.isTailAnchoredWindow
 import ru.sipaha.sawe.core.parseExpiredSendMessage
 import ru.sipaha.sawe.core.reconcileOptimistic
 import ru.sipaha.sawe.core.stampClientSendId
-import ru.sipaha.sawe.core.upsertEntryAtIndex
 import ru.sipaha.sawe.core.withOptimisticStopping
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicLong
@@ -880,6 +879,11 @@ internal class SessionDetailStore(
         val changed = _selectedSubagent.value != target
         _selectedSubagent.value = target
         if (changed) {
+            // Cancel any armed delta poll — it carries the old tab filter
+            // and would apply stale entries under the new tab if it fired
+            // after the switch.
+            deltaPollJob?.cancel()
+            deltaPollJob = null
             // Server-side per-tab filtering: the held entries are the PREVIOUS
             // tab's window, so the newly-selected tab's history isn't loaded
             // yet. Pull a fresh first page filtered to the new tab (a tab

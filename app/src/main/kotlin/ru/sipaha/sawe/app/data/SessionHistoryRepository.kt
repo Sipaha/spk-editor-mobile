@@ -121,39 +121,6 @@ class SessionHistoryRepository(
         }
     }
 
-    /**
-     * Merge [newEntries] into the cached transcript for [sessionId] +
-     * persist. Convenience used by the live-update path
-     * (`agent_session_message_appended` splice) so the caller doesn't
-     * have to round-trip through `load` itself.
-     *
-     * When no cache exists for [sessionId], no write is performed — a
-     * partial transcript without the prior history is a worse cache
-     * than no cache (it would defeat gap-detection on the next open).
-     */
-    fun appendEntries(
-        sessionId: String,
-        solutionId: String,
-        agentId: String,
-        newEntries: List<EntrySummary>,
-        newTotalCount: Int,
-    ) {
-        if (newEntries.isEmpty()) return
-        val existing = load(sessionId) ?: return
-        val merged = existing.entries + newEntries
-        val newLastIndex = merged.mapNotNull { it.index.takeIf { i -> i >= 0 } }.maxOrNull()
-        save(
-            CachedSessionHistory(
-                sessionId = sessionId,
-                solutionId = solutionId,
-                agentId = agentId,
-                entries = stripImages(merged),
-                lastIndex = newLastIndex,
-                totalCountAtLastWrite = newTotalCount,
-            ),
-        )
-    }
-
     /** Drop the cache entry for [sessionId] and cancel any pending debounced write. */
     fun evict(sessionId: String) {
         synchronized(pendingWritesLock) {
