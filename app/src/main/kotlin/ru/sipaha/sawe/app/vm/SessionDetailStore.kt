@@ -29,7 +29,6 @@ import ru.sipaha.sawe.app.data.PersistedPendingAttachment
 import ru.sipaha.sawe.app.data.PersistedPendingSend
 import ru.sipaha.sawe.app.data.SessionHistoryRepository
 import ru.sipaha.sawe.core.AgentSessionContextResetPayload
-import ru.sipaha.sawe.core.AppendedPlaceholderOutcome
 import ru.sipaha.sawe.core.BackgroundAgentDto
 import ru.sipaha.sawe.core.BackgroundShellDto
 import ru.sipaha.sawe.core.ContentBlockDto
@@ -42,19 +41,18 @@ import ru.sipaha.sawe.core.SessionBackgroundShellsChangedPayload
 import ru.sipaha.sawe.core.SessionQueueChangedPayload
 import ru.sipaha.sawe.core.SubagentDto
 import ru.sipaha.sawe.core.SessionStateDto
+import ru.sipaha.sawe.core.GetSessionChangesResult
 import ru.sipaha.sawe.core.JsonRpc
-import ru.sipaha.sawe.core.GetSessionEntryResult
 import ru.sipaha.sawe.core.GetSessionResult
-import ru.sipaha.sawe.core.MergeOutcome
 import ru.sipaha.sawe.core.MessageAppendedPayload
 import ru.sipaha.sawe.core.QueueTtlException
 import ru.sipaha.sawe.core.QueuedMessage
 import ru.sipaha.sawe.core.RemoteClient
 import ru.sipaha.sawe.core.ResetContextResult
+import ru.sipaha.sawe.core.SessionDeltaState
 import ru.sipaha.sawe.core.StartCompactResult
-import ru.sipaha.sawe.core.applyAppendedPlaceholder
+import ru.sipaha.sawe.core.applySessionDelta
 import ru.sipaha.sawe.core.isTailAnchoredWindow
-import ru.sipaha.sawe.core.mergeSessionHistory
 import ru.sipaha.sawe.core.parseExpiredSendMessage
 import ru.sipaha.sawe.core.reconcileOptimistic
 import ru.sipaha.sawe.core.stampClientSendId
@@ -96,15 +94,16 @@ private const val TAIL_RESYNC_TRAILING_TICKS: Int = 3
 private const val DEFERRED_UPLOAD_TIMEOUT_MS: Long = 5L * 60_000L
 
 /**
- * Backoff schedule for [SessionDetailStore.fetchAndReplaceEntry] when
- * `get_session_entry` fails (typically a dropped / flaky connection).
- * The first call is immediate; on failure we sleep these delays before
- * the next attempt, so total attempts = size + 1 (≈ 4). Kept short and
- * bounded so the ~5 calls/s that fire during streaming can't pile up
- * into a retry storm — a stuck placeholder either heals within a few
- * seconds or waits for the reconnect resume safety net.
+ * Trailing-edge debounce window for the live delta poll
+ * ([SessionDetailStore.scheduleDeltaPoll]). Push notifications no longer
+ * write session state directly — they only TRIGGER a poll, and a burst of
+ * notifications (e.g. ~5 `message_appended`/s while the agent streams a
+ * long reply, plus an interleaved state/queue change) collapses into ONE
+ * `get_session_changes` round-trip per quiet window. Short enough that a
+ * streaming reply still feels live; long enough that a tight burst doesn't
+ * fan out into N redundant requests (the very fan-out this phase removes).
  */
-private val ENTRY_FETCH_RETRY_DELAYS_MS: LongArray = longArrayOf(300L, 1_000L, 3_000L)
+private const val DELTA_POLL_DEBOUNCE_MS: Long = 200L
 
 private fun totalBytesFromState(state: UploadManager.State): Long = when (state) {
     is UploadManager.State.Queued -> state.total
@@ -168,10 +167,13 @@ data class DeferredUpload(
  *     notification collector lives there; this store consumes routed
  *     events via the [DetailNotificationRouter] hook implemented below.
  *  3. **Read-modify-write mutations on `_session.value` are serialised
- *     under [sessionMutex]** — multiple coroutines (notification observer,
- *     fetchAndReplaceEntry, loadOlder, resumeSession) compete for the
- *     same flow; without the mutex a stale snapshot can be re-published
- *     on top of a newer one.
+ *     under [sessionMutex]** — multiple coroutines (the delta poll,
+ *     fetchFullSession, loadOlder) compete for the same flow; without the
+ *     mutex a stale snapshot can be re-published on top of a newer one.
+ *     After the delta-sync rewrite there is exactly ONE writer of
+ *     `_session.entries`/state, `_serverQueuedBundles`, `_activeSubagents`:
+ *     [applyDeltaLocked] + [fetchFullSession]. Push handlers only
+ *     [scheduleDeltaPoll].
  *  4. **Optimistic bubbles carry two ids** — a local stable id
  *     ([optimisticIdGen]) used by the cancel-by-id failure path and a
  *     wire-side `client_send_id` stamp ([optimisticClientSendIds])
@@ -422,6 +424,27 @@ internal class SessionDetailStore(
         private set
 
     /**
+     * The coalescing live delta poll for the open session. At most ONE
+     * `get_session_changes` is in flight at a time; [scheduleDeltaPoll]
+     * cancels+rearms this job on every trigger so a burst of push
+     * notifications collapses into a single trailing-edge poll. Guarded
+     * exactly like [tailResyncJob] — cancelled on session switch / close /
+     * reset / server switch.
+     */
+    private var deltaPollJob: Job? = null
+
+    /**
+     * Per-open-session delta cursor. Seeded from the disk cache on open,
+     * from `get_session`'s `epoch`/`currentSeq` on every full load, and
+     * from each applied delta's `epoch`/`currentSeq`. Reset on every
+     * session switch / [reset] / [closeSession]. Mutated ONLY under
+     * [sessionMutex] (read by the poll trigger while building the
+     * `get_session_changes` request).
+     */
+    private var openEpoch: Long = 0
+    private var openSeq: Long = 0
+
+    /**
      * Serialises read-modify-write mutations on [_session]. See class
      * KDoc invariant 3.
      */
@@ -437,6 +460,8 @@ internal class SessionDetailStore(
     fun reset() {
         tailResyncJob?.cancel()
         tailResyncJob = null
+        deltaPollJob?.cancel()
+        deltaPollJob = null
         _isLoadingOlder.value = false
         // Detail-state mutations MUST run under `sessionMutex` — otherwise
         // an in-flight `withLock` block that already cleared its stale-write
@@ -446,11 +471,14 @@ internal class SessionDetailStore(
         scope.launch {
             sessionMutex.withLock {
                 openSessionId = null
+                openEpoch = 0
+                openSeq = 0
                 lastSeen.clear()
                 _session.value = UiData.Loading
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
                 optimisticClientSendIds.clear()
+                _serverQueuedBundles.value = emptyList()
                 _activeSubagents.value = emptyList()
                 _selectedSubagent.value = null
                 _backgroundShells.value = emptyList()
@@ -472,6 +500,8 @@ internal class SessionDetailStore(
         openSessionId = null
         tailResyncJob?.cancel()
         tailResyncJob = null
+        deltaPollJob?.cancel()
+        deltaPollJob = null
     }
 
     /** Bounce-to-input recovery routed here from ConnectionManager. */
@@ -496,16 +526,20 @@ internal class SessionDetailStore(
         scope.launch {
             sessionMutex.withLock {
                 openSessionId = sessionId
+                // Reset the delta cursor for the new session; seeded
+                // below from the cache (if present) or by the full load.
+                openEpoch = 0
+                openSeq = 0
                 _isLoadingOlder.value = false
                 _optimisticEntries.value = emptyList()
                 optimisticIds.clear()
                 optimisticClientSendIds.clear()
                 // Drop the previous session's server-queue view; the
-                // next fetchInitialOrDiff seeds from the new
-                // session's `pendingBundles`.
+                // next delta / full load seeds from the new session's
+                // `pendingBundles`.
                 _serverQueuedBundles.value = emptyList()
                 // Drop the previous session's subagent strip — the next
-                // fetchInitialOrDiff seeds from `activeSubagents`. Reset
+                // delta / full load seeds from `activeSubagents`. Reset
                 // selection to Main so the new session opens unfiltered.
                 _activeSubagents.value = emptyList()
                 _selectedSubagent.value = null
@@ -572,11 +606,15 @@ internal class SessionDetailStore(
                 }
                 if (cached != null && cached.entries.isNotEmpty()) {
                     // Render the cached transcript immediately so the
-                    // chat surface is interactive while the diff fetch
+                    // chat surface is interactive while the delta fetch
                     // is in flight. We synthesise a minimal
-                    // GetSessionResult; missing fields (state, title,
-                    // timestamps) are overwritten by the first
-                    // successful diff / full fetch.
+                    // GetSessionResult carrying the cached delta cursor
+                    // (`epoch`/`currentSeq`) so the held `_session` value
+                    // agrees with [openEpoch]/[openSeq]; missing fields
+                    // (state, title, timestamps) are overwritten by the
+                    // first successful delta / full fetch.
+                    openEpoch = cached.epoch
+                    openSeq = cached.lastSeq
                     _session.value = UiData.Loaded(
                         GetSessionResult(
                             id = cached.sessionId,
@@ -586,6 +624,8 @@ internal class SessionDetailStore(
                             state = SessionStateDto.Idle,
                             createdAt = 0L,
                             lastActivityAt = 0L,
+                            epoch = cached.epoch,
+                            currentSeq = cached.lastSeq,
                             entries = cached.entries,
                             totalCount = cached.totalCountAtLastWrite,
                         ),
@@ -594,7 +634,7 @@ internal class SessionDetailStore(
                     _session.value = UiData.Loading
                 }
             }
-            fetchInitialOrDiff(active, sessionId, cached)
+            fetchDeltaOrFull(active, sessionId, cached)
         }
         sessionList.loadChildren(sessionId)
         // Seed the background-shell strip once with the lite list (no
@@ -624,7 +664,7 @@ internal class SessionDetailStore(
         // Opening a session over a silently-dead socket (a zombie left by a
         // Doze window or a server restart the client never detected — state
         // still reads "Connected", no banner) would let the initial
-        // `fetchInitialOrDiff` above time out silently, leaving an empty
+        // `fetchDeltaOrFull` above time out silently, leaving an empty
         // transcript and a stale subagent strip. Probe liveness in parallel:
         // a healthy socket answers in <8s (cheap no-op) and the fetch lands
         // normally; a dead one is force-reconnected, and `onReconnected`
@@ -635,18 +675,20 @@ internal class SessionDetailStore(
     }
 
     /**
-     * Start (or restart) the tail-resync poller for [sessionId]. Runs for
-     * the lifetime of the open session and pulls an `after_index` diff via
-     * [resumeSession] while the agent is producing (Running / Stopping)
-     * AND for a short TRAILING window after it stops.
+     * Start (or restart) the SLOW tail-resync fallback poller for
+     * [sessionId]. The live delta poll ([scheduleDeltaPoll]) is the primary
+     * sync path — driven by push notifications; this fallback exists ONLY as
+     * the safety net for a LOST (and unsequenced) notification on a live
+     * socket. It triggers a delta poll while the agent is producing (Running
+     * / Stopping) AND for a short TRAILING window after it stops.
      *
-     * The trailing window is the whole point: mid-turn losses self-heal
-     * (the next `message_appended` gap-detects → full fetch), but the
-     * FINAL message of a turn has no follow-up — if its notification (or
-     * the Idle-transition notification) is lost, the reply strands until
-     * the user sends again. Keeping a few ticks of resync running after
-     * the agent goes Idle catches that last message. `resumeSession` also
-     * adopts the response's session state, so a missed Idle transition is
+     * The trailing window is the whole point: mid-turn losses self-heal (the
+     * next notification triggers a poll), but the FINAL message of a turn has
+     * no follow-up — if its notification (or the Idle-transition
+     * notification) is lost, the reply strands until the user sends again.
+     * Keeping a few ticks of resync running after the agent goes Idle catches
+     * that last message; the delta poll always pulls the full changed entries
+     * and the freshest session state, so a missed Idle transition is
      * recovered here too. Once the trailing budget is spent on a quiet
      * session, the poller idles (no traffic).
      */
@@ -664,52 +706,29 @@ internal class SessionDetailStore(
                 when {
                     producing -> {
                         trailing = TAIL_RESYNC_TRAILING_TICKS
-                        resumeSession(sessionId)
-                        resyncLatestEntryContent(sessionId)
+                        scheduleDeltaPoll(sessionId)
                     }
                     trailing > 0 -> {
-                        // Agent just stopped — keep resyncing briefly to
+                        // Agent just stopped — keep polling briefly to
                         // recover a stranded final message / Idle transition.
                         trailing--
-                        resumeSession(sessionId)
-                        resyncLatestEntryContent(sessionId)
+                        scheduleDeltaPoll(sessionId)
                     }
                 }
             }
         }
     }
 
-    /**
-     * Re-pull the CONTENT of the newest known entry during tail-resync.
-     *
-     * `resumeSession`'s `after_index = lastSeen` diff can only ADD entries
-     * past the cursor and dedups existing slots untouched — it can never
-     * refresh a slot the local view already has. But a streaming reply's body
-     * arrives as repeated `message_appended` for the SAME index, each one
-     * re-fetching that entry via [fetchAndReplaceEntry]. If the trailing
-     * updates (and the Idle-transition notification) are lost, the bubble
-     * freezes mid-content and `resumeSession` is structurally unable to heal
-     * it — it strands the final message ("cut off in the middle, won't load
-     * further"). So while we resync, also re-fetch the latest entry's content.
-     *
-     * [fetchAndReplaceEntry] is content-equality guarded (skips the StateFlow
-     * write + markdown re-render when the body is unchanged), so on a healthy
-     * stream this is a cheap no-op; its value is recovering the one entry the
-     * `after_index` diff can't see.
-     */
-    private fun resyncLatestEntryContent(sessionId: String) {
-        if (openSessionId != sessionId) return
-        val loaded = _session.value as? UiData.Loaded ?: return
-        val newestIndex = loaded.value.entries.lastOrNull { it.index >= 0 }?.index ?: return
-        fetchAndReplaceEntry(sessionId, newestIndex)
-    }
-
     fun closeSession() {
         tailResyncJob?.cancel()
         tailResyncJob = null
+        deltaPollJob?.cancel()
+        deltaPollJob = null
         scope.launch {
             sessionMutex.withLock {
                 openSessionId = null
+                openEpoch = 0
+                openSeq = 0
                 _session.value = UiData.Loading
                 _isLoadingOlder.value = false
                 _optimisticEntries.value = emptyList()
@@ -745,86 +764,24 @@ internal class SessionDetailStore(
     override fun onMessageAppended(payload: MessageAppendedPayload) {
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
+        // Keep the shared last-seen index current — the session-list unread
+        // badge reads it. Everything else (the placeholder, the fast-pop,
+        // the entry content) now arrives via the delta poll: the delta's
+        // `changed_entries` always carries the full entry body, and
+        // `applyDeltaLocked` pops optimistics via `reconcileOptimisticLocked`.
         lastSeen.recordIfNewer(payload.sessionId, payload.entryIndex)
-        val singularCsid = payload.clientSendId
-        val csids: List<Long> = when {
-            payload.clientSendIds.isNotEmpty() -> payload.clientSendIds
-            singularCsid != null -> listOf(singularCsid)
-            else -> emptyList()
-        }
-        scope.launch {
-            sessionMutex.withLock {
-                if (openSessionId != payload.sessionId) return@withLock
-                // If this echo corresponds to a local optimistic bubble
-                // (we stamped its csid and the notification carries it
-                // back), defer BOTH the fast-pop and the placeholder.
-                // The optimistic already shows the full user-typed body
-                // (`markdown` populated in [sendMessageBlocks]); leaving
-                // it visible keeps the bubble's content stable until
-                // `fetchAndReplaceEntry` slots the canonical server
-                // entry into the same `csid:N` LazyColumn key —
-                // [echoedCsids] then hides the optimistic in the same
-                // recomposition. Without this, the bubble visibly
-                // regressed from full body → server's truncated preview
-                // (the notification's `preview` field) → full body
-                // again, perceived as "the bubble disappears and comes
-                // back" by the user.
-                val matchesLocalOptimistic = payload.role == EntryRoleDto.User &&
-                    csids.any { it in optimisticClientSendIds }
-                if (!matchesLocalOptimistic) {
-                    // Fast-pop optimistic bubbles whose csid lands in
-                    // the notification. Done FIRST inside the mutex so
-                    // the subsequent placeholder add can't create a
-                    // brief duplicate-bubble window.
-                    if (payload.role == EntryRoleDto.User && csids.isNotEmpty()) {
-                        for (c in csids) popOptimisticByClientSendIdLocked(c)
-                    }
-                    // Apply the placeholder ONLY for new entries (slot
-                    // doesn't exist yet). For updates to an existing
-                    // entry (the common case under throttled
-                    // EntryUpdated streaming — ~5 emits/sec while the
-                    // agent writes a long reply), skipping the
-                    // placeholder lets the already-rendered full
-                    // markdown stay on screen while
-                    // [fetchAndReplaceEntry] races the new content in.
-                    val current = _session.value as? UiData.Loaded ?: return@withLock
-                    val entries = current.value.entries
-                    // "New entry?" keys on the SERVER index, not list size —
-                    // a paginated window's positions don't match indices. A
-                    // notification for an index we already hold is a content
-                    // update; skip the placeholder so the rendered body stays
-                    // put while [fetchAndReplaceEntry] races the new content in.
-                    val maxIndex = entries.lastOrNull()?.index ?: -1
-                    if (payload.entryIndex > maxIndex) {
-                        when (val outcome = applyAppendedPlaceholder(entries, payload)) {
-                            is AppendedPlaceholderOutcome.Replaced -> {
-                                _session.value = UiData.Loaded(
-                                    current.value.copy(entries = outcome.entries),
-                                )
-                            }
-                            AppendedPlaceholderOutcome.OutOfRange -> {
-                                val active = context.activeClient() ?: return@withLock
-                                scope.launch {
-                                    runCatching { fetchFullSession(active, payload.sessionId) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            fetchAndReplaceEntry(openSid, payload.entryIndex)
-        }
+        scheduleDeltaPoll(openSid)
     }
 
     override fun onMessageAppendedFallback() {
         val openSid = openSessionId ?: return
-        refreshSession(openSid)
+        scheduleDeltaPoll(openSid)
     }
 
     override fun onSessionStateOrTitleChanged(notifSessionId: String?) {
         val openSid = openSessionId ?: return
         if (notifSessionId != null && notifSessionId != openSid) return
-        refreshSession(openSid)
+        scheduleDeltaPoll(openSid)
     }
 
     override fun onSessionContextReset(payload: AgentSessionContextResetPayload) {
@@ -840,28 +797,24 @@ internal class SessionDetailStore(
                 optimisticClientSendIds.clear()
                 // Flip to Loading so the chat shows a clean refresh state
                 // rather than briefly painting the old entries during the
-                // get_session round-trip.
+                // poll round-trip.
                 _session.value = UiData.Loading
             }
-            // refreshSession is a full get_session WITHOUT after_index — exactly
-            // what we need: a fresh transcript page (likely empty) replaces the
-            // stale one.
-            refreshSession(payload.sessionId)
+            // The delta poll detects the epoch change (our held `openEpoch`
+            // no longer matches the server's), gets `reset:true`, and falls
+            // back to a full `get_session` — a fresh transcript page (likely
+            // empty) replaces the stale one.
+            scheduleDeltaPoll(payload.sessionId)
         }
     }
 
     override fun onActiveSubagentsChanged(payload: SessionActiveSubagentsChangedPayload) {
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
-        // Cross the mutex so the read-then-conditional-write snap in
-        // applyActiveSubagentsLocked cannot race a concurrent
-        // fetchFullSession / applyAppended path on the same flow.
-        scope.launch {
-            sessionMutex.withLock {
-                if (openSessionId != payload.sessionId) return@withLock
-                applyActiveSubagentsLocked(payload.activeSubagents)
-            }
-        }
+        // The delta's `active_subagents` section is the single writer of
+        // `_activeSubagents` now — just trigger a poll; do NOT apply the
+        // payload list directly (that would make the push a second writer).
+        scheduleDeltaPoll(openSid)
     }
 
     override fun onBackgroundShellsChanged(payload: SessionBackgroundShellsChangedPayload) {
@@ -952,280 +905,212 @@ internal class SessionDetailStore(
     override fun onSessionQueueChanged(payload: SessionQueueChangedPayload) {
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
-        scope.launch {
-            sessionMutex.withLock {
-                if (openSessionId != payload.sessionId) return@withLock
-                _serverQueuedBundles.value = payload.bundles
-                // The server's `pending_messages` is the single source of
-                // truth for queued state: it MERGES sends from every client
-                // into shared bundles (mobile + desktop typing into the same
-                // busy session collapse into one growing bundle, and a
-                // desktop EDIT rewrites that bundle's preview in place).
-                // So once a csid lands in a server bundle we drop the local
-                // optimistic and let the synthetic bundle bubble represent
-                // it — keeping the local optimistic instead would (a) show
-                // stale mobile-only text after a desktop edit and (b) make a
-                // cross-client merge render as two competing bubbles. The
-                // width-oscillation that originally motivated keeping the
-                // local bubble was a separate bug (the status row's
-                // fillMaxWidth) and is fixed independently, so the
-                // local→synthetic handoff is now seamless.
-                val csidsInBundles: Set<Long> =
-                    payload.bundles.flatMap { it.csids }.toHashSet()
-                if (csidsInBundles.isEmpty()) return@withLock
-                val current = _optimisticEntries.value
-                val keptIndices = current.indices.filter { i ->
-                    current[i].clientSendId !in csidsInBundles
-                }
-                if (keptIndices.size == current.size) return@withLock
-                _optimisticEntries.value = keptIndices.map { current[it] }
-                val keptIds = keptIndices.mapNotNull { optimisticIds.getOrNull(it) }
-                val keptCsids = keptIndices.mapNotNull { optimisticClientSendIds.getOrNull(it) }
-                optimisticIds.clear()
-                optimisticIds.addAll(keptIds)
-                optimisticClientSendIds.clear()
-                optimisticClientSendIds.addAll(keptCsids)
-                // The disk marker (offline-send rehydrate) is no longer
-                // needed once the server has the message in a bundle.
-                for (csid in csidsInBundles) pendingSendsRepository.remove(csid)
-            }
-        }
+        // The delta's `pending_bundles` section is the single writer of
+        // `_serverQueuedBundles` now — just trigger a poll; do NOT assign
+        // the payload bundles directly. The optimistic-bubble pop that this
+        // handler used to do (drop the local optimistic once its csid lands
+        // in a server bundle) now happens inside `applyDeltaLocked` via
+        // `reconcileOptimisticLocked` against the delta's `changed_entries`
+        // (the merged user entry carries the rolled-up csids) — see
+        // `reconcilePendingBundleOptimisticsLocked` for the bundle-only case
+        // where the merged entry hasn't materialised yet.
+        scheduleDeltaPoll(openSid)
     }
 
     // -------------------------------------------------------------------------
     // Network ops
     // -------------------------------------------------------------------------
 
-    private fun fetchAndReplaceEntry(sessionId: String, index: Int) {
-        if (context.activeClient() == null) return
-        scope.launch {
-            // Bounded retry with backoff. The placeholder produced by
-            // `applyAppendedPlaceholder` has only the truncated preview and
-            // no structured toolCall; the full entry only ever arrives via
-            // this fetch. On a flaky/dropped connection a single-shot fetch
-            // failed silently and left the bubble stuck on the skimpy
-            // preview (rendered narrow + truncated). Retry a few times so
-            // the entry self-heals once the connection blips back, while
-            // bailing the moment the session is no longer open or the
-            // client went away — never retry forever.
-            var fetched: GetSessionEntryResult? = null
-            var attempt = 0
-            while (fetched == null) {
-                // Re-check liveness each attempt: the client can be torn
-                // down (server switch) mid-retry, and the session can be
-                // closed/switched. Either makes the result useless.
-                if (openSessionId != sessionId) return@launch
-                val active = context.activeClient() ?: return@launch
-                fetched = runCatching {
-                    active.getSessionEntry(sessionId, index, includeImages = true)
-                }.getOrNull()
-                if (fetched != null) break
-                if (attempt >= ENTRY_FETCH_RETRY_DELAYS_MS.size) {
-                    // Exhausted the schedule — give up quietly. The
-                    // reconnect resume path (resumeSession) re-fetches any
-                    // still-incomplete entries as the longer-term safety net.
-                    return@launch
-                }
-                delay(ENTRY_FETCH_RETRY_DELAYS_MS[attempt])
-                attempt++
-            }
-            val result = fetched ?: return@launch
-            var snapshotForCache: GetSessionResult? = null
-            sessionMutex.withLock {
-                // stale-write barrier (see class kdoc invariant 1)
-                if (openSessionId != sessionId) return@withLock
-                val current = _session.value as? UiData.Loaded ?: return@withLock
-                val entries = current.value.entries
-                // Address the slot by SERVER index, never by list position —
-                // a paginated window's positions don't match indices (the old
-                // `entries[index]` splice silently corrupted or dropped to a
-                // full refetch there). [index] is the index we requested, so
-                // it is the authoritative key even if the single-entry fetch
-                // returned `entry.index == -1` (pre-R-6e).
-                val existingPos = entries.indexOfFirst { it.index == index }
-                // Dedup: if the freshly-fetched entry is structurally equal
-                // to the existing slot, skip the StateFlow write. The
-                // markdown widget's recomposition cycle is non-trivial
-                // (re-parses the AST, re-decodes inline images, rebuilds
-                // the SelectionContainer text layout) and produces a
-                // visible flicker on every update — emits where the
-                // content didn't actually change (server-side throttle
-                // sometimes refires a trailing-edge emit with the same
-                // body it already sent) shouldn't pay that cost.
-                if (existingPos >= 0 && entries[existingPos] == result.entry) {
-                    return@withLock
-                }
-                // A genuine gap (the requested index is more than one past the
-                // tail and we don't already hold it) means we're missing
-                // intermediate entries — upserting would leave a hole, so fall
-                // back to a full refetch. Otherwise replace-or-insert by index.
-                val maxIndex = entries.lastOrNull()?.index ?: -1
-                if (existingPos < 0 && index > maxIndex + 1) {
-                    val client = context.activeClient()
-                    if (client != null) {
-                        scope.launch {
-                            runCatching { fetchFullSession(client, sessionId) }
-                        }
-                    }
-                    return@withLock
-                }
-                val newEntries = upsertEntryAtIndex(entries, index, result.entry)
-                val updated = current.value.copy(entries = newEntries)
-                _session.value = UiData.Loaded(updated)
-                reconcileOptimisticLocked(newEntries)
-                snapshotForCache = updated
-            }
-            // Persist cache outside the mutex — repository write is
-            // already debounced + IO-dispatched.
-            snapshotForCache?.let {
-                persistCache(sessionId, it, it.entries, it.totalCount)
-            }
+    /**
+     * Cache-first open path. The cache (if any) has already been rendered by
+     * [openSession]; this resolves the live state:
+     *
+     *  - **cache present** (delta cursor known) → poll `get_session_changes`
+     *    against the held [openEpoch]/[openSeq]. `reset == true` (the cached
+     *    epoch is stale — a compact / reset happened while we were away) →
+     *    full `get_session` via [fetchFullSession]; otherwise apply the delta
+     *    via [applyDeltaLocked].
+     *  - **no cache** → full `get_session` via [fetchFullSession].
+     */
+    private suspend fun fetchDeltaOrFull(
+        active: RemoteClient,
+        sessionId: String,
+        cached: CachedSessionHistory?,
+    ) {
+        if (cached == null || cached.entries.isEmpty()) {
+            fetchFullSession(active, sessionId)
+            return
+        }
+        val delta = runCatching {
+            active.getSessionChanges(
+                sessionId = sessionId,
+                sinceSeq = cached.lastSeq,
+                knownEpoch = cached.epoch,
+                subagentFilter = currentSubagentFilter(),
+            )
+        }.getOrElse {
+            applyFetchFailure(sessionId, it)
+            return
+        }
+        if (delta.reset) {
+            fetchFullSession(active, sessionId)
+        } else {
+            applyDeltaLocked(sessionId, delta)
         }
     }
 
+    /**
+     * Full `get_session` load — the single writer for the no-cache open,
+     * reset / context-clear, tab switch, and the gap / short-window
+     * fallback. Publishes entries / bundles / subagents under the mutex,
+     * reconciles optimistics, adopts the server's delta cursor
+     * ([epoch]/[currentSeq]) into [openEpoch]/[openSeq], and persists the
+     * cache stamped with that cursor.
+     */
     private suspend fun fetchFullSession(active: RemoteClient, sessionId: String) {
         val params = buildJsonObject {
             put("session_id", sessionId)
             put("include_full_content", true)
             put("include_images", true)
             put("subagent_filter", currentSubagentFilter())
+            put("count", SESSION_PAGE_SIZE)
         }
         val result = runCatching { active.call("remote.solution_agent.get_session", params) }
             .mapCatching { resp -> resp.decodeResultOrThrow(GetSessionResult.serializer()) }
-            .getOrNull() ?: return
+            .getOrElse {
+                applyFetchFailure(sessionId, it)
+                return
+            }
         sessionMutex.withLock {
             // stale-write barrier (see class kdoc invariant 1)
             if (openSessionId != sessionId) return@withLock
             _session.value = UiData.Loaded(result)
             _serverQueuedBundles.value = result.pendingBundles
             applyActiveSubagentsLocked(result.activeSubagents)
+            _isLoadingOlder.value = false
             reconcileOptimisticLocked(result.entries)
+            result.entries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
+                lastSeen.recordIfNewer(sessionId, newest.index)
+            }
+            openEpoch = result.epoch
+            openSeq = result.currentSeq
         }
         persistCache(sessionId, result, result.entries, result.totalCount)
     }
 
     private suspend fun fetchInitialPage(active: RemoteClient, sessionId: String) {
-        fetchInitialOrDiff(active, sessionId, cached = null)
+        fetchFullSession(active, sessionId)
     }
 
     /**
-     * Pull either a full initial page (no cache, or `after_index` cursor
-     * absent) or a diff against [cached] via `after_index=cached.lastIndex`.
-     * Resolves the [MergeOutcome] in-place: [MergeOutcome.FullReplace] +
-     * [MergeOutcome.Appended] splice into `_session.value`;
-     * [MergeOutcome.GapDetected] retries WITHOUT `after_index` and full-
-     * replaces.
+     * The SINGLE delta-applier publish seam. Together with [fetchFullSession]
+     * it is the only writer of `_session.entries`/state,
+     * `_serverQueuedBundles`, and `_activeSubagents`. Holds [sessionMutex] +
+     * the `openSessionId == sessionId` stale-write barrier on every publish.
+     *
+     * Precondition: [delta.reset] is false (caller routes a reset delta to
+     * [fetchFullSession]). When the held `_session` is not yet `Loaded`, or
+     * the post-apply window falls short of the newest entry (the delta missed
+     * newer entries), this triggers a full [fetchFullSession] instead of
+     * publishing a half-applied state.
      */
-    private suspend fun fetchInitialOrDiff(
-        active: RemoteClient,
-        sessionId: String,
-        cached: CachedSessionHistory?,
-    ) {
-        val afterIndex: Int? = cached
-            ?.takeIf { it.entries.isNotEmpty() }
-            ?.lastIndex
-        val params = buildJsonObject {
-            put("session_id", sessionId)
-            put("include_full_content", true)
-            put("include_images", true)
-            put("subagent_filter", currentSubagentFilter())
-            if (afterIndex != null) {
-                put("after_index", afterIndex)
-            } else {
-                put("count", SESSION_PAGE_SIZE)
-            }
-        }
-        val outcome = runCatching { active.call("remote.solution_agent.get_session", params) }
-            .mapCatching { resp -> resp.decodeResultOrThrow(GetSessionResult.serializer()) }
-        outcome
-            .onSuccess { fetched ->
-                val merged = mergeSessionHistory(
-                    cachedEntries = cached?.entries.orEmpty(),
-                    cachedLastIndex = cached?.lastIndex,
-                    cachedTotalCount = cached?.totalCountAtLastWrite ?: -1,
-                    fetched = fetched,
-                    afterIndexHint = afterIndex,
-                )
-                when (merged) {
-                    is MergeOutcome.FullReplace ->
-                        applyFullReplace(sessionId, fetched, merged.entries, merged.newTotalCount)
-                    is MergeOutcome.Appended ->
-                        applyAppended(sessionId, fetched, cached, merged.mergedEntries, merged.newTotalCount)
-                    is MergeOutcome.GapDetected -> {
-                        // Fall back to a full fetch — drop the after_index cursor.
-                        val fullParams = buildJsonObject {
-                            put("session_id", sessionId)
-                            put("include_full_content", true)
-                            put("include_images", true)
-                            put("subagent_filter", currentSubagentFilter())
-                            put("count", SESSION_PAGE_SIZE)
-                        }
-                        val fullOutcome = runCatching {
-                            active.call("remote.solution_agent.get_session", fullParams)
-                        }.mapCatching { resp ->
-                            resp.decodeResultOrThrow(GetSessionResult.serializer())
-                        }
-                        fullOutcome
-                            .onSuccess { full ->
-                                applyFullReplace(sessionId, full, full.entries, full.totalCount)
-                            }
-                            .onFailure { applyFetchFailure(sessionId, it) }
-                    }
-                }
-            }
-            .onFailure { applyFetchFailure(sessionId, it) }
-    }
-
-    private suspend fun applyFullReplace(
-        sessionId: String,
-        fetched: GetSessionResult,
-        entries: List<EntrySummary>,
-        newTotalCount: Int,
-    ) {
+    private suspend fun applyDeltaLocked(sessionId: String, delta: GetSessionChangesResult) {
+        var needsFullLoad = false
+        var snapshotForCache: GetSessionResult? = null
         sessionMutex.withLock {
+            // stale-write barrier (see class kdoc invariant 1)
             if (openSessionId != sessionId) return@withLock
-            val result = fetched.copy(entries = entries, totalCount = newTotalCount)
-            _session.value = UiData.Loaded(result)
-            _serverQueuedBundles.value = fetched.pendingBundles
-            applyActiveSubagentsLocked(fetched.activeSubagents)
-            _isLoadingOlder.value = false
-            reconcileOptimisticLocked(entries)
-            entries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
+            val current = _session.value as? UiData.Loaded ?: run {
+                // No loaded base to apply onto — fall back to a full load.
+                needsFullLoad = true
+                return@withLock
+            }
+            val deltaState = SessionDeltaState(
+                entries = current.value.entries,
+                totalCount = current.value.totalCount,
+                state = current.value.state,
+                pendingBundles = _serverQueuedBundles.value,
+                activeSubagents = _activeSubagents.value,
+                currentSeq = openSeq,
+            )
+            val next = applySessionDelta(deltaState, delta)
+            // Tail-anchored guard: if the post-apply window no longer reaches
+            // the newest entry, the delta missed newer entries (e.g. a gap
+            // the cursor couldn't bridge) — do NOT publish the half-applied
+            // state; full-reload instead.
+            if (!isTailAnchoredWindow(next.entries, next.totalCount)) {
+                needsFullLoad = true
+                return@withLock
+            }
+            val updated = current.value.copy(
+                entries = next.entries,
+                totalCount = next.totalCount,
+                state = next.state,
+                epoch = delta.epoch,
+                currentSeq = delta.currentSeq,
+            )
+            _session.value = UiData.Loaded(updated)
+            _serverQueuedBundles.value = next.pendingBundles
+            applyActiveSubagentsLocked(next.activeSubagents)
+            reconcileOptimisticLocked(next.entries)
+            // Bundle-only optimistic handoff: a send that landed in a server
+            // bundle (but whose merged user entry hasn't materialised in
+            // `changed_entries` yet) still pops, mirroring the old
+            // `onSessionQueueChanged` behaviour.
+            reconcilePendingBundleOptimisticsLocked(next.pendingBundles)
+            next.entries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
                 lastSeen.recordIfNewer(sessionId, newest.index)
             }
+            openEpoch = delta.epoch
+            openSeq = delta.currentSeq
+            snapshotForCache = updated
         }
-        persistCache(sessionId, fetched, entries, newTotalCount)
+        if (needsFullLoad) {
+            val active = context.activeClient() ?: return
+            fetchFullSession(active, sessionId)
+            return
+        }
+        snapshotForCache?.let {
+            persistCache(sessionId, it, it.entries, it.totalCount)
+        }
     }
 
-    private suspend fun applyAppended(
-        sessionId: String,
-        fetched: GetSessionResult,
-        cached: CachedSessionHistory?,
-        mergedEntries: List<EntrySummary>,
-        newTotalCount: Int,
+    /**
+     * Drop optimistic bubbles whose `client_send_id` has landed in a server
+     * pending bundle. The server's `pending_messages` is the single source of
+     * truth for queued state: it MERGES sends from every client into shared
+     * bundles (mobile + desktop typing into the same busy session collapse
+     * into one growing bundle, and a desktop EDIT rewrites that bundle's
+     * preview in place). Once a csid lands in a server bundle we drop the
+     * local optimistic and let the synthetic bundle bubble represent it —
+     * keeping the local optimistic instead would show stale mobile-only text
+     * after a desktop edit and render a cross-client merge as two competing
+     * bubbles.
+     *
+     * MUST hold [sessionMutex] — mutates the three optimistic lists in
+     * lock-step. Folded into [applyDeltaLocked] so the delta's
+     * `pending_bundles` section stays the single writer for this transition.
+     */
+    private fun reconcilePendingBundleOptimisticsLocked(
+        bundles: List<QueuedBundleSummary>,
     ) {
-        sessionMutex.withLock {
-            if (openSessionId != sessionId) return@withLock
-            val result = fetched.copy(entries = mergedEntries, totalCount = newTotalCount)
-            _session.value = UiData.Loaded(result)
-            _serverQueuedBundles.value = fetched.pendingBundles
-            applyActiveSubagentsLocked(fetched.activeSubagents)
-            _isLoadingOlder.value = false
-            reconcileOptimisticLocked(mergedEntries)
-            mergedEntries.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
-                lastSeen.recordIfNewer(sessionId, newest.index)
-            }
+        val csidsInBundles: Set<Long> = bundles.flatMap { it.csids }.toHashSet()
+        if (csidsInBundles.isEmpty()) return
+        val current = _optimisticEntries.value
+        val keptIndices = current.indices.filter { i ->
+            current[i].clientSendId !in csidsInBundles
         }
-        // Fall back to the cached solutionId when the server omits it
-        // (some legacy `after_index` responses leave it blank because the
-        // session id alone is canonical for the routing layer).
-        val solutionId = fetched.solutionId.ifEmpty { cached?.solutionId.orEmpty() }
-        persistCache(
-            sessionId,
-            fetched.copy(solutionId = solutionId),
-            mergedEntries,
-            newTotalCount,
-        )
+        if (keptIndices.size == current.size) return
+        _optimisticEntries.value = keptIndices.map { current[it] }
+        val keptIds = keptIndices.mapNotNull { optimisticIds.getOrNull(it) }
+        val keptCsids = keptIndices.mapNotNull { optimisticClientSendIds.getOrNull(it) }
+        optimisticIds.clear()
+        optimisticIds.addAll(keptIds)
+        optimisticClientSendIds.clear()
+        optimisticClientSendIds.addAll(keptCsids)
+        // The disk marker (offline-send rehydrate) is no longer needed once
+        // the server has the message in a bundle.
+        for (csid in csidsInBundles) pendingSendsRepository.remove(csid)
     }
 
     private fun applyFetchFailure(sessionId: String, throwable: Throwable) {
@@ -1261,8 +1146,56 @@ internal class SessionDetailStore(
                 entries = entries,
                 lastIndex = lastIdx,
                 totalCountAtLastWrite = newTotalCount,
+                // Stamp the held delta cursor (set under the lock by the
+                // single writer before this off-lock persist) so the next
+                // open can drive a `get_session_changes` poll from it.
+                epoch = openEpoch,
+                lastSeq = openSeq,
             ),
         )
+    }
+
+    /**
+     * Trailing-edge debounced live delta poll. At most ONE
+     * `get_session_changes` is in flight per open session: every trigger
+     * cancels+rearms [deltaPollJob], so a burst of push notifications
+     * collapses into a single poll after [DELTA_POLL_DEBOUNCE_MS] of quiet.
+     *
+     * When it fires (still the open session): poll `get_session_changes`
+     * against the held [openSeq]/[openEpoch]. `reset == true` → full
+     * `get_session` via [fetchFullSession]; otherwise apply via
+     * [applyDeltaLocked] (the single writer). A failed poll is recoverable
+     * and silent — the slow tail-resync fallback / the next notification
+     * re-triggers.
+     */
+    private fun scheduleDeltaPoll(sessionId: String) {
+        if (openSessionId != sessionId) return
+        deltaPollJob?.cancel()
+        deltaPollJob = scope.launch {
+            delay(DELTA_POLL_DEBOUNCE_MS)
+            if (openSessionId != sessionId) return@launch
+            val active = context.activeClient() ?: return@launch
+            // Snapshot the cursor under the lock so we don't race a
+            // concurrent applyDeltaLocked / fetchFullSession advancing it.
+            val (sinceSeq, knownEpoch) = sessionMutex.withLock {
+                if (openSessionId != sessionId) return@launch
+                openSeq to openEpoch
+            }
+            val delta = runCatching {
+                active.getSessionChanges(
+                    sessionId = sessionId,
+                    sinceSeq = sinceSeq,
+                    knownEpoch = knownEpoch,
+                    subagentFilter = currentSubagentFilter(),
+                )
+            }.getOrNull() ?: return@launch
+            if (openSessionId != sessionId) return@launch
+            if (delta.reset) {
+                fetchFullSession(active, sessionId)
+            } else {
+                applyDeltaLocked(sessionId, delta)
+            }
+        }
     }
 
     fun loadOlder(sessionId: String) {
@@ -1318,172 +1251,20 @@ internal class SessionDetailStore(
         }
     }
 
-    fun resumeSession(sessionId: String) {
-        val active = context.activeClient() ?: return
-        if (openSessionId != sessionId) return
-        // Reconnect resume is the natural place to flush a deferred cancel
-        // queued while we were offline. cancel_turn is idempotent on the
-        // server, so a flush against an already-Stopping/Idle session is
-        // a safe no-op.
-        flushPendingCancel()
-        val current = _session.value
-        val lastSeenIdx = lastSeen.getCached(sessionId) ?: lastSeen.readFromDisk(sessionId)
-        if (lastSeenIdx == null || current !is UiData.Loaded) {
-            scope.launch { fetchInitialPage(active, sessionId) }
-            return
-        }
-        val params = buildJsonObject {
-            put("session_id", sessionId)
-            put("include_full_content", true)
-            put("include_images", true)
-            put("after_index", lastSeenIdx)
-        }
-        scope.launch {
-            val outcome = runCatching { active.call("remote.solution_agent.get_session", params) }
-                .mapCatching { resp -> resp.decodeResultOrThrow(GetSessionResult.serializer()) }
-            outcome.onSuccess { result ->
-                // Fast-path: dedup first, then decide whether the
-                // post-dedup merged size still falls short of the server's
-                // totalCount (audit Fix R). The previous order compared
-                // pre-dedup, which could spuriously trigger a full
-                // refetch when the resume returned overlapping entries.
-                var snapshotForCache: GetSessionResult? = null
-                sessionMutex.withLock {
-                    if (openSessionId != sessionId) return@withLock
-                    val latest = _session.value as? UiData.Loaded ?: return@withLock
-                    val existingIndices = latest.value.entries.mapNotNull {
-                        it.index.takeIf { i -> i >= 0 }
-                    }.toHashSet()
-                    val fresh = result.entries.filterNot {
-                        it.index >= 0 && existingIndices.contains(it.index)
-                    }
-                    val merged = if (fresh.isEmpty()) latest.value.entries else latest.value.entries + fresh
-                    val mergedTotal = maxOf(latest.value.totalCount, result.totalCount)
-                    // Pagination-aware integrity check. A windowed view (the
-                    // user scrolled up + loaded older, or any session > one
-                    // page) LEGITIMATELY has `merged.size < totalCount` — the
-                    // older entries simply aren't loaded, which is what
-                    // `loadOlder` is for. Comparing size to totalCount instead
-                    // nuked the loaded-older window and the reading position on
-                    // EVERY tail-resync tick of any paginated session (a reset
-                    // ~every 4s while the agent runs). [isTailAnchoredWindow]
-                    // holds when the merge still reaches the server's newest
-                    // entry. We deliberately do NOT require dense index
-                    // contiguity: a per-tab (`subagent_filter`) view returns
-                    // SPARSE absolute indices, so interior gaps are expected —
-                    // demanding contiguity here was itself the bug that flung a
-                    // scrolled-up reader to the top every resync tick on any
-                    // filtered session with active subagents. Only a window that
-                    // falls short of the newest means the diff missed newer
-                    // entries → full refetch.
-                    if (!isTailAnchoredWindow(merged, result.totalCount)) {
-                        scope.launch { fetchInitialPage(active, sessionId) }
-                        return@withLock
-                    }
-                    // Always reconcile the subagent set from a fresh resume
-                    // response — a subagent that disappeared while the app
-                    // was backgrounded would otherwise stay in the strip
-                    // until the user navigates away and back.
-                    applyActiveSubagentsLocked(result.activeSubagents)
-                    if (fresh.isEmpty()) {
-                        // No new entries, but still adopt the freshest state +
-                        // total. The tail-resync poller relies on this to notice
-                        // the agent went Idle (and stop polling) even when the
-                        // state-change notification itself was the lost event.
-                        val newTotal =
-                            if (result.totalCount >= 0) maxOf(latest.value.totalCount, result.totalCount)
-                            else latest.value.totalCount
-                        if (newTotal != latest.value.totalCount || result.state != latest.value.state) {
-                            _session.value = UiData.Loaded(
-                                latest.value.copy(totalCount = newTotal, state = result.state),
-                            )
-                        }
-                        return@withLock
-                    }
-                    val updated = latest.value.copy(entries = merged, totalCount = mergedTotal, state = result.state)
-                    _session.value = UiData.Loaded(updated)
-                    reconcileOptimisticLocked(merged)
-                    fresh.lastOrNull()?.takeIf { it.index >= 0 }?.let { newest ->
-                        lastSeen.recordIfNewer(sessionId, newest.index)
-                    }
-                    snapshotForCache = updated
-                }
-                snapshotForCache?.let {
-                    persistCache(sessionId, it, it.entries, it.totalCount)
-                    // Heal stuck placeholders only on a clean merge (i.e. when
-                    // no full refetch was launched). `resumeSession` only MERGES
-                    // entries the local view is missing (by index); it never
-                    // re-fetches an already-present slot. A placeholder that
-                    // got stuck on its truncated preview during an outage
-                    // (its `fetchAndReplaceEntry` retries all failed) keeps
-                    // its index, so the resume merge above skips it. Re-fetch
-                    // any still-incomplete tool_call slots now that we're back
-                    // online. `fetchAndReplaceEntry` is dedup-guarded, so a
-                    // slot that was already complete is a cheap no-op.
-                    // When a full refetch was triggered (snapshotForCache == null)
-                    // the refetch already retrieves complete entries — heal there
-                    // would spawn redundant coroutines racing the refetch.
-                    healIncompletePlaceholders(sessionId)
-                }
-            }
-            // Failed resume is recoverable — silent.
-        }
-    }
-
     /**
-     * Re-fetch any open-session entries still stuck on the lightweight
-     * placeholder produced by `applyAppendedPlaceholder` — i.e.
-     * `role == "tool_call"` slots with no structured [ToolCallSummary].
-     * Called from the reconnect resume path so prolonged-outage entries
-     * self-heal once the socket is back. Bounded by the (small) number of
-     * stuck slots; each fetch is itself retry- and dedup-guarded.
-     *
-     * Addresses each slot by its SERVER index ([EntrySummary.index]), so it
-     * is correct even on a paginated window where list position != index.
+     * Reconnect / foreground-resume entry point (called externally by
+     * `MainViewModel`). Flushes a deferred cancel queued while offline
+     * (`cancel_turn` is server-side idempotent, so a flush against an
+     * already-Stopping/Idle session is a safe no-op), then kicks the live
+     * delta poll — which pulls everything new (full changed-entry bodies +
+     * the freshest session state) since the held cursor, or full-reloads on
+     * an epoch mismatch. The old `after_index` get_session merge + gap logic
+     * + placeholder healing are subsumed by the delta poll.
      */
-    private fun healIncompletePlaceholders(sessionId: String) {
+    fun resumeSession(sessionId: String) {
         if (openSessionId != sessionId) return
-        val loaded = _session.value as? UiData.Loaded ?: return
-        loaded.value.entries.forEach { entry ->
-            if (entry.role == EntryRoleDto.ToolCall && entry.toolCall == null && entry.index >= 0) {
-                fetchAndReplaceEntry(sessionId, entry.index)
-            }
-        }
-    }
-
-    private fun refreshSession(sessionId: String) {
-        val active = context.activeClient() ?: return
-        val params = buildJsonObject {
-            put("session_id", sessionId)
-            put("include_full_content", true)
-            put("include_images", true)
-            put("subagent_filter", currentSubagentFilter())
-        }
-        scope.launch {
-            val outcome = runCatching { active.call("remote.solution_agent.get_session", params) }
-                .mapCatching { resp -> resp.decodeResultOrThrow(GetSessionResult.serializer()) }
-            var snapshotForCache: GetSessionResult? = null
-            sessionMutex.withLock {
-                // stale-write barrier (see class kdoc invariant 1)
-                if (openSessionId != sessionId) return@withLock
-                outcome
-                    .onSuccess { result ->
-                        _session.value = UiData.Loaded(result)
-                        _serverQueuedBundles.value = result.pendingBundles
-                        applyActiveSubagentsLocked(result.activeSubagents)
-                        reconcileOptimisticLocked(result.entries)
-                        snapshotForCache = result
-                    }
-                    .onFailure {
-                        if (_session.value !is UiData.Loaded) {
-                            _session.value = UiData.Error(it.message ?: "unknown error")
-                        }
-                    }
-            }
-            snapshotForCache?.let {
-                persistCache(sessionId, it, it.entries, it.totalCount)
-            }
-        }
+        flushPendingCancel()
+        scheduleDeltaPoll(sessionId)
     }
 
     /**
@@ -1581,7 +1362,7 @@ internal class SessionDetailStore(
         // the bubble show the COMPLETE multi-line message immediately
         // instead of `buildBlocksPreview`'s first-line + 200-char clamp.
         // Without this, long sends flashed as a truncated stub until the
-        // `fetchAndReplaceEntry` round-trip back-filled the real body.
+        // delta poll's `changed_entries` back-filled the real body.
         val fullMarkdown = buildBlocksFullText(blocks)
         val localId = optimisticIdGen.incrementAndGet()
         val clientSendId = clientSendIdGen.incrementAndGet()

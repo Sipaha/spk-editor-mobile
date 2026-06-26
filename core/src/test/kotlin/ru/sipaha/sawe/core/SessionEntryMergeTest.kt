@@ -14,10 +14,11 @@ import org.junit.jupiter.api.Test
 
 /**
  * JVM-only tests for the pure merge / dedup helpers extracted from
- * `SessionDetailStore`. Covers the three index-boundary branches of
- * [applyAppendedPlaceholder] and the FIFO / partial-match / duplicate-
- * content behaviour of [reconcileOptimisticContent], plus the wire-
- * parser [parseExpiredSendMessage].
+ * `SessionDetailStore`. Covers [upsertEntryAtIndex], the pagination-aware
+ * [isTailAnchoredWindow] integrity check, [dedupeEntriesByIndex], the FIFO
+ * / partial-match / duplicate-content behaviour of
+ * [reconcileOptimisticContent] / [reconcileOptimistic], plus the wire-parser
+ * [parseExpiredSendMessage].
  */
 class SessionEntryMergeTest {
 
@@ -41,138 +42,6 @@ class SessionEntryMergeTest {
             index = index,
             clientSendId = clientSendId,
         )
-
-    private fun payload(
-        sessionId: String = "s1",
-        entryIndex: Int,
-        role: String = "assistant",
-        preview: String = "preview",
-    ): MessageAppendedPayload =
-        MessageAppendedPayload(
-            sessionId = sessionId,
-            entryIndex = entryIndex,
-            role = roleFromWire(role),
-            preview = preview,
-        )
-
-    // -------------------------------------------------------------------------
-    // applyAppendedPlaceholder
-    // -------------------------------------------------------------------------
-
-    @Test
-    fun `append onto empty list at index 0 lands as a single-entry Replaced`() {
-        val out = applyAppendedPlaceholder(
-            current = emptyList(),
-            payload = payload(entryIndex = 0, role = "user", preview = "hi"),
-        )
-        assertTrue(out is AppendedPlaceholderOutcome.Replaced)
-        val entries = (out as AppendedPlaceholderOutcome.Replaced).entries
-        assertEquals(1, entries.size)
-        assertEquals(EntryRoleDto.User, entries[0].role)
-        assertEquals("hi", entries[0].preview)
-    }
-
-    @Test
-    fun `append - entryIndex one past the max index - lands at the end`() {
-        val current = listOf(entry("user", "a", index = 0), entry("assistant", "b", index = 1))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 2, role = "assistant", preview = "c"),
-        )
-        assertTrue(out is AppendedPlaceholderOutcome.Replaced)
-        val entries = (out as AppendedPlaceholderOutcome.Replaced).entries
-        assertEquals(3, entries.size)
-        assertEquals("c", entries[2].preview)
-        assertEquals(2, entries[2].index)
-    }
-
-    @Test
-    fun `in-place replace - existing index - overwrites the slot without growing`() {
-        val current = listOf(entry("user", "a", index = 0), entry("assistant", "stale", index = 1))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 1, role = "assistant", preview = "fresh"),
-        )
-        assertTrue(out is AppendedPlaceholderOutcome.Replaced)
-        val entries = (out as AppendedPlaceholderOutcome.Replaced).entries
-        assertEquals(2, entries.size)
-        assertEquals("fresh", entries[1].preview)
-        // First slot untouched.
-        assertEquals("a", entries[0].preview)
-    }
-
-    @Test
-    fun `gap above the max index returns OutOfRange so caller refetches`() {
-        val current = listOf(entry("user", "a", index = 0))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 5, role = "assistant", preview = "future"),
-        )
-        assertEquals(AppendedPlaceholderOutcome.OutOfRange, out)
-    }
-
-    // ---- the class-eliminating cases: a paginated WINDOW where list
-    //      position != server index. The old size-based logic refetched the
-    //      whole transcript on every append/update here; index-based does not.
-
-    @Test
-    fun `append onto a paginated window keys on index not position`() {
-        // Window holds indices 878..879 (list positions 0..1).
-        val current = listOf(entry("assistant", "x", index = 878), entry("assistant", "y", index = 879))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 880, role = "assistant", preview = "z"),
-        )
-        assertTrue(out is AppendedPlaceholderOutcome.Replaced)
-        val entries = (out as AppendedPlaceholderOutcome.Replaced).entries
-        assertEquals(3, entries.size)
-        assertEquals(880, entries[2].index)
-        assertEquals("z", entries[2].preview)
-    }
-
-    @Test
-    fun `in-place update onto a paginated window keys on index not position`() {
-        val current = listOf(entry("assistant", "x", index = 878), entry("assistant", "stale", index = 879))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 879, role = "assistant", preview = "fresh"),
-        )
-        assertTrue(out is AppendedPlaceholderOutcome.Replaced)
-        val entries = (out as AppendedPlaceholderOutcome.Replaced).entries
-        assertEquals(2, entries.size)
-        assertEquals("fresh", entries[1].preview)
-        assertEquals(879, entries[1].index)
-    }
-
-    @Test
-    fun `gap above a paginated window returns OutOfRange`() {
-        val current = listOf(entry("assistant", "x", index = 878), entry("assistant", "y", index = 879))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 882, role = "assistant", preview = "z"),
-        )
-        assertEquals(AppendedPlaceholderOutcome.OutOfRange, out)
-    }
-
-    @Test
-    fun `idempotent — replaying the same payload twice yields identical results`() {
-        val current = listOf(entry("user", "a", index = 0), entry("assistant", "old", index = 1))
-        val p = payload(entryIndex = 1, role = "assistant", preview = "new")
-        val first = applyAppendedPlaceholder(current, p) as AppendedPlaceholderOutcome.Replaced
-        val second = applyAppendedPlaceholder(first.entries, p) as AppendedPlaceholderOutcome.Replaced
-        assertEquals(first.entries, second.entries)
-    }
-
-    @Test
-    fun `does not mutate the input list`() {
-        val current = mutableListOf(entry("user", "a", index = 0))
-        val before = current.toList()
-        applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 0, role = "user", preview = "MUTATED"),
-        )
-        assertEquals(before, current, "input list must not be mutated")
-    }
 
     // -------------------------------------------------------------------------
     // upsertEntryAtIndex
@@ -210,74 +79,6 @@ class SessionEntryMergeTest {
         val current = listOf(entry("user", "a", index = 0))
         val out = upsertEntryAtIndex(current, 1, entry("assistant", "b", index = -1))
         assertEquals(1, out[1].index)
-    }
-
-    @Test
-    fun `appended placeholder carries the server entryIndex`() {
-        // The placeholder MUST be stamped with the notification's server
-        // index. A sentinel index (-1) makes it invisible to the index-based
-        // dedup in resumeSession / loadOlder, which lets a racing tail-resync
-        // merge a SECOND copy of the same entry — two list slots then resolve
-        // to the same `idx:N` LazyColumn key and the app hard-crashes
-        // ("Key idx:N was already used").
-        val current = listOf(entry("user", "a", index = 0), entry("assistant", "b", index = 1))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 2, role = "assistant", preview = "c"),
-        ) as AppendedPlaceholderOutcome.Replaced
-        assertEquals(2, out.entries[2].index)
-    }
-
-    @Test
-    fun `in-place placeholder replace also carries the server entryIndex`() {
-        val current = listOf(entry("user", "a"), entry("assistant", "stale", index = 1))
-        val out = applyAppendedPlaceholder(
-            current = current,
-            payload = payload(entryIndex = 1, role = "assistant", preview = "fresh"),
-        ) as AppendedPlaceholderOutcome.Replaced
-        assertEquals(1, out.entries[1].index)
-    }
-
-    @Test
-    fun `placeholder then racing tail-resync does not duplicate the entry index`() {
-        // End-to-end repro of the "Key idx:N already used" crash. While the
-        // agent streams, a tail-resync `get_session(after_index = N-1)` is in
-        // flight when `message_appended(N)` lands. Sequence:
-        //   1. message_appended adds a placeholder for index N.
-        //   2. the in-flight resync returns entry N; resumeSession dedups
-        //      incoming entries by index, then appends the survivors.
-        //   3. fetchAndReplaceEntry(N) replaces list POSITION N in place.
-        // If the placeholder doesn't carry index N, step 2's dedup can't see
-        // it, so entry N is appended a second time and step 3 turns the
-        // placeholder slot into a duplicate — two slots with index N.
-        val full = listOf(
-            entry("user", "a", index = 0),
-            entry("assistant", "b", index = 1),
-            entry("user", "c", index = 2),
-        )
-
-        val afterPlaceholder = (
-            applyAppendedPlaceholder(
-                current = full,
-                payload = payload(entryIndex = 3, role = "assistant", preview = "d"),
-            ) as AppendedPlaceholderOutcome.Replaced
-            ).entries
-
-        val afterResync = resumeMerge(
-            current = afterPlaceholder,
-            fetched = listOf(entry("assistant", "d", index = 3)),
-        )
-
-        // fetchAndReplaceEntry(3) replaces list position 3.
-        val afterReplace = afterResync.toMutableList().also {
-            if (3 < it.size) it[3] = entry("assistant", "d", index = 3)
-        }
-
-        assertEquals(
-            1,
-            afterReplace.count { it.index == 3 },
-            "a placeholder + racing resync must not yield two slots with index 3",
-        )
     }
 
     // -------------------------------------------------------------------------
@@ -374,20 +175,6 @@ class SessionEntryMergeTest {
     fun `dedupe returns the same instance when there is nothing to drop`() {
         val input = listOf(entry("user", "a", index = 0), entry("assistant", "b", index = 1))
         assertSame(input, dedupeEntriesByIndex(input))
-    }
-
-    /**
-     * Faithful inline model of the index-based dedup the store performs in
-     * `resumeSession` / `loadOlder`: drop incoming entries whose index is
-     * already present locally, then append the survivors.
-     */
-    private fun resumeMerge(
-        current: List<EntrySummary>,
-        fetched: List<EntrySummary>,
-    ): List<EntrySummary> {
-        val existing = current.mapNotNull { it.index.takeIf { i -> i >= 0 } }.toHashSet()
-        val fresh = fetched.filterNot { it.index >= 0 && existing.contains(it.index) }
-        return current + fresh
     }
 
     // -------------------------------------------------------------------------
