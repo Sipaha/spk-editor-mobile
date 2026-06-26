@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Placeholder adaptive-icon foreground for the SPK Remote app. A stylised
+    Placeholder adaptive-icon foreground for the Sawe Mobile app. A stylised
     "S" glyph centred on the 108dp canvas, comfortably inside the 72dp safe
     zone the launcher mask enforces. The shape is intentionally geometric
     (no embedded fonts) so AAPT renders it deterministically across SDK

@@ -9,11 +9,11 @@ plugins {
 }
 
 android {
-    namespace = "ru.sipaha.spkremote.app"
+    namespace = "ru.sipaha.sawe.app"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "ru.sipaha.spkremote.app"
+        applicationId = "ru.sipaha.sawe.app"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

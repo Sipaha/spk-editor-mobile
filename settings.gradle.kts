@@ -20,5 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "spk-editor-mobile"
+rootProject.name = "sawe-mobile"
 include(":core", ":app", ":cli")

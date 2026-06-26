@@ -174,7 +174,7 @@ last-connected timestamp drives ordering.
 ## Connection errors
 
 Every connection failure is classified by the
-[`ConnectFailure`](core/src/main/kotlin/ru/sipaha/spkremote/core/ConnectFailure.kt)
+[`ConnectFailure`](core/src/main/kotlin/ru/sipaha/sawe/core/ConnectFailure.kt)
 sealed class into one of: `Unreachable`, `TlsPinMismatch`,
 `AuthRejected`, `HandshakeTimeout`, `ProtocolError`, `ServerClosed`,
 or `Unknown`. The on-screen banner shows the user-facing reason —

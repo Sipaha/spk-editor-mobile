@@ -17,5 +17,5 @@ dependencies {
 }
 
 application {
-    mainClass.set("ru.sipaha.spkremote.cli.MainKt")
+    mainClass.set("ru.sipaha.sawe.cli.MainKt")
 }

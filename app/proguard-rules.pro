@@ -1,4 +1,4 @@
-# R8 / ProGuard rules for the SPK Remote Android app.
+# R8 / ProGuard rules for the Sawe Mobile Android app.
 #
 # Most third-party deps (OkHttp, Okio, AndroidX) already ship their own
 # consumer rules — we only need to add the bits R8 can't infer from
@@ -19,13 +19,13 @@
     kotlinx.serialization.KSerializer serializer(...);
 }
 
-# Our own @Serializable types live under ru.sipaha.spkremote — keep both
+# Our own @Serializable types live under ru.sipaha.sawe — keep both
 # the $$serializer synthetic classes and the Companion factories.
--keep,includedescriptorclasses class ru.sipaha.spkremote.**$$serializer { *; }
--keepclassmembers class ru.sipaha.spkremote.** {
+-keep,includedescriptorclasses class ru.sipaha.sawe.**$$serializer { *; }
+-keepclassmembers class ru.sipaha.sawe.** {
     *** Companion;
 }
--keepclasseswithmembers class ru.sipaha.spkremote.** {
+-keepclasseswithmembers class ru.sipaha.sawe.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
 
@@ -50,5 +50,5 @@
 # integration ever does load them through `Class.forName` or service
 # loaders, an R8-stripped build would silently fall back to OS trust /
 # unauth, which is exactly the failure mode we cannot afford.
--keep class ru.sipaha.spkremote.core.FingerprintPinningTrustManager { *; }
--keep class ru.sipaha.spkremote.core.HmacChallengeAuth { *; }
+-keep class ru.sipaha.sawe.core.FingerprintPinningTrustManager { *; }
+-keep class ru.sipaha.sawe.core.HmacChallengeAuth { *; }
