@@ -553,6 +553,42 @@ class RemoteClient internal constructor(
     }
 
     /**
+     * Convenience helper around `remote.solution_agent.get_session_changes`.
+     *
+     * Poll this instead of `get_session` to fetch only what changed since
+     * [sinceSeq]. Pass [knownEpoch] from the last [GetSessionResult] so
+     * the server can detect a state reset and return [GetSessionChangesResult.reset]
+     * = true, signalling that the client must fall back to a full `get_session`.
+     *
+     * [subagentFilter] is sent only when non-null — the server uses
+     * `deny_unknown_fields` + `skip_serializing_if`, so sending JSON null
+     * would fail. Pass null to fetch all subagents' entries.
+     */
+    suspend fun getSessionChanges(
+        sessionId: String,
+        sinceSeq: Long,
+        knownEpoch: Long,
+        subagentFilter: String? = null,
+        includeImages: Boolean = true,
+    ): GetSessionChangesResult {
+        val params = buildJsonObject {
+            put("session_id", sessionId)
+            put("since_seq", sinceSeq)
+            put("known_epoch", knownEpoch)
+            put("include_images", includeImages)
+            if (subagentFilter != null) put("subagent_filter", subagentFilter)
+        }
+        val response = call("remote.solution_agent.get_session_changes", params)
+        val err = response.error
+        if (err != null) {
+            error("get_session_changes failed: ${err.message}")
+        }
+        val result = response.structuredContent()
+            ?: error("get_session_changes returned no structuredContent")
+        return JsonRpc.json.decodeFromJsonElement(GetSessionChangesResult.serializer(), result)
+    }
+
+    /**
      * List the registry (catalog) projects available for adding to a
      * Solution. Backs the mobile project picker. Returns an empty list
      * when the catalog is empty (a normal state, not an error).

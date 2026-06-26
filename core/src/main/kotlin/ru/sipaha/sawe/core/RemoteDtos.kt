@@ -778,6 +778,17 @@ data class GetSessionResult(
     @SerialName("created_at") val createdAt: Long,
     @SerialName("last_activity_at") val lastActivityAt: Long,
     /**
+     * Epoch token for delta-sync. The client passes this as [GetSessionChangesResult.epoch]
+     * to `get_session_changes.known_epoch` so the server can detect a state reset.
+     * Defaults to 0 for pre-Phase-5 servers that don't emit the field.
+     */
+    val epoch: Long = 0,
+    /**
+     * The sequence cursor for delta-sync. Pass as `since_seq` on the next
+     * `get_session_changes` poll. Defaults to 0 for pre-Phase-5 servers.
+     */
+    @SerialName("current_seq") val currentSeq: Long = 0,
+    /**
      * Parent session id when this session was spawned by another agent.
      * Mirrors [SessionSummary.parentSessionId] — null at the top of the
      * agent-dispatch tree or on pre-F-server builds. F-phone uses this to
@@ -815,6 +826,38 @@ data class GetSessionResult(
      * pre-Etap-5 servers.
      */
     @SerialName("active_subagents") val activeSubagents: List<SubagentDto> = emptyList(),
+)
+
+/**
+ * Result envelope for `remote.solution_agent.get_session_changes` (Phase 5
+ * delta-sync RPC). The client polls this instead of re-fetching the full
+ * transcript on every change.
+ *
+ * **Absent-vs-empty distinction (CRITICAL):**
+ * [state], [pendingBundles], and [activeSubagents] default to `null`. A
+ * missing JSON key (absent section) decodes to `null` and means "section
+ * unchanged — keep the cached value". A present-but-empty JSON array `[]`
+ * decodes to an empty `List` (not null) and means "section changed and is
+ * now empty — replace the cache with empty". Do NOT change the default for
+ * these three fields to `emptyList()` — that would make the absent and
+ * present-empty cases indistinguishable and silently reintroduce the
+ * redundant re-renders this feature is designed to fix.
+ *
+ * [changedEntries] and [removedIndices] use `emptyList()` defaults
+ * because the server omits them only when they're actually empty (no
+ * absent-vs-empty ambiguity — empty == nothing changed).
+ */
+@Serializable
+data class GetSessionChangesResult(
+    val epoch: Long,
+    @SerialName("current_seq") val currentSeq: Long,
+    val reset: Boolean,
+    @SerialName("total_count") val totalCount: Int,
+    @SerialName("changed_entries") val changedEntries: List<EntrySummary> = emptyList(),
+    @SerialName("removed_indices") val removedIndices: List<Int> = emptyList(),
+    val state: SessionStateDto? = null,
+    @SerialName("pending_bundles") val pendingBundles: List<QueuedBundleSummary>? = null,
+    @SerialName("active_subagents") val activeSubagents: List<SubagentDto>? = null,
 )
 
 /**
