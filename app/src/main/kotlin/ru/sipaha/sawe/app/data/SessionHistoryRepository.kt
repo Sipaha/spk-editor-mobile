@@ -232,7 +232,15 @@ class SessionHistoryRepository(
         val key = scopedKey(history.sessionId) ?: return
         // Defensive strip — most call sites already pass image-free
         // entries but appendEntries / direct save can leak them.
-        val sanitised = history.copy(entries = stripImages(history.entries))
+        // Stamp the current schema version on every write: the data-class
+        // default is the legacy sentinel `1`, so without this stamp
+        // `encodeDefaults = false` would drop the key and the blob would decode
+        // back to `1` and fail the gate on its own next load. Because
+        // CACHE_SCHEMA_VERSION (2) != the default (1), the key is persisted.
+        val sanitised = history.copy(
+            entries = stripImages(history.entries),
+            schemaVersion = CachedSessionHistory.CACHE_SCHEMA_VERSION,
+        )
         runCatching {
             val raw = JSON.encodeToString(CachedSessionHistory.serializer(), sanitised)
             p.edit().putString(key, raw).apply()

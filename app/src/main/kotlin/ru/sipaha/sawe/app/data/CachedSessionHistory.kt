@@ -30,7 +30,16 @@ data class CachedSessionHistory(
      * (pre-R-6e server response).
      */
     val totalCountAtLastWrite: Int,
-    val schemaVersion: Int = CACHE_SCHEMA_VERSION,
+    /**
+     * Cache schema version. Default is the legacy sentinel `1`: a genuine
+     * pre-Phase-6 blob was serialized (under `encodeDefaults = false`) without
+     * any `schemaVersion` key, so it must decode back to `1` and be rejected by
+     * [SessionHistoryRepository.gateBySchema]. Every NEW write is stamped with
+     * [CACHE_SCHEMA_VERSION] in `SessionHistoryRepository.writeNow` before
+     * encoding, so `2 != 1` (the default) forces the key to be persisted and the
+     * blob decodes back to `2`, passing the gate.
+     */
+    val schemaVersion: Int = 1,
     /** Phase-5 delta cursor: the session epoch this cache was built against. */
     val epoch: Long = 0,
     /** Phase-5 delta cursor: the server `current_seq` at last write — passed as
