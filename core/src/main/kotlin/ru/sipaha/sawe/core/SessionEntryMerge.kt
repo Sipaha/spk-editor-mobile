@@ -191,6 +191,88 @@ fun dedupeEntriesByIndex(entries: List<EntrySummary>): List<EntrySummary> {
     return if (out.size == entries.size) entries else out
 }
 
+// =============================================================================
+// Delta-sync applier (Task 2 — pure state-transition function)
+// =============================================================================
+
+/**
+ * Immutable snapshot that [applySessionDelta] transforms. [entries] is sorted
+ * ascending by absolute [EntrySummary.index]. [state]/[pendingBundles]/
+ * [activeSubagents] are always concrete (the held current values).
+ * [totalCount] is the FILTERED count last reported by the server (-1 = unknown).
+ */
+data class SessionDeltaState(
+    val entries: List<EntrySummary>,
+    val totalCount: Int,
+    val state: SessionStateDto,
+    val pendingBundles: List<QueuedBundleSummary>,
+    val activeSubagents: List<SubagentDto>,
+    val currentSeq: Long,
+)
+
+/**
+ * Apply a [GetSessionChangesResult] delta onto a [SessionDeltaState] snapshot
+ * and return the new snapshot. Pure — never mutates [current].
+ *
+ * Precondition: [delta.reset] is false. When the server signals a reset the
+ * caller MUST discard the held snapshot and issue a fresh `get_session` call
+ * (Task 4 handles this in `SessionDetailStore`). This function is never called
+ * on a reset delta; passing one yields a semantically valid but stale result
+ * because the function has no way to detect that the epoch is no longer live.
+ *
+ * Application order:
+ * 1. Upsert [delta.changedEntries] by absolute index into the sorted entry list.
+ * 2. Remove entries whose index ∈ [delta.removedIndices].
+ * 3. Tail-truncate: drop the last `shrink` entries by count (not by index
+ *    cutoff) where `shrink = max(0, current.totalCount - delta.totalCount)`.
+ *    Shrink is skipped when either totalCount is negative (unknown / pre-R-6e).
+ *    The function coerces shrink to at most `entries.size` as a safety guard.
+ *    This drop-by-count model is load-bearing for filtered (per-subagent-tab)
+ *    views, where held indices are ABSOLUTE and sparse — dropping by
+ *    `index >= totalCount` would incorrectly remove most of the window.
+ * 4. Keep or replace each section: a `null` section means "unchanged"; a
+ *    present list (even empty) replaces the current value.
+ * 5. Advance [currentSeq] and [totalCount] to delta's values.
+ */
+fun applySessionDelta(current: SessionDeltaState, delta: GetSessionChangesResult): SessionDeltaState {
+    // Step 1: upsert changed entries.
+    var entries = current.entries
+    for (entry in delta.changedEntries) {
+        entries = upsertEntryAtIndex(entries, entry.index, entry)
+    }
+
+    // Step 2: remove explicitly removed indices.
+    if (delta.removedIndices.isNotEmpty()) {
+        val removed = delta.removedIndices.toHashSet()
+        entries = entries.filter { it.index !in removed }
+    }
+
+    // Step 3: tail-truncate shrink by COUNT from the tail.
+    val shrink = if (current.totalCount >= 0 && delta.totalCount >= 0) {
+        (current.totalCount - delta.totalCount).coerceIn(0, entries.size)
+    } else {
+        0
+    }
+    if (shrink > 0) {
+        entries = entries.dropLast(shrink)
+    }
+
+    // Step 4: adopt sections only when the delta carries them.
+    val newState = delta.state ?: current.state
+    val newPendingBundles = delta.pendingBundles ?: current.pendingBundles
+    val newActiveSubagents = delta.activeSubagents ?: current.activeSubagents
+
+    // Step 5: advance cursors.
+    return SessionDeltaState(
+        entries = entries,
+        totalCount = delta.totalCount,
+        state = newState,
+        pendingBundles = newPendingBundles,
+        activeSubagents = newActiveSubagents,
+        currentSeq = delta.currentSeq,
+    )
+}
+
 /**
  * Pop optimistic bubbles whose corresponding server-side "user" entry
  * has now landed. Matching is **id-first** (via `client_send_id`
