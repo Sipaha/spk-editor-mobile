@@ -29,6 +29,7 @@ import ru.sipaha.sawe.core.SessionActiveSubagentsChangedPayload
 import ru.sipaha.sawe.core.SessionBackgroundAgentsChangedPayload
 import ru.sipaha.sawe.core.SessionBackgroundShellsChangedPayload
 import ru.sipaha.sawe.core.SessionCreatedPayload
+import ru.sipaha.sawe.core.SessionDirtyPayload
 import ru.sipaha.sawe.core.SessionQueueChangedPayload
 import ru.sipaha.sawe.core.SessionSummary
 import ru.sipaha.sawe.core.UploadChunkAckedPayload
@@ -310,6 +311,12 @@ internal class SessionListStore(
             "agent_session_title_changed",
             "agent_session_message_appended",
             "agent_session_queue_changed",
+            // Content-free "transcript advanced — re-poll" signal carrying
+            // `current_seq`. The detail store polls get_session_changes to
+            // CONVERGENCE (cursor >= current_seq) on it, so a single delivered
+            // dirty heals a view left short by lost per-entry append pokes (the
+            // "interrupted reply stays interrupted" bug).
+            "agent_session_dirty",
             // Task/Agent subagent set changed mid-turn — routes to
             // SessionDetailStore.onActiveSubagentsChanged which moves
             // the tab strip; without this the strip only refreshes
@@ -533,6 +540,17 @@ internal class SessionListStore(
             "agent_session_title_changed" -> {
                 val notifSessionId = data?.get("session_id")?.jsonPrimitive?.content
                 router.onSessionStateOrTitleChanged(notifSessionId)
+            }
+            "agent_session_dirty" -> {
+                val payload = data?.let {
+                    runCatching {
+                        JsonRpc.json.decodeFromJsonElement(
+                            SessionDirtyPayload.serializer(),
+                            it,
+                        )
+                    }.getOrNull()
+                } ?: return
+                router.onSessionDirty(payload.sessionId, payload.currentSeq)
             }
             "agent_session_queue_changed" -> {
                 val payload = data?.let {
@@ -865,6 +883,15 @@ internal interface DetailNotificationRouter {
 
     /** A session-state or title-change notification. [notifSessionId] is null when the payload didn't carry one. */
     fun onSessionStateOrTitleChanged(notifSessionId: String?)
+
+    /**
+     * Content-free "transcript advanced — re-poll" signal. [currentSeq] is the
+     * session's `change_seq` at emit time. The detail store polls
+     * `get_session_changes` to CONVERGENCE (held cursor >= [currentSeq]) with
+     * bounded retry, so a single delivered dirty heals a view stranded by lost
+     * per-entry append pokes.
+     */
+    fun onSessionDirty(sessionId: String, currentSeq: Long)
 
     /**
      * The server-side `pending_messages` queue mutated. Carries every

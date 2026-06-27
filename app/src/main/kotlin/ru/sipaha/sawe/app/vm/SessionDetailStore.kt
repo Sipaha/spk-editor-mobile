@@ -105,6 +105,15 @@ private const val DEFERRED_UPLOAD_TIMEOUT_MS: Long = 5L * 60_000L
  */
 private const val DELTA_POLL_DEBOUNCE_MS: Long = 200L
 
+// Convergence poll (driven by `agent_session_dirty`): retry a failed/short poll
+// with exponential backoff until the held cursor reaches the signalled seq.
+private const val CONVERGENCE_MIN_BACKOFF_MS: Long = 150L
+private const val CONVERGENCE_MAX_BACKOFF_MS: Long = 2_000L
+// Bound the retry loop so a target that can never be reached (e.g. a seq from a
+// since-rotated epoch the reset path didn't catch) can't spin forever — the
+// next dirty / tail-resync / reconnect retries.
+private const val CONVERGENCE_MAX_ATTEMPTS: Int = 15
+
 private fun totalBytesFromState(state: UploadManager.State): Long = when (state) {
     is UploadManager.State.Queued -> state.total
     is UploadManager.State.Uploading -> state.total
@@ -784,6 +793,17 @@ internal class SessionDetailStore(
         scheduleDeltaPoll(openSid)
     }
 
+    override fun onSessionDirty(sessionId: String, currentSeq: Long) {
+        val openSid = openSessionId ?: return
+        if (sessionId != openSid) return
+        // Converge to the signalled seq: poll get_session_changes until the held
+        // cursor reaches currentSeq, retrying failed polls. Unlike the plain
+        // poke (scheduleDeltaPoll), this does not give up after one failed/short
+        // poll — so an interrupted reply whose trailing append pokes were lost
+        // is reliably healed by a single delivered dirty.
+        scheduleDeltaPollToConvergence(openSid, currentSeq)
+    }
+
     override fun onSessionContextReset(payload: AgentSessionContextResetPayload) {
         val openSid = openSessionId ?: return
         if (payload.sessionId != openSid) return
@@ -1199,6 +1219,68 @@ internal class SessionDetailStore(
                 fetchFullSession(active, sessionId)
             } else {
                 applyDeltaLocked(sessionId, delta)
+            }
+        }
+    }
+
+    /**
+     * Poll `get_session_changes` until the held cursor ([openSeq]) reaches
+     * [targetSeq], retrying failed polls with bounded exponential backoff.
+     * Triggered by the server's `agent_session_dirty` signal.
+     *
+     * Unlike [scheduleDeltaPoll] (one shot, silent give-up on failure / short
+     * read), this CONVERGES: it does not stop while the held cursor is below the
+     * signalled seq and a client is connected. That is what heals an interrupted
+     * reply whose trailing append pokes were lost on a flaky link — a single
+     * delivered dirty drives the view all the way to the server's `current_seq`.
+     *
+     * Shares [deltaPollJob] (cancel + re-arm), so a newer poke / dirty
+     * supersedes an in-flight convergence run; a dirty with a higher target
+     * simply restarts the loop against the new target.
+     */
+    private fun scheduleDeltaPollToConvergence(sessionId: String, targetSeq: Long) {
+        if (openSessionId != sessionId) return
+        deltaPollJob?.cancel()
+        deltaPollJob = scope.launch {
+            delay(DELTA_POLL_DEBOUNCE_MS)
+            var backoffMs = CONVERGENCE_MIN_BACKOFF_MS
+            var attempts = 0
+            while (attempts < CONVERGENCE_MAX_ATTEMPTS) {
+                attempts++
+                if (openSessionId != sessionId) return@launch
+                val active = context.activeClient() ?: return@launch
+                val (sinceSeq, knownEpoch) = sessionMutex.withLock {
+                    if (openSessionId != sessionId) return@launch
+                    openSeq to openEpoch
+                }
+                if (sinceSeq >= targetSeq) return@launch // converged
+                val delta = runCatching {
+                    active.getSessionChanges(
+                        sessionId = sessionId,
+                        sinceSeq = sinceSeq,
+                        knownEpoch = knownEpoch,
+                        subagentFilter = currentSubagentFilter(),
+                    )
+                }.getOrNull()
+                if (delta == null) {
+                    // Poll failed (transport / reconnect window) — back off and
+                    // retry rather than stranding the view.
+                    delay(backoffMs)
+                    backoffMs = (backoffMs * 2).coerceAtMost(CONVERGENCE_MAX_BACKOFF_MS)
+                    continue
+                }
+                if (openSessionId != sessionId) return@launch
+                if (delta.reset) {
+                    // Epoch rotated: a full reload snaps the cursor to the live
+                    // currentSeq, which is convergence by definition.
+                    fetchFullSession(active, sessionId)
+                    return@launch
+                }
+                applyDeltaLocked(sessionId, delta)
+                // Loop: the next iteration re-reads [openSeq] under the lock and
+                // returns once it reaches [targetSeq]. A single successful poll
+                // normally converges (the server was already at >= targetSeq
+                // when it emitted the dirty); the loop exists to survive failures.
             }
         }
     }

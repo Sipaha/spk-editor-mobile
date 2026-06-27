@@ -654,6 +654,20 @@ data class AgentSessionContextResetPayload(
     @SerialName("context_count") val contextCount: Int,
 )
 
+/**
+ * Decoded `params.payload` of an `agent_session_dirty` notification — the
+ * server's content-free "this session's transcript advanced, re-poll" signal.
+ * [currentSeq] is the session's `change_seq` at emit time; the detail store
+ * polls `get_session_changes` until its held cursor reaches it (with bounded
+ * retry), so a single delivered dirty converges a view that lost per-entry
+ * append pokes on a flaky link.
+ */
+@Serializable
+data class SessionDirtyPayload(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("current_seq") val currentSeq: Long,
+)
+
 @Serializable
 data class MessageAppendedPayload(
     @SerialName("session_id") val sessionId: String,
