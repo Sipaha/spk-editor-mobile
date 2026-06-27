@@ -4566,6 +4566,7 @@ private fun SupervisorSettingsSheet(
                                 if (state.verdictsCompact > 0) append(" · ⚙${state.verdictsCompact}")
                                 if (state.verdictsDone > 0) append(" · ✓${state.verdictsDone}")
                                 if (state.verdictsAsk > 0) append(" · ❗${state.verdictsAsk}")
+                                if (state.verdictsAskAgent > 0) append(" · 💬${state.verdictsAskAgent}")
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

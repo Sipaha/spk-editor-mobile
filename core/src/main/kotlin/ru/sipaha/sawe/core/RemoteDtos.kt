@@ -1185,6 +1185,7 @@ data class SupervisorStateDto(
     @SerialName("verdicts_compact") val verdictsCompact: Int = 0,
     @SerialName("verdicts_done") val verdictsDone: Int = 0,
     @SerialName("verdicts_ask") val verdictsAsk: Int = 0,
+    @SerialName("verdicts_ask_agent") val verdictsAskAgent: Int = 0,
     val audits: Int = 0,
     @SerialName("total_tokens") val totalTokens: Long = 0L,
 )
