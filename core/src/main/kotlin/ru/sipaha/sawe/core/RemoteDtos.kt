@@ -337,6 +337,8 @@ data class EntrySummary(
     @SerialName("tool_call") val toolCall: ToolCallSummary? = null,
     /** Plan detail — present only on entries with `role=plan`. */
     val plan: PlanSummary? = null,
+    /** Severity — present only on entries with `role=system`. */
+    @SerialName("system_level") val systemLevel: SystemLevelDto? = null,
     /**
      * Client-stamped correlation id for the originating user message — the
      * server lifts `_meta.spk_client_send_id` from the first ContentBlock of
@@ -890,7 +892,7 @@ fun GetSessionResult.withOptimisticStopping(): GetSessionResult =
 
 enum class DisplayState { Idle, Running, Stopping, AwaitingInput, Errored, Unknown }
 
-enum class EntryRole { User, Assistant, ToolCall, Plan, Unknown }
+enum class EntryRole { User, Assistant, ToolCall, Plan, System, Unknown }
 
 // =====================================================================
 // workspace.* DTOs (wire schema v2)
@@ -1094,8 +1096,43 @@ enum class EntryRoleDto {
     Assistant,
     ToolCall,
     Plan,
+    /** Editor-originated annotation (watchdog / usage-limit / supervisor).
+     *  Severity is in [EntrySummary.systemLevel]. */
+    System,
     /** Forward-compat fallback for any role string the client doesn't know. */
     Unknown,
+}
+
+/** Severity of a `role == system` entry, so it renders distinctly. */
+@Serializable(with = SystemLevelDtoSerializer::class)
+enum class SystemLevelDto {
+    Info,
+    Error,
+    Observer,
+    Unknown,
+}
+
+internal object SystemLevelDtoSerializer : KSerializer<SystemLevelDto> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("SystemLevelDto", PrimitiveKind.STRING)
+
+    override fun deserialize(decoder: Decoder): SystemLevelDto = when (decoder.decodeString()) {
+        "info" -> SystemLevelDto.Info
+        "error" -> SystemLevelDto.Error
+        "observer" -> SystemLevelDto.Observer
+        else -> SystemLevelDto.Unknown
+    }
+
+    override fun serialize(encoder: Encoder, value: SystemLevelDto) {
+        encoder.encodeString(
+            when (value) {
+                SystemLevelDto.Info -> "info"
+                SystemLevelDto.Error -> "error"
+                SystemLevelDto.Observer -> "observer"
+                SystemLevelDto.Unknown -> "info"
+            },
+        )
+    }
 }
 
 internal object EntryRoleDtoSerializer : KSerializer<EntryRoleDto> {
@@ -1107,6 +1144,7 @@ internal object EntryRoleDtoSerializer : KSerializer<EntryRoleDto> {
         "assistant" -> EntryRoleDto.Assistant
         "tool_call" -> EntryRoleDto.ToolCall
         "plan" -> EntryRoleDto.Plan
+        "system" -> EntryRoleDto.System
         else -> EntryRoleDto.Unknown
     }
 
@@ -1117,6 +1155,7 @@ internal object EntryRoleDtoSerializer : KSerializer<EntryRoleDto> {
                 EntryRoleDto.Assistant -> "assistant"
                 EntryRoleDto.ToolCall -> "tool_call"
                 EntryRoleDto.Plan -> "plan"
+                EntryRoleDto.System -> "system"
                 EntryRoleDto.Unknown -> "unknown"
             },
         )
@@ -1133,6 +1172,7 @@ fun EntryRoleDto.toEntryRole(): EntryRole = when (this) {
     EntryRoleDto.Assistant -> EntryRole.Assistant
     EntryRoleDto.ToolCall -> EntryRole.ToolCall
     EntryRoleDto.Plan -> EntryRole.Plan
+    EntryRoleDto.System -> EntryRole.System
     EntryRoleDto.Unknown -> EntryRole.Unknown
 }
 

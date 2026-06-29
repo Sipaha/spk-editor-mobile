@@ -78,6 +78,8 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.HourglassBottom
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.HourglassEmpty
@@ -175,6 +177,7 @@ import ru.sipaha.sawe.core.DisplayState
 import ru.sipaha.sawe.app.ui.common.ConnectionStatusBanner
 import ru.sipaha.sawe.core.EntryImage
 import ru.sipaha.sawe.core.EntryRoleDto
+import ru.sipaha.sawe.core.SystemLevelDto
 import ru.sipaha.sawe.core.EntrySummary
 import ru.sipaha.sawe.core.GetSessionResult
 import kotlinx.coroutines.flow.StateFlow
@@ -1436,6 +1439,34 @@ private fun ChatBubble(
                             bg = MaterialTheme.colorScheme.secondaryContainer,
                             fg = MaterialTheme.colorScheme.onSecondaryContainer,
                             label = "plan",
+                        )
+                    }
+                }
+                EntryRoleDto.System -> {
+                    // Editor-originated annotation — render distinctly per
+                    // severity so it's clearly NOT the agent or the user.
+                    val text = entry.markdown ?: entry.preview
+                    when (entry.systemLevel) {
+                        SystemLevelDto.Error -> CenteredAnnotatedBubble(
+                            text = text,
+                            icon = Icons.Filled.Warning,
+                            bg = MaterialTheme.colorScheme.errorContainer,
+                            fg = MaterialTheme.colorScheme.onErrorContainer,
+                            label = "system",
+                        )
+                        SystemLevelDto.Observer -> CenteredAnnotatedBubble(
+                            text = text,
+                            icon = Icons.Filled.Visibility,
+                            bg = MaterialTheme.colorScheme.tertiaryContainer,
+                            fg = MaterialTheme.colorScheme.onTertiaryContainer,
+                            label = "observer",
+                        )
+                        else -> CenteredAnnotatedBubble(
+                            text = text,
+                            icon = Icons.Filled.Info,
+                            bg = MaterialTheme.colorScheme.surfaceVariant,
+                            fg = MaterialTheme.colorScheme.onSurfaceVariant,
+                            label = "system",
                         )
                     }
                 }
